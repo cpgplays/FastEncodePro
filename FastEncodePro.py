@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-FastEncode Pro - Accessibility Edition v0.07.1
+FastEncode Pro - Accessibility Edition v0.06
 GPU-Accelerated Video Editor with Native Eye-Tracking & Switch Support
 
-v0.07.1 Changes:
-- Fixed GPU Pipeline: Implemented 'scale_cuda' to fix 8% GPU usage bottleneck.
-- Added MKV/GStreamer diagnostic check on startup.
-- Version number reset to 0.07.1 as requested.
+v0.06 Features:
+- Dwell Clicking (Eye Gaze Emulation)
+- High-Contrast Focus (Head Switch Support)
+- Smart Stream Rendering (Audio/Video Sync)
+- Fixed GPU Hardware Decoding
+- Linux/Hyprland Icon Support
 """
 
 import sys
@@ -24,7 +26,7 @@ from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
-__version__ = "0.07.1"
+__version__ = "0.06"
 __author__ = "cpgplays"
 
 # --- ACCESSIBILITY CLASSES ---
@@ -732,7 +734,7 @@ class TimelineRenderingEngine:
         temp_audio = self.output_path + ".temp_audio.wav"
         
         try:
-            self.log("=== FAST ENCODE PRO v0.07.1 ===")
+            self.log("=== HIGH-PERFORMANCE STREAM RENDERING v0.7.2 ===")
             if not self.timeline.clips:
                 return False, "No clips on timeline"
             
@@ -821,39 +823,13 @@ class TimelineRenderingEngine:
                                  current_total_frames, target_total_frames, job_start_time):
         scale_algo = self.settings.get('scale_algo', 'lanczos')
         frame_size = int(width * height * 1.5)
-        
         cmd = ['ffmpeg']
-        
-        # --- FIXED GPU PIPELINE ---
-        use_gpu = self.settings.get('use_gpu_decode', False)
-        if use_gpu:
-            # We enable hardware accel AND configure the output to stay on CUDA
-            cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
-            
+        if self.settings.get('use_gpu_decode', False):
+            cmd.extend(['-hwaccel', 'cuda'])
         cmd.extend([
-            '-ss', f"{start_time:.6f}",
-            '-i', input_file,
-            '-vframes', str(frame_count)
-        ])
-        
-        # --- FILTER CHAIN ---
-        if use_gpu:
-            # This is the secret sauce: Resizing ON the GPU, then downloading small frame
-            # 1. scale_cuda (GPU resize)
-            # 2. hwdownload (Download frame to RAM)
-            # 3. format=nv12 (Standard output of download)
-            # 4. fps (CPU based frame duplication/dropping if needed)
-            # 5. format=yuv420p (For pipe compatibility)
-            vf = f"scale_cuda={width}:{height},hwdownload,format=nv12,fps={fps},format=yuv420p"
-        else:
-            # CPU fallback
-            vf = f"scale={width}:{height}:flags={scale_algo},fps={fps},format=yuv420p"
-            
-        cmd.extend([
-            '-vf', vf,
-            '-f', 'rawvideo',
-            '-pix_fmt', 'yuv420p',
-            '-'
+            '-ss', f"{start_time:.6f}", '-i', input_file, '-vframes', str(frame_count),
+            '-vf', f'scale={width}:{height}:flags={scale_algo},fps={fps},format=yuv420p',
+            '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'
         ])
         
         decoder = None
@@ -1113,27 +1089,6 @@ class FastEncodeProApp(QMainWindow):
         
         self.apply_theme()
         self.load_settings()
-        
-        # MKV CHECK
-        QTimer.singleShot(1000, self.check_system_health)
-
-    def check_system_health(self):
-        # Only check on Linux
-        if sys.platform.startswith('linux'):
-            # Check for GStreamer Libav plugin (needed for MKV)
-            # We can't check directly easily, but we can warn CachyOS/Arch users
-            if not shutil.which('gst-inspect-1.0'):
-                pass # GStreamer tools not installed, can't check
-            else:
-                try:
-                    result = subprocess.run(['gst-inspect-1.0', 'libav'], capture_output=True, text=True)
-                    if "No such element or plugin" in result.stderr or result.returncode != 0:
-                        QMessageBox.warning(self, "Missing Driver", 
-                            "MKV Playback requires GStreamer Libav.\n\n"
-                            "Run this in terminal:\n"
-                            "sudo pacman -S gst-libav gst-plugins-good gst-plugins-bad gst-plugins-ugly")
-                except:
-                    pass
 
     def create_accessibility_tab(self):
         tab = QWidget()
@@ -1625,6 +1580,7 @@ class FastEncodeProApp(QMainWindow):
         """)
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
         control_buttons = QHBoxLayout()
         self.start_btn = QPushButton("▶️ START ENCODING")
         self.start_btn.setStyleSheet(self.button_style("#4ade80"))
@@ -2121,12 +2077,66 @@ class FastEncodeProApp(QMainWindow):
         self.current_file_index = 0
 
     def save_settings(self):
-        pass
+        self.app_settings.setValue("output_folder", self.output_folder)
+        # We can expand this to save other settings if desired
 
     def load_settings(self):
+        # We did output_folder in __init__, but could add more here
         pass
+        
+    def save_project(self):
+        if not self.timeline.clips:
+            QMessageBox.information(self, "Info", "Timeline is empty")
+            return
+            
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Project", "project.fep", "FastEncode Projects (*.fep)")
+        if not file_path:
+            return
+            
+        project_data = {
+            "version": __version__,
+            "clips": [clip.to_dict() for clip in self.timeline.clips],
+            "settings": self.get_settings()
+        }
+        
+        try:
+            with open(file_path, 'w') as f:
+                json.dump(project_data, f, indent=4)
+            self.status_label.setText(f"Project saved: {Path(file_path).name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save project: {e}")
+
+    def load_project(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "FastEncode Projects (*.fep)")
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'r') as f:
+                project_data = json.load(f)
+                
+            self.timeline.clear_timeline()
+            
+            # Load clips
+            for clip_data in project_data.get("clips", []):
+                clip = TimelineClip.from_dict(clip_data)
+                # Verify file still exists
+                if not os.path.exists(clip.file_path):
+                    QMessageBox.warning(self, "Missing Media", f"Could not find media: {clip.file_path}")
+                    continue
+                self.timeline.add_clip(clip)
+            
+            self.update_timeline_duration()
+            self.status_label.setText(f"Project loaded: {Path(file_path).name}")
+            
+            # NOTE: We could also load the codec settings here if desired
+            # But users might want to keep their current codec settings.
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load project: {e}")
 
     def closeEvent(self, event):
+        self.save_settings()
         if self.encoding_thread and self.encoding_thread.isRunning():
             reply = QMessageBox.question(self, "Active", "Stop and quit?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.No:
@@ -2146,6 +2156,12 @@ class FastEncodeProApp(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    
+    # --- FIX FOR ARCH/HYPRLAND ICONS ---
+    # This ID must match the 'StartupWMClass' in the .desktop file
+    app.setDesktopFileName("FastEncodePro") 
+    # -----------------------------------
+    
     app.setStyle("Fusion")
     window = FastEncodeProApp()
     window.show()

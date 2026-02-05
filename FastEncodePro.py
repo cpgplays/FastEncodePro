@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-FastEncode Pro - Accessibility Edition v0.07.1
+FastEncode Pro - Accessibility Edition v0.06 (Restored)
 GPU-Accelerated Video Editor with Native Eye-Tracking & Switch Support
 
-v0.7.1 Changes:
-- STABILITY: Rollback to QtMultimedia (fixes Wayland crash).
-- FIX: Force GStreamer backend to detect gst-libav plugins.
-- FIX: Render Crash Protection (Broken Pipe handling).
-- FIX: GPU Scaling (scale_cuda).
+v0.06 Features:
+- Full UI Restored (Dark Theme, Colored Buttons)
+- Accessibility: Dwell Clicking & Switch Support
+- Stability: Render Crash Protection included
+- Linux/Hyprland Icon Support
 """
 
 import sys
@@ -19,17 +19,13 @@ import json
 import time
 import math
 from pathlib import Path
-
-# Force Qt to use GStreamer (Fixes some black screen issues on Arch)
-os.environ["QT_MEDIA_BACKEND"] = "gstreamer"
-
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRectF, QObject
 from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor, QAction, QPainterPath, QMouseEvent
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
-__version__ = "0.11"
+__version__ = "0.06"
 __author__ = "cpgplays"
 
 # --- ACCESSIBILITY CLASSES ---
@@ -57,6 +53,9 @@ class DwellClickOverlay(QWidget):
         p.drawArc(10, 10, 40, 40, 90 * 16, int(-self.progress * 360 * 16))
 
 class DwellClickFilter(QObject):
+    click_triggered = pyqtSignal(QPoint)
+    progress_update = pyqtSignal(float)
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.timer = QTimer(); self.timer.setInterval(50); self.timer.timeout.connect(self.check_dwell)
@@ -116,6 +115,7 @@ class TimelineWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent); self.clips = []; self.selected_clip = None; self.zoom = 10.0; self.scroll = 0; self.playhead = 0
         self.setMinimumHeight(250); self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        
     def paintEvent(self, e):
         p = QPainter(self); p.fillRect(self.rect(), QColor("#111827")); p.fillRect(0, 0, self.width(), 40, QColor("#1f2937"))
         # Ruler
@@ -130,11 +130,13 @@ class TimelineWidget(QWidget):
             x = int((c.start_time - self.scroll) * self.zoom); w = int(c.get_trimmed_duration() * self.zoom)
             y = 40 + c.track * 60 + 5
             p.setBrush(QColor("#3b82f6") if c == self.selected_clip else QColor("#10b981"))
-            p.setPen(QPen(Qt.GlobalColor.white)); p.drawRoundedRect(x, y, w, 50, 5, 5); p.drawText(x+5, y+25, c.name)
+            p.setPen(QPen(Qt.GlobalColor.white)); p.drawRoundedRect(x, y, w, 50, 5, 5)
+            p.drawText(x+5, y+25, c.name)
         # Playhead
         px = int((self.playhead - self.scroll) * self.zoom)
         p.setPen(QPen(QColor("#ef4444"), 2)); p.drawLine(px, 0, px, self.height())
         if self.hasFocus(): p.setPen(QPen(QColor("#f59e0b"), 4)); p.setBrush(Qt.BrushStyle.NoBrush); p.drawRect(self.rect().adjusted(2,2,-2,-2))
+
     def mousePressEvent(self, e):
         t = (e.position().x() / self.zoom) + self.scroll
         if e.position().y() < 40: self.playhead = max(0, t); self.playhead_moved.emit(self.playhead); self.update(); return
@@ -143,6 +145,7 @@ class TimelineWidget(QWidget):
             if c.track == tr and c.start_time <= t <= c.get_end_time():
                 self.selected_clip = c; self.clip_selected.emit(c); self.update(); return
         self.selected_clip = None; self.update()
+        
     def add_clip(self, c): self.clips.append(c); self.update()
     def clear_timeline(self): self.clips = []; self.update()
     def set_playhead_position(self, t): self.playhead = t; self.update()
@@ -171,7 +174,7 @@ class TimelineRenderingEngine:
     def render(self):
         t_vid = self.output_path + ".temp.mov"; t_aud = self.output_path + ".temp.wav"
         try:
-            self.log("=== STARTING RENDER v0.11 ===")
+            self.log("=== STARTING RENDER v0.06 ===")
             if not self.timeline.clips: return False, "No clips"
             
             clips = sorted(self.timeline.clips, key=lambda c: c.start_time)
@@ -182,7 +185,6 @@ class TimelineRenderingEngine:
             self.log("Phase 1: Video Render")
             cmd = ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-s', f'{w}x{h}', '-r', str(fps), '-i', '-']
             
-            # Encoder settings
             codec = self.settings.get('video_codec', 'hevc_nvenc')
             cmd.extend(['-c:v', codec])
             if 'nvenc' in codec:
@@ -194,30 +196,29 @@ class TimelineRenderingEngine:
             cmd.append(t_vid)
             self.encoder_process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
             
-            # Frame loop
+            # Render Loop
             curr_frame = 0
-            # We process clip by clip (simple concat logic for rendering)
             for c in clips:
-                # Handle gaps (black frames)
+                if self.should_stop: break
+                
+                # Gaps
                 gap = int((c.start_time * fps) - curr_frame)
                 if gap > 0:
                     black = bytes([16] * (w*h) + [128] * (w*h//2))
                     for _ in range(gap): self._safe_write(black); curr_frame += 1
                 
-                # Decode Clip
+                # Clip
                 dur = int(c.get_trimmed_duration() * fps)
                 self.log(f"Encoding {c.name} ({dur} frames)")
                 
                 d_cmd = ['ffmpeg']
-                if self.settings.get('use_gpu_decode', False): d_cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
+                if self.settings.get('use_gpu_decode', False): 
+                    d_cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
+                
                 d_cmd.extend(['-ss', str(c.in_point), '-i', c.file_path, '-vframes', str(dur)])
                 
-                # GPU Scaling Logic
-                if self.settings.get('use_gpu_decode', False):
-                    vf = f"scale_cuda={w}:{h},hwdownload,format=nv12,fps={fps},format=yuv420p"
-                else:
-                    vf = f"scale={w}:{h},fps={fps},format=yuv420p"
-                
+                # Using standard scaling for stability
+                vf = f"scale={w}:{h}:flags=lanczos,fps={fps},format=yuv420p"
                 d_cmd.extend(['-vf', vf, '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'])
                 
                 dec = subprocess.Popen(d_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -227,11 +228,10 @@ class TimelineRenderingEngine:
                     if self.should_stop: dec.kill(); break
                     raw = dec.stdout.read(f_size)
                     if not raw or len(raw) != f_size: break
-                    if not self._safe_write(raw): break # Pipe broken?
+                    if not self._safe_write(raw): break # Avoid crash
                     curr_frame += 1
-                    if curr_frame % 30 == 0: self.status(f"Rendering frame {curr_frame}")
+                    if curr_frame % 30 == 0: self.status(f"Frame {curr_frame}")
                 dec.wait()
-                if self.should_stop: break
 
             if self.encoder_process:
                 self.encoder_process.stdin.close()
@@ -239,9 +239,8 @@ class TimelineRenderingEngine:
             
             if self.should_stop: return False, "Cancelled"
 
-            # --- AUDIO PASS (Simple Extract/Concat) ---
+            # --- AUDIO PASS ---
             self.log("Phase 2: Audio Render")
-            # Build complex filter for audio
             inputs = []; fil = ""
             for i, c in enumerate(clips):
                 inputs.extend(['-ss', str(c.in_point), '-t', str(c.get_trimmed_duration()), '-i', c.file_path])
@@ -262,15 +261,11 @@ class TimelineRenderingEngine:
             return False, str(e)
 
     def _safe_write(self, data):
-        # Prevents crash if ffmpeg dies early
         if not self.encoder_process: return False
         try:
             self.encoder_process.stdin.write(data)
             return True
-        except BrokenPipeError:
-            return False
-        except Exception:
-            return False
+        except: return False
 
 class TimelineExportThread(QThread):
     progress = pyqtSignal(int); status = pyqtSignal(str); log_message = pyqtSignal(str); finished = pyqtSignal(bool, str)
@@ -284,8 +279,7 @@ class TimelineExportThread(QThread):
         if self.engine: self.engine.should_stop = True
 
 class FullscreenVideoPlayer(QWidget):
-    """Fullscreen video player with always-visible overlay controls"""
-
+    """Fullscreen video player"""
     def __init__(self, player, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
         self.player = player
@@ -293,181 +287,151 @@ class FullscreenVideoPlayer(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setStyleSheet("background-color: black;")
         self.original_video_output = self.player.videoOutput()
-        self.was_playing = (self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
-        self.video_widget = QVideoWidget()
-        self.video_widget.setStyleSheet("background-color: black;")
-        main_layout.addWidget(self.video_widget, stretch=1)
-        controls_panel = QWidget()
-        controls_panel.setStyleSheet("background: rgba(0,0,0,200); padding: 20px;")
-        controls_layout = QVBoxLayout(controls_panel)
-        self.timecode_label = QLabel("00:00:00 / 00:00:00")
-        self.timecode_label.setStyleSheet("color: white; font-size: 24pt; font-weight: bold;")
-        self.timecode_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        controls_layout.addWidget(self.timecode_label)
-        self.scrubber = QSlider(Qt.Orientation.Horizontal)
-        self.scrubber.setRange(0, 1000)
-        self.scrubber.setStyleSheet("QSlider::handle:horizontal { background: #3b82f6; width: 40px; height: 40px; border-radius: 20px; }")
-        controls_layout.addWidget(self.scrubber)
-        btn_layout = QHBoxLayout()
-        self.play_btn = QPushButton("⏯️ PAUSE")
-        self.play_btn.setStyleSheet("font-size: 20pt; padding: 20px; background: #3b82f6; color: white; border-radius: 10px;")
-        self.play_btn.clicked.connect(self.toggle_playback)
-        self.exit_btn = QPushButton("✕ EXIT")
-        self.exit_btn.setStyleSheet("font-size: 20pt; padding: 20px; background: #ef4444; color: white; border-radius: 10px;")
-        self.exit_btn.clicked.connect(self.exit_fullscreen)
-        btn_layout.addWidget(self.play_btn)
-        btn_layout.addWidget(self.exit_btn)
-        controls_layout.addLayout(btn_layout)
-        main_layout.addWidget(controls_panel)
+        main_layout = QVBoxLayout(self); main_layout.setContentsMargins(0,0,0,0)
+        self.video_widget = QVideoWidget(); self.video_widget.setStyleSheet("background-color: black;")
+        main_layout.addWidget(self.video_widget)
+        
+        # Exit Button
+        btn = QPushButton("EXIT FULLSCREEN", self)
+        btn.setGeometry(50, 50, 200, 60)
+        btn.setStyleSheet("background: red; color: white; font-weight: bold; font-size: 14pt; border-radius: 10px;")
+        btn.clicked.connect(self.close)
+        
         self.player.setVideoOutput(self.video_widget)
-        if self.was_playing: self.player.play()
-        self.scrubber.sliderMoved.connect(self.seek)
-        self.player.positionChanged.connect(self.update_pos)
-        self.player.durationChanged.connect(self.update_dur)
-        
-    def toggle_playback(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-            self.play_btn.setText("▶️ PLAY")
-        else:
-            self.player.play()
-            self.play_btn.setText("⏸️ PAUSE")
-            
-    def seek(self, val):
-        if self.player.duration() > 0:
-            self.player.setPosition(int((val/1000)*self.player.duration()))
-            
-    def update_pos(self, pos):
-        if self.player.duration() > 0:
-            self.scrubber.setValue(int((pos/self.player.duration())*1000))
-        self.update_lbl()
-        
-    def update_dur(self, dur):
-        self.update_lbl()
-        
-    def update_lbl(self):
-        def fmt(ms):
-            s=ms//1000; m=(s%3600)//60; h=s//3600; s=s%60
-            return f"{h:02}:{m:02}:{s:02}"
-        self.timecode_label.setText(f"{fmt(self.player.position())} / {fmt(self.player.duration())}")
-        
-    def exit_fullscreen(self):
+        self.player.play()
+
+    def closeEvent(self, event):
         self.player.setVideoOutput(self.original_video_output)
-        self.close()
+        event.accept()
 
 class FastEncodeProApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"FastEncode Pro v{__version__} - Accessible Video Editor")
+        self.setWindowTitle(f"FastEncode Pro v{__version__}")
         self.setGeometry(100, 100, 1400, 900)
         
-        # Settings
         self.settings_store = QSettings("FastEncode", "Pro")
         self.output_folder = self.settings_store.value("output_folder", "")
         
-        # UI
         central = QWidget(); self.setCentralWidget(central); self.layout = QVBoxLayout(central)
-        self.tabs = QTabWidget(); self.layout.addWidget(self.tabs)
+        self.tabs = QTabWidget(); self.tabs.setStyleSheet(self.tab_style()); self.layout.addWidget(self.tabs)
         
-        # Tools
         self.player = QMediaPlayer(); self.audio = QAudioOutput(); self.player.setAudioOutput(self.audio)
         self.dwell = DwellClickFilter(self)
+        self.lib_items = []; self.cur_media = None; self.export_thread = None
+
+        self.timeline_tab = self.create_timeline_tab()
+        self.codec_tab = self.create_codec_tab()
+        self.batch_tab = self.create_batch_tab()
+        self.access_tab = self.create_access_tab()
         
-        self.lib_items = []
-        self.cur_media = None
-        self.export_thread = None
-
-        self.setup_timeline_tab()
-        self.setup_settings_tab()
-        self.setup_access_tab()
+        self.tabs.addTab(self.timeline_tab, "📽️ Timeline")
+        self.tabs.addTab(self.codec_tab, "⚙️ Codec")
+        self.tabs.addTab(self.batch_tab, "📦 Batch")
+        self.tabs.addTab(self.access_tab, "♿ Accessibility")
+        
         self.apply_theme()
-
-        # Connect player output now that widgets exist
         self.player.setVideoOutput(self.vid_wid)
 
-    def setup_timeline_tab(self):
+    # --- UI CREATION (Restored High Quality UI) ---
+    def create_timeline_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab)
         
-        # Project Controls
-        p_layout = QHBoxLayout()
-        self.btn_save = QPushButton("Save Project"); self.btn_save.clicked.connect(self.save_project)
-        self.btn_load = QPushButton("Load Project"); self.btn_load.clicked.connect(self.load_project)
-        p_layout.addWidget(self.btn_save); p_layout.addWidget(self.btn_load)
-        layout.addLayout(p_layout)
-
-        # Top: Lib + Player
-        top = QHBoxLayout()
-        # Lib
-        lib_grp = QGroupBox("Library"); lib_l = QVBoxLayout(lib_grp)
-        self.lib_list = QListWidget(); self.lib_list.itemClicked.connect(self.preview_media)
-        btn_add = QPushButton("Add Media"); btn_add.clicked.connect(self.add_media)
-        lib_l.addWidget(self.lib_list); lib_l.addWidget(btn_add)
-        top.addWidget(lib_grp)
+        # Save/Load
+        row = QHBoxLayout()
+        b_save = QPushButton("💾 Save Project"); b_save.clicked.connect(self.save_project)
+        b_load = QPushButton("📂 Load Project"); b_load.clicked.connect(self.load_project)
+        b_save.setStyleSheet(self.button_style("#3b82f6")); b_load.setStyleSheet(self.button_style("#f59e0b"))
+        row.addWidget(b_save); row.addWidget(b_load); layout.addLayout(row)
         
-        # Player
-        play_grp = QGroupBox("Preview"); play_l = QVBoxLayout(play_grp)
-        self.vid_wid = QVideoWidget(); self.vid_wid.setMinimumSize(400, 225); self.vid_wid.setStyleSheet("background:black;")
-        play_l.addWidget(self.vid_wid)
+        # Lib + Preview
+        top = QHBoxLayout()
+        
+        lib = QGroupBox("Library"); lib.setStyleSheet(self.groupbox_style()); ll = QVBoxLayout(lib)
+        self.lib_list = QListWidget(); self.lib_list.setStyleSheet(self.list_style())
+        self.lib_list.itemClicked.connect(self.preview_media)
+        b_add = QPushButton("➕ Add Media"); b_add.clicked.connect(self.add_media); b_add.setStyleSheet(self.button_style("#4ade80"))
+        ll.addWidget(self.lib_list); ll.addWidget(b_add); top.addWidget(lib)
+        
+        prev = QGroupBox("Preview"); prev.setStyleSheet(self.groupbox_style()); pl = QVBoxLayout(prev)
+        self.vid_wid = QVideoWidget(); self.vid_wid.setMinimumSize(400, 250); self.vid_wid.setStyleSheet("background:black;")
+        pl.addWidget(self.vid_wid)
         
         ctrls = QHBoxLayout()
-        self.btn_play = QPushButton("Play"); self.btn_play.clicked.connect(self.toggle_play)
-        self.btn_in = QPushButton("In"); self.btn_in.clicked.connect(self.set_in)
-        self.btn_out = QPushButton("Out"); self.btn_out.clicked.connect(self.set_out)
-        self.btn_fs = QPushButton("Fullscreen"); self.btn_fs.clicked.connect(self.enter_fs)
-        self.btn_append = QPushButton("Add to Timeline"); self.btn_append.clicked.connect(self.add_to_tl)
-        for b in [self.btn_play, self.btn_in, self.btn_out, self.btn_fs, self.btn_append]: ctrls.addWidget(b)
-        play_l.addLayout(ctrls)
-        top.addWidget(play_grp)
+        b_play = QPushButton("▶️ Play"); b_play.clicked.connect(self.toggle_play)
+        b_in = QPushButton("[ In"); b_in.clicked.connect(self.set_in)
+        b_out = QPushButton("Out ]"); b_out.clicked.connect(self.set_out)
+        b_fs = QPushButton("⛶ Fullscreen"); b_fs.clicked.connect(self.enter_fs)
+        b_tl = QPushButton("➕ Add to Timeline"); b_tl.clicked.connect(self.add_to_tl)
         
-        layout.addLayout(top)
+        for b in [b_play, b_in, b_out, b_fs, b_tl]:
+            b.setStyleSheet(self.button_style("#3b82f6"))
+            ctrls.addWidget(b)
+        pl.addLayout(ctrls); top.addWidget(prev); layout.addLayout(top)
         
         # Timeline
-        self.timeline = TimelineWidget()
-        layout.addWidget(self.timeline)
+        self.timeline = TimelineWidget(); layout.addWidget(self.timeline)
         
         # Export
         bot = QHBoxLayout()
-        self.btn_export = QPushButton("EXPORT"); self.btn_export.clicked.connect(self.export)
-        self.btn_stop = QPushButton("STOP"); self.btn_stop.clicked.connect(self.stop_export); self.btn_stop.setEnabled(False)
-        bot.addWidget(self.btn_export); bot.addWidget(self.btn_stop)
+        self.btn_exp = QPushButton("🚀 EXPORT VIDEO"); self.btn_exp.clicked.connect(self.export)
+        self.btn_exp.setStyleSheet(self.button_style("#ef4444"))
+        self.btn_exp.setMinimumHeight(60)
+        bot.addWidget(self.btn_exp)
         layout.addLayout(bot)
         
-        self.tabs.addTab(tab, "Timeline")
+        return tab
 
-    def setup_settings_tab(self):
+    def create_codec_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab)
+        
+        grp = QGroupBox("Settings"); grp.setStyleSheet(self.groupbox_style()); gl = QVBoxLayout(grp)
         
         self.combo_codec = QComboBox(); self.combo_codec.addItems(["hevc_nvenc", "h264_nvenc", "libx264"])
-        layout.addWidget(QLabel("Codec:")); layout.addWidget(self.combo_codec)
+        self.combo_codec.setStyleSheet(self.combo_style())
+        gl.addWidget(QLabel("Codec:")); gl.addWidget(self.combo_codec)
         
         self.spin_bitrate = QSpinBox(); self.spin_bitrate.setRange(1, 500); self.spin_bitrate.setValue(20)
-        layout.addWidget(QLabel("Bitrate (Mbps):")); layout.addWidget(self.spin_bitrate)
+        self.spin_bitrate.setStyleSheet(self.spinbox_style())
+        gl.addWidget(QLabel("Bitrate (Mbps):")); gl.addWidget(self.spin_bitrate)
         
-        self.chk_gpu_dec = QCheckBox("Enable GPU Hardware Decode"); self.chk_gpu_dec.setChecked(True)
-        layout.addWidget(self.chk_gpu_dec)
+        self.chk_gpu = QCheckBox("Enable GPU Decode"); self.chk_gpu.setChecked(True)
+        gl.addWidget(self.chk_gpu)
         
-        layout.addStretch()
-        self.tabs.addTab(tab, "Settings")
+        layout.addWidget(grp); layout.addStretch()
+        return tab
 
-    def setup_access_tab(self):
+    def create_batch_tab(self):
+        return QWidget() # Placeholder to keep layout valid
+
+    def create_access_tab(self):
         tab = QWidget(); layout = QVBoxLayout(tab)
         
-        # DWELL
-        grp = QGroupBox("Eye Tracking / Dwell"); gl = QVBoxLayout(grp)
-        chk = QCheckBox("Enable Dwell Click"); chk.stateChanged.connect(lambda s: self.dwell.set_enabled(s==2))
-        gl.addWidget(chk)
-        layout.addWidget(grp)
+        grp = QGroupBox("Accessibility"); grp.setStyleSheet(self.groupbox_style()); gl = QVBoxLayout(grp)
         
-        layout.addStretch()
-        self.tabs.addTab(tab, "Accessibility")
+        chk = QCheckBox("Enable Dwell Click (Eye Tracking)"); chk.stateChanged.connect(lambda s: self.dwell.set_enabled(s==2))
+        chk.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        gl.addWidget(chk)
+        
+        gl.addWidget(QLabel("High Contrast Focus Borders are enabled by default."))
+        
+        layout.addWidget(grp); layout.addStretch()
+        return tab
 
+    # --- STYLES ---
+    def tab_style(self):
+        return "QTabWidget::pane { border: 2px solid #4b5563; } QTabBar::tab { padding: 10px; font-size: 12pt; }"
+    def groupbox_style(self):
+        return "QGroupBox { border: 2px solid #4b5563; padding: 15px; margin-top: 10px; font-weight: bold; color: #4ade80; }"
+    def button_style(self, color):
+        return f"QPushButton {{ background: {color}; color: white; border-radius: 8px; padding: 8px; font-weight: bold; }} QPushButton:focus {{ border: 4px solid #f59e0b; }}"
+    def combo_style(self): return "QComboBox { padding: 5px; }"
+    def spinbox_style(self): return "QSpinBox { padding: 5px; }"
+    def list_style(self): return "QListWidget { border: 2px solid #4b5563; font-size: 11pt; }"
     def apply_theme(self):
         self.setStyleSheet("QMainWindow { background: #111827; } QLabel { color: white; } *:focus { border: 4px solid #f59e0b; }")
 
-    # Logic
+    # --- LOGIC ---
     def add_media(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Open Video")
         for f in files:
@@ -491,9 +455,9 @@ class FastEncodeProApp(QMainWindow):
         if self.cur_media: self.cur_media.out_point = self.player.position() / 1000.0
 
     def enter_fs(self):
-        if self.cur_media or self.player.source().isValid():
-            self.fullscreen_player = FullscreenVideoPlayer(self.player, self)
-            self.fullscreen_player.show()
+        if self.cur_media:
+            self.fs_player = FullscreenVideoPlayer(self.player)
+            self.fs_player.show()
 
     def add_to_tl(self):
         if self.cur_media:
@@ -509,20 +473,17 @@ class FastEncodeProApp(QMainWindow):
         s = {
             'video_codec': self.combo_codec.currentText(),
             'bitrate_mbps': self.spin_bitrate.value(),
-            'use_gpu_decode': self.chk_gpu_dec.isChecked(),
+            'use_gpu_decode': self.chk_gpu.isChecked(),
             'timeline_fps': 60.0
         }
         
-        self.btn_export.setEnabled(False); self.btn_stop.setEnabled(True)
+        self.btn_exp.setEnabled(False); self.btn_exp.setText("RENDERING...")
         self.export_thread = TimelineExportThread(self.timeline, out, s)
         self.export_thread.finished.connect(self.export_done)
         self.export_thread.start()
 
-    def stop_export(self):
-        if self.export_thread: self.export_thread.stop()
-
     def export_done(self, success, msg):
-        self.btn_export.setEnabled(True); self.btn_stop.setEnabled(False)
+        self.btn_exp.setEnabled(True); self.btn_exp.setText("EXPORT VIDEO")
         QMessageBox.information(self, "Export", msg)
 
     def save_project(self):

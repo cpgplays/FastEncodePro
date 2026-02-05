@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-FastEncode Pro - Accessibility Edition v0.06
+FastEncode Pro - Accessibility Edition v0.07.2
 GPU-Accelerated Video Editor with Native Eye-Tracking & Switch Support
 
-v0.06 Features:
-- Dwell Clicking (Eye Gaze Emulation)
-- High-Contrast Focus (Head Switch Support)
-- Smart Stream Rendering (Audio/Video Sync)
-- Fixed GPU Hardware Decoding
-- Linux/Hyprland Icon Support
+v0.07.2 Changes:
+- Added robust error reporting for the Video Player (Preview).
+- Fixed GPU Pipeline (Scale CUDA) for 100% GPU utilization.
+- MKV/GStreamer diagnostic check on startup.
 """
 
 import sys
@@ -26,7 +24,7 @@ from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
-__version__ = "0.06"
+__version__ = "0.07.2"
 __author__ = "cpgplays"
 
 # --- ACCESSIBILITY CLASSES ---
@@ -224,7 +222,7 @@ class FullscreenVideoPlayer(QWidget):
         buttons_row.addStretch()
         self.play_pause_btn = QPushButton("⏸️ PAUSE")
         self.play_pause_btn.setMinimumSize(300, 80)
-        self.play_pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus) # Changed for Switch Support
+        self.play_pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.play_pause_btn.setStyleSheet("""
             QPushButton {
                 background-color: #3b82f6;
@@ -238,7 +236,7 @@ class FullscreenVideoPlayer(QWidget):
                 background-color: #2563eb;
             }
             QPushButton:focus {
-                border: 6px solid #f59e0b; /* Orange focus for switches */
+                border: 6px solid #f59e0b;
             }
             QPushButton:pressed {
                 background-color: #1d4ed8;
@@ -825,12 +823,19 @@ class TimelineRenderingEngine:
         frame_size = int(width * height * 1.5)
         cmd = ['ffmpeg']
         if self.settings.get('use_gpu_decode', False):
-            cmd.extend(['-hwaccel', 'cuda'])
+            cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
         cmd.extend([
-            '-ss', f"{start_time:.6f}", '-i', input_file, '-vframes', str(frame_count),
-            '-vf', f'scale={width}:{height}:flags={scale_algo},fps={fps},format=yuv420p',
-            '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'
+            '-ss', f"{start_time:.6f}", '-i', input_file, '-vframes', str(frame_count)
         ])
+        
+        # FIXED GPU PIPELINE (Scale CUDA)
+        use_gpu = self.settings.get('use_gpu_decode', False)
+        if use_gpu:
+            vf = f"scale_cuda={width}:{height},hwdownload,format=nv12,fps={fps},format=yuv420p"
+        else:
+            vf = f"scale={width}:{height}:flags={scale_algo},fps={fps},format=yuv420p"
+            
+        cmd.extend(['-vf', vf, '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'])
         
         decoder = None
         try:
@@ -1062,6 +1067,9 @@ class FastEncodeProApp(QMainWindow):
         self.fullscreen_player = None
         self.timeline_duration = 0
         
+        # --- PLAYER ERROR HANDLING ---
+        self.player.errorOccurred.connect(self.handle_player_error)
+        
         # --- ACCESSIBILITY INIT ---
         self.dwell_filter = DwellClickFilter(self)
         
@@ -1089,6 +1097,43 @@ class FastEncodeProApp(QMainWindow):
         
         self.apply_theme()
         self.load_settings()
+        
+        # MKV CHECK
+        QTimer.singleShot(1000, self.check_system_health)
+
+    def handle_player_error(self):
+        """Displays friendly errors when the video player fails."""
+        err_msg = self.player.errorString()
+        self.status_label.setText(f"Player Error: {err_msg}")
+        self.log_text.append(f"❌ Video Player Error: {err_msg}")
+        
+        if "no service" in err_msg.lower() or "resource" in err_msg.lower():
+            QMessageBox.warning(self, "Playback Error", 
+                f"Could not play video.\nError: {err_msg}\n\n"
+                "If this is an MKV file, you are missing GStreamer plugins.\n"
+                "Check the Log tab for the fix command.")
+
+    def check_system_health(self):
+        # Only check on Linux
+        if sys.platform.startswith('linux'):
+            # Check for GStreamer Libav plugin (needed for MKV)
+            if not shutil.which('gst-inspect-1.0'):
+                pass 
+            else:
+                try:
+                    result = subprocess.run(['gst-inspect-1.0', 'libav'], capture_output=True, text=True)
+                    if "No such element or plugin" in result.stderr or result.returncode != 0:
+                        warn_msg = (
+                            "⚠️ MKV Support Missing!\n"
+                            "Your system is missing the GStreamer Libav bridge.\n"
+                            "MKV/HEVC videos will have audio but NO VIDEO.\n\n"
+                            "Run this in terminal to fix:\n"
+                            "sudo pacman -S gst-libav gst-plugins-good gst-plugins-bad gst-plugins-ugly"
+                        )
+                        self.log_text.append(warn_msg)
+                        QMessageBox.warning(self, "Missing Driver", warn_msg)
+                except:
+                    pass
 
     def create_accessibility_tab(self):
         tab = QWidget()
@@ -1580,7 +1625,6 @@ class FastEncodeProApp(QMainWindow):
         """)
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
         control_buttons = QHBoxLayout()
         self.start_btn = QPushButton("▶️ START ENCODING")
         self.start_btn.setStyleSheet(self.button_style("#4ade80"))

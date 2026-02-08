@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-FastEncode Pro - Timeline Edition v0.07.1
+FastEncode Pro - Timeline Edition v0.08
 GPU-Accelerated Video Editor with Full MKV Support
 
-v0.07.1 Features:
+v0.08 Features:
 - MKV Video Preview (MPV Integration)
 - AV1 Codec Support (CPU Decode Fallback)
 - Fixed Audio Rendering (Proper Error Handling)
@@ -22,13 +22,30 @@ import math
 from pathlib import Path
 
 # Try to import MPV for MKV support
+print("Checking for python-mpv library...")
 try:
     import mpv
     MPV_AVAILABLE = True
-except ImportError:
+    print(f"✅ python-mpv found! Version: {mpv.__version__ if hasattr(mpv, '__version__') else 'unknown'}")
+except ImportError as e:
     MPV_AVAILABLE = False
-    print("Warning: python-mpv not installed. MKV preview will be limited.")
-    print("Install with: pip install python-mpv --break-system-packages")
+    print("=" * 60)
+    print("❌ WARNING: python-mpv not installed. MKV preview disabled.")
+    print(f"   Import error: {e}")
+    print("=" * 60)
+    print("Install instructions:")
+    print("")
+    print("Arch/Manjaro/CachyOS:")
+    print("  sudo pacman -S mpv python-mpv")
+    print("")
+    print("Debian/Ubuntu:")
+    print("  sudo apt install libmpv-dev mpv")
+    print("  pip install python-mpv --break-system-packages")
+    print("")
+    print("Fedora:")
+    print("  sudo dnf install mpv python3-mpv")
+    print("=" * 60)
+    print("")
 
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRectF, QObject
@@ -374,64 +391,122 @@ class MPVVideoWidget(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        
+        # CRITICAL: Make this a native window BEFORE MPV tries to embed
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
+        
         self.mpv_player = None
         self.current_file = None
         self._is_paused = True
         self._duration_ms = 0
         self._position_ms = 0
+        self._mpv_initialized = False
         
         # Timer to update position
         self.position_timer = QTimer(self)
         self.position_timer.timeout.connect(self._update_position)
-        self.position_timer.setInterval(100)  # Update every 100ms
+        self.position_timer.setInterval(100)
         
         # Set black background
         self.setStyleSheet("background-color: black;")
         self.setMinimumSize(640, 360)
         
-        if MPV_AVAILABLE:
-            try:
-                # Initialize MPV with Qt OpenGL widget embedding
-                self.mpv_player = mpv.MPV(
-                    wid=str(int(self.winId())),
-                    vo='gpu',  # Use GPU rendering
-                    hwdec='auto',  # Hardware decode when available
-                    keep_open='yes',  # Keep window open after playback
-                    idle='yes',  # Start in idle mode
-                    osc='no',  # No on-screen controls
-                    input_default_bindings='no',  # Disable default keybinds
-                    input_vo_keyboard='no',  # Disable keyboard in video output
-                )
-                
-                # Set up event observers
-                @self.mpv_player.property_observer('duration')
-                def duration_observer(_name, value):
-                    if value:
-                        self._duration_ms = int(value * 1000)
-                        self.durationChanged.emit(self._duration_ms)
-                
-                @self.mpv_player.property_observer('time-pos')
-                def time_observer(_name, value):
-                    if value is not None:
-                        self._position_ms = int(value * 1000)
-                
-            except Exception as e:
-                print(f"MPV initialization error: {e}")
-                self.mpv_player = None
+        print("MPV widget created (MPV will initialize on first file load)")
+    
+    def _initialize_mpv(self):
+        """Initialize MPV player (called when first file is loaded)"""
+        if self._mpv_initialized:
+            print("MPV already initialized")
+            return True
+            
+        if not MPV_AVAILABLE:
+            print("MPV_AVAILABLE is False - python-mpv not imported")
+            return False
+        
+        try:
+            print("Starting MPV initialization...")
+            
+            # Force Qt to fully realize the widget
+            self.show()
+            from PyQt6.QtWidgets import QApplication
+            QApplication.processEvents()
+            
+            print("Widget shown, getting window ID...")
+            
+            # Get window ID after widget is fully shown
+            wid = int(self.winId())
+            print(f"Got window ID: {wid}")
+            
+            print("Creating MPV instance...")
+            
+            # Initialize MPV
+            self.mpv_player = mpv.MPV(
+                wid=str(wid),
+                vo='gpu',
+                hwdec='auto',
+                keep_open='yes',
+                idle='yes',
+                osc='no',
+                input_default_bindings='no',
+                input_vo_keyboard='no',
+                log_handler=print,
+                loglevel='info'
+            )
+            
+            print("MPV instance created successfully!")
+            
+            # Set up event observers
+            @self.mpv_player.property_observer('duration')
+            def duration_observer(_name, value):
+                if value:
+                    self._duration_ms = int(value * 1000)
+                    self.durationChanged.emit(self._duration_ms)
+            
+            @self.mpv_player.property_observer('time-pos')
+            def time_observer(_name, value):
+                if value is not None:
+                    self._position_ms = int(value * 1000)
+            
+            print("Event observers registered")
+            
+            self._mpv_initialized = True
+            return True
+            
+        except Exception as e:
+            print(f"MPV initialization FAILED with exception:")
+            print(f"  Error type: {type(e).__name__}")
+            print(f"  Error message: {e}")
+            import traceback
+            traceback.print_exc()
+            self.mpv_player = None
+            return False
     
     def load_file(self, file_path):
         """Load a video file"""
+        print(f"MPV load_file called with: {file_path}")
+        print(f"File exists: {os.path.exists(file_path)}")
+        
+        # Initialize MPV on first file load (lazy initialization)
+        if not self._mpv_initialized:
+            if not self._initialize_mpv():
+                return False
+        
         if not self.mpv_player:
             return False
         
         try:
             self.current_file = file_path
+            print(f"Calling mpv_player.loadfile({file_path})")
             self.mpv_player.loadfile(file_path)
             self.mpv_player.pause = True  # Start paused
             self._is_paused = True
+            print("MPV loadfile succeeded")
             return True
         except Exception as e:
             print(f"MPV load error: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def play(self):
@@ -2024,23 +2099,60 @@ class FastEncodeProApp(QMainWindow):
         if self.using_mpv:
             return  # Already using MPV
         
-        # Hide QVideoWidget
-        self.video_widget.hide()
-        
-        # Create MPV widget if it doesn't exist
-        if not self.mpv_widget:
-            self.mpv_widget = MPVVideoWidget()
-            self.mpv_widget.setMinimumSize(640, 360)
-            self.mpv_widget.setStyleSheet("background-color: black; border: 2px solid #4b5563; border-radius: 8px;")
-            self.video_container_layout.addWidget(self.mpv_widget)
+        try:
+            # Hide QVideoWidget
+            self.video_widget.hide()
             
-            # Connect MPV signals to UI
-            self.mpv_widget.positionChanged.connect(self._on_mpv_position_changed)
-            self.mpv_widget.durationChanged.connect(self._on_mpv_duration_changed)
-        
-        self.mpv_widget.show()
-        self.using_mpv = True
-        print("Switched to MPV player for MKV/AV1 support")
+            # Create MPV widget if it doesn't exist
+            if not self.mpv_widget:
+                print("Creating MPV widget...")
+                self.mpv_widget = MPVVideoWidget()
+                
+                if not self.mpv_widget.mpv_player:
+                    # MPV failed to initialize
+                    error_msg = "MPV player failed to initialize. MKV preview not available.\n\n"
+                    error_msg += "Installation instructions:\n\n"
+                    error_msg += "Arch/Manjaro/CachyOS:\n"
+                    error_msg += "  sudo pacman -S mpv python-mpv\n\n"
+                    error_msg += "Debian/Ubuntu:\n"
+                    error_msg += "  sudo apt install libmpv-dev mpv\n"
+                    error_msg += "  pip install python-mpv --break-system-packages\n\n"
+                    error_msg += "Fedora:\n"
+                    error_msg += "  sudo dnf install mpv python3-mpv\n\n"
+                    error_msg += "Rendering will still work (uses FFmpeg directly)."
+                    
+                    QMessageBox.warning(self, "MPV Not Available", error_msg)
+                    
+                    # Fall back to showing QVideoWidget (won't play, but won't crash)
+                    self.video_widget.show()
+                    self.using_mpv = False
+                    return
+                
+                self.mpv_widget.setMinimumSize(640, 360)
+                self.mpv_widget.setStyleSheet("background-color: black; border: 2px solid #4b5563; border-radius: 8px;")
+                self.video_container_layout.addWidget(self.mpv_widget)
+                
+                # Connect MPV signals to UI
+                self.mpv_widget.positionChanged.connect(self._on_mpv_position_changed)
+                self.mpv_widget.durationChanged.connect(self._on_mpv_duration_changed)
+                
+                print("MPV widget created successfully")
+            
+            self.mpv_widget.show()
+            self.using_mpv = True
+            print("Switched to MPV player for MKV/AV1 support")
+            
+        except Exception as e:
+            print(f"ERROR creating MPV widget: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Show error to user
+            QMessageBox.critical(self, "MPV Error", f"Failed to initialize MPV player:\n\n{str(e)}\n\nMKV preview will not work, but rendering will still function.")
+            
+            # Fall back to QVideoWidget
+            self.video_widget.show()
+            self.using_mpv = False
     
     def _switch_to_qmediaplayer(self):
         """Switch from MPV to QVideoWidget"""
@@ -2081,13 +2193,33 @@ class FastEncodeProApp(QMainWindow):
             self.current_media = self.media_library[row]
             file_path = self.current_media.file_path
             
+            # Debug: Check the file path being used
+            print("=" * 60)
+            print(f"Media selected: {self.current_media.name if hasattr(self.current_media, 'name') else 'unknown'}")
+            print(f"File path: {file_path}")
+            print(f"File exists: {os.path.exists(file_path)}")
+            print(f"File extension: {os.path.splitext(file_path)[1]}")
+            print(f"MPV_AVAILABLE: {MPV_AVAILABLE}")
+            print("=" * 60)
+            
             # Determine which player to use
             if self._should_use_mpv(file_path):
+                print(f"File requires MPV (detected as MKV/AV1)")
                 self._switch_to_mpv()
-                if self.mpv_widget:
+                
+                # Only try to load if MPV actually initialized
+                if self.mpv_widget and self.mpv_widget.mpv_player:
+                    print("MPV player available, loading file...")
                     self.mpv_widget.load_file(file_path)
                     self.mpv_widget.pause()
+                else:
+                    print("MPV player not available, falling back to QMediaPlayer")
+                    # MPV failed - use QMediaPlayer instead (won't preview but won't crash)
+                    self._switch_to_qmediaplayer()
+                    self.player.setSource(QUrl.fromLocalFile(file_path))
+                    self.player.pause()
             else:
+                print("Using QMediaPlayer")
                 self._switch_to_qmediaplayer()
                 self.player.setSource(QUrl.fromLocalFile(file_path))
                 self.player.pause()
@@ -2100,10 +2232,18 @@ class FastEncodeProApp(QMainWindow):
         # Determine which player to use
         if self._should_use_mpv(file_path):
             self._switch_to_mpv()
-            if self.mpv_widget:
+            
+            # Only try to load if MPV actually initialized
+            if self.mpv_widget and self.mpv_widget.mpv_player:
                 self.mpv_widget.load_file(file_path)
                 self.mpv_widget.seek(int(clip.in_point * 1000))
                 self.mpv_widget.pause()
+            else:
+                # MPV failed - use QMediaPlayer instead
+                self._switch_to_qmediaplayer()
+                self.player.setSource(QUrl.fromLocalFile(file_path))
+                self.player.setPosition(int(clip.in_point * 1000))
+                self.player.pause()
         else:
             self._switch_to_qmediaplayer()
             self.player.setSource(QUrl.fromLocalFile(file_path))

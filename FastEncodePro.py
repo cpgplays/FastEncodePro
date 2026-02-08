@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-FastEncode Pro - Timeline Edition v0.08
+FastEncode Pro - Timeline Edition v0.07.1
 GPU-Accelerated Video Editor with Full MKV Support
 
-v0.08 Features:
+v0.07.1 Features:
 - MKV Video Preview (MPV Integration)
 - AV1 Codec Support (CPU Decode Fallback)
 - Fixed Audio Rendering (Proper Error Handling)

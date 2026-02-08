@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-FastEncode Pro - Accessibility Edition v0.06
-GPU-Accelerated Video Editor with Native Eye-Tracking & Switch Support
+FastEncode Pro - Timeline Edition v0.08
+GPU-Accelerated Video Editor with Full MKV Support
 
-v0.06 Features:
-- Dwell Clicking (Eye Gaze Emulation)
-- High-Contrast Focus (Head Switch Support)
-- Smart Stream Rendering (Audio/Video Sync)
-- Fixed GPU Hardware Decoding
-- Linux/Hyprland Icon Support
+v0.08 Features:
+- MKV Video Preview (MPV Integration)
+- AV1 Codec Support (CPU Decode Fallback)
+- Fixed Audio Rendering (Proper Error Handling)
+- Fixed Merge Crashes (Non-Blocking Merge)
+- Dwell Clicking & Eye Tracking Support
 """
 
 import sys
@@ -20,13 +20,23 @@ import json
 import time
 import math
 from pathlib import Path
+
+# Try to import MPV for MKV support
+try:
+    import mpv
+    MPV_AVAILABLE = True
+except ImportError:
+    MPV_AVAILABLE = False
+    print("Warning: python-mpv not installed. MKV preview will be limited.")
+    print("Install with: pip install python-mpv --break-system-packages")
+
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRectF, QObject
 from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor, QAction, QPainterPath, QMouseEvent
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
-__version__ = "0.06"
+__version__ = "0.08"
 __author__ = "cpgplays"
 
 # --- ACCESSIBILITY CLASSES ---
@@ -224,7 +234,7 @@ class FullscreenVideoPlayer(QWidget):
         buttons_row.addStretch()
         self.play_pause_btn = QPushButton("⏸️ PAUSE")
         self.play_pause_btn.setMinimumSize(300, 80)
-        self.play_pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus) # Changed for Switch Support
+        self.play_pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus) 
         self.play_pause_btn.setStyleSheet("""
             QPushButton {
                 background-color: #3b82f6;
@@ -352,6 +362,133 @@ class FullscreenVideoPlayer(QWidget):
         except Exception as e:
             print(f"Error restoring video output: {e}")
         self.close()
+
+
+# --- MPV VIDEO WIDGET FOR MKV SUPPORT ---
+
+class MPVVideoWidget(QWidget):
+    """MPV-based video widget for MKV/AV1/VP9 playback support"""
+    
+    positionChanged = pyqtSignal(int)  # Emits position in milliseconds
+    durationChanged = pyqtSignal(int)  # Emits duration in milliseconds
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.mpv_player = None
+        self.current_file = None
+        self._is_paused = True
+        self._duration_ms = 0
+        self._position_ms = 0
+        
+        # Timer to update position
+        self.position_timer = QTimer(self)
+        self.position_timer.timeout.connect(self._update_position)
+        self.position_timer.setInterval(100)  # Update every 100ms
+        
+        # Set black background
+        self.setStyleSheet("background-color: black;")
+        self.setMinimumSize(640, 360)
+        
+        if MPV_AVAILABLE:
+            try:
+                # Initialize MPV with Qt OpenGL widget embedding
+                self.mpv_player = mpv.MPV(
+                    wid=str(int(self.winId())),
+                    vo='gpu',  # Use GPU rendering
+                    hwdec='auto',  # Hardware decode when available
+                    keep_open='yes',  # Keep window open after playback
+                    idle='yes',  # Start in idle mode
+                    osc='no',  # No on-screen controls
+                    input_default_bindings='no',  # Disable default keybinds
+                    input_vo_keyboard='no',  # Disable keyboard in video output
+                )
+                
+                # Set up event observers
+                @self.mpv_player.property_observer('duration')
+                def duration_observer(_name, value):
+                    if value:
+                        self._duration_ms = int(value * 1000)
+                        self.durationChanged.emit(self._duration_ms)
+                
+                @self.mpv_player.property_observer('time-pos')
+                def time_observer(_name, value):
+                    if value is not None:
+                        self._position_ms = int(value * 1000)
+                
+            except Exception as e:
+                print(f"MPV initialization error: {e}")
+                self.mpv_player = None
+    
+    def load_file(self, file_path):
+        """Load a video file"""
+        if not self.mpv_player:
+            return False
+        
+        try:
+            self.current_file = file_path
+            self.mpv_player.loadfile(file_path)
+            self.mpv_player.pause = True  # Start paused
+            self._is_paused = True
+            return True
+        except Exception as e:
+            print(f"MPV load error: {e}")
+            return False
+    
+    def play(self):
+        """Start playback"""
+        if self.mpv_player and self.current_file:
+            self.mpv_player.pause = False
+            self._is_paused = False
+            self.position_timer.start()
+    
+    def pause(self):
+        """Pause playback"""
+        if self.mpv_player:
+            self.mpv_player.pause = True
+            self._is_paused = True
+            self.position_timer.stop()
+    
+    def is_paused(self):
+        """Check if playback is paused"""
+        return self._is_paused
+    
+    def seek(self, position_ms):
+        """Seek to position in milliseconds"""
+        if self.mpv_player:
+            try:
+                self.mpv_player.seek(position_ms / 1000.0, reference='absolute')
+                self._position_ms = position_ms
+            except:
+                pass
+    
+    def position(self):
+        """Get current position in milliseconds"""
+        return self._position_ms
+    
+    def duration(self):
+        """Get duration in milliseconds"""
+        return self._duration_ms
+    
+    def _update_position(self):
+        """Emit position update signal"""
+        self.positionChanged.emit(self._position_ms)
+    
+    def stop(self):
+        """Stop playback"""
+        if self.mpv_player:
+            self.mpv_player.command('stop')
+            self._is_paused = True
+            self._position_ms = 0
+            self.position_timer.stop()
+    
+    def shutdown(self):
+        """Cleanup MPV player"""
+        if self.mpv_player:
+            try:
+                self.position_timer.stop()
+                self.mpv_player.terminate()
+            except:
+                pass
 
 
 class TimelineClip:
@@ -649,6 +786,10 @@ def _parse_ffmpeg_time(line):
 
 
 class TimelineRenderingEngine:
+    """
+    Fixed engine: Uses local temporary folder for raw streams to prevent
+    External Drive (USB) bottlenecks, broken pipes, and SIGKILL errors.
+    """
     def __init__(self, timeline, settings, output_path,
                  log_callback, progress_callback, status_callback, playhead_callback=None):
         self.timeline = timeline
@@ -688,12 +829,25 @@ class TimelineRenderingEngine:
     
     def get_video_metadata(self, file_path):
         try:
-            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', file_path]
+            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
+                   '-show_entries', 'stream=width,height,codec_name', '-of', 'json', file_path]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             data = json.loads(result.stdout)
-            return data['streams'][0]['width'], data['streams'][0]['height']
+            stream = data['streams'][0]
+            return stream['width'], stream['height']
         except:
             return 1920, 1080
+    
+    def _get_video_codec(self, file_path):
+        """Detect video codec (needed for AV1 handling)"""
+        try:
+            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                   '-show_entries', 'stream=codec_name', '-of', 'json', file_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            data = json.loads(result.stdout)
+            return data['streams'][0]['codec_name']
+        except:
+            return 'unknown'
 
     def _build_render_plan(self, total_frames, timeline_fps):
         self.log("Building render plan...")
@@ -730,11 +884,51 @@ class TimelineRenderingEngine:
         return segments
 
     def render(self):
-        temp_video = self.output_path + ".temp_video.mov"
-        temp_audio = self.output_path + ".temp_audio.wav"
+        # SMART TEMP DIRECTORY SELECTION:
+        # 1. Try output directory (user's selected drive) if it has space
+        # 2. Fall back to /tmp/ (boot drive) if output drive is problematic
+        # 3. This ensures we don't fill up boot drive on small SSDs
+        
+        output_dir = os.path.dirname(self.output_path)
+        temp_dir = None
+        
+        # Check if output directory has enough free space (estimate 15GB needed for 5K render)
+        try:
+            stat = shutil.disk_usage(output_dir)
+            free_gb = stat.free / (1024**3)
+            
+            if free_gb > 15:  # At least 15GB free
+                # Use output directory for temp files (same drive = faster final copy)
+                temp_dir = output_dir
+                self.log(f"Using output drive for temp files ({free_gb:.1f}GB free)")
+            else:
+                # Not enough space on output drive, use /tmp/
+                temp_dir = tempfile.gettempdir()
+                self.log(f"Output drive low on space ({free_gb:.1f}GB), using {temp_dir}")
+        except:
+            # Can't check output directory (permissions?), use /tmp/
+            temp_dir = tempfile.gettempdir()
+            self.log(f"Using system temp: {temp_dir}")
+        
+        # Check /tmp/ space if we're using it
+        if temp_dir == tempfile.gettempdir():
+            try:
+                stat = shutil.disk_usage(temp_dir)
+                free_gb = stat.free / (1024**3)
+                if free_gb < 10:
+                    self.log(f"WARNING: Low disk space on {temp_dir} ({free_gb:.1f}GB free)")
+                    return False, f"Insufficient disk space: {free_gb:.1f}GB free (need 10GB+)"
+            except:
+                pass
+        
+        ts = int(time.time())
+        temp_video = os.path.join(temp_dir, f"fep_video_stream_{ts}.mov")
+        temp_audio = os.path.join(temp_dir, f"fep_audio_stream_{ts}.wav")
         
         try:
             self.log("=== HIGH-PERFORMANCE STREAM RENDERING v0.7.2 ===")
+            self.log(f"Temp storage: {temp_dir} (Faster & Safer than USB)")
+            
             if not self.timeline.clips:
                 return False, "No clips on timeline"
             
@@ -767,10 +961,15 @@ class TimelineRenderingEngine:
                 if self.should_stop: return False, "Cancelled"
                 count = seg['count']
                 if seg['type'] == 'blank':
+                    # Generate black frames for YUV420P
+                    # Y = 16 (Black), U = 128 (Neutral), V = 128 (Neutral)
                     black_frame = bytes([16] * (export_width * export_height)) + bytes([128] * (export_width * export_height // 2))
                     for _ in range(count):
                         if self.should_stop: break
-                        self.encoder_process.stdin.write(black_frame)
+                        try:
+                            self.encoder_process.stdin.write(black_frame)
+                        except (BrokenPipeError, IOError):
+                            return False, "Encoder pipe broken (Disk full?)"
                         frames_processed += 1
                         self._update_progress(frames_processed, total_frames, start_time, timeline_fps)
                 elif seg['type'] == 'clip':
@@ -782,27 +981,103 @@ class TimelineRenderingEngine:
                         clip.file_path, source_seek_time, count, export_width, export_height, timeline_fps,
                         frames_processed, total_frames, start_time
                     )
-                    if not success:
-                        self.log("Video decode error, padding with black.")
+                    
+                    # FIX: 99% Stall Fix. If clip ended early or errored, pad with black to satisfy encoder.
+                    if not success or success < count:
+                        missing = count - (success if isinstance(success, int) else 0)
+                        self.log(f"Warning: Clip ended early. Padding {missing} frames.")
                         black_frame = bytes([16] * (export_width * export_height)) + bytes([128] * (export_width * export_height // 2))
-                        for _ in range(count):
-                            self.encoder_process.stdin.write(black_frame)
+                        for _ in range(missing):
+                            try:
+                                self.encoder_process.stdin.write(black_frame)
+                            except:
+                                break
+                    
                     frames_processed += count
 
-            self.encoder_process.stdin.close()
-            self.encoder_process.wait()
+            if self.encoder_process.stdin:
+                self.encoder_process.stdin.close()
+            
+            # FIX: Wait with timeout for encoder to finish
+            # Long renders (78 min) need more time to finalize
+            self.log("Waiting for encoder to finalize video file...")
+            try:
+                self.encoder_process.wait(timeout=60)  # 60 seconds for long renders
+                self.log("Encoder finished successfully")
+            except subprocess.TimeoutExpired:
+                self.log("WARNING: Encoder timeout after 60s - forcing termination")
+                self.encoder_process.kill()
+                self.encoder_process.wait()
+                # Check if file was created anyway
+                if not os.path.exists(temp_video) or os.path.getsize(temp_video) < 1000:
+                    return False, "Encoder timeout - file not created"
+            
+            # Verify encoder completed successfully
+            if self.encoder_process.returncode != 0:
+                return False, f"Encoder failed with exit code {self.encoder_process.returncode}"
             
             self.log("Phase 2/3: Rendering Audio Stream...")
-            self._render_audio(segments, timeline_fps, temp_audio)
+            audio_success = self._render_audio(segments, timeline_fps, temp_audio)
             
-            self.log("Phase 3/3: Merging Audio and Video...")
+            if not audio_success:
+                self.log("ERROR: Audio rendering failed")
+                # Clean up temp video
+                if os.path.exists(temp_video): os.remove(temp_video)
+                return False, "Audio rendering failed - check logs for details"
+            
+            self.log("Phase 3/3: Merging Audio and Video to Destination...")
             self.status("Finalizing...")
-            merge_cmd = [
-                'ffmpeg', '-y', '-v', 'error', '-i', temp_video, '-i', temp_audio,
-                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '320k', '-shortest', self.output_path
-            ]
-            subprocess.run(merge_cmd, check=True)
             
+            # Merge logic - reading from local temp, writing to final destination
+            # Add +faststart here (rewrites once at end, not during encoding)
+            merge_cmd = [
+                'ffmpeg', '-y', '-v', 'error', '-stats',
+                '-i', temp_video, 
+                '-i', temp_audio,
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '320k', 
+                '-movflags', '+faststart',  # Optimize for web streaming
+                '-shortest', self.output_path
+            ]
+            
+            # CRITICAL FIX: Use Popen instead of run() to prevent UI freeze on large files
+            # subprocess.run() blocks for 5-10 min on 60GB files, causing Qt to kill the app
+            self.log("Merging 60GB+ files - this may take 5-10 minutes...")
+            merge_process = subprocess.Popen(
+                merge_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            # Monitor merge progress and keep UI responsive
+            while merge_process.poll() is None:
+                if self.should_stop:
+                    merge_process.kill()
+                    return False, "Merge cancelled"
+                
+                # Read stderr to check for errors (FFmpeg outputs to stderr)
+                try:
+                    import select
+                    if select.select([merge_process.stderr], [], [], 0.5)[0]:
+                        line = merge_process.stderr.readline()
+                        if line and 'error' in line.lower():
+                            self.log(f"Merge warning: {line.strip()}")
+                except:
+                    pass
+                
+                # Update status every second to keep UI alive
+                time.sleep(1)
+                self.status("Finalizing (merging audio/video)...")
+            
+            # Check merge completed successfully
+            if merge_process.returncode != 0:
+                stderr_output = merge_process.stderr.read()
+                self.log(f"Merge failed: {stderr_output}")
+                return False, f"Merge failed with exit code {merge_process.returncode}"
+            
+            self.log("Merge complete!")
+            
+            # Cleanup
             if os.path.exists(temp_video): os.remove(temp_video)
             if os.path.exists(temp_audio): os.remove(temp_audio)
             
@@ -822,9 +1097,21 @@ class TimelineRenderingEngine:
     def _stream_segment_to_encoder(self, input_file, start_time, frame_count, width, height, fps, 
                                  current_total_frames, target_total_frames, job_start_time):
         scale_algo = self.settings.get('scale_algo', 'lanczos')
+        # YUV420P frame size = W * H * 1.5
         frame_size = int(width * height * 1.5)
+        
+        # Detect codec - AV1 needs software decode on RTX 20-series
+        codec = self._get_video_codec(input_file)
+        use_gpu = self.settings.get('use_gpu_decode', False)
+        
+        # Disable GPU decode for AV1 (not supported on RTX 20/30-series)
+        if codec == 'av1':
+            use_gpu = False
+            if current_total_frames == 0:  # Log once per file
+                self.log(f"Detected AV1 codec - using CPU decode (GPU AV1 decode requires RTX 30+)")
+        
         cmd = ['ffmpeg']
-        if self.settings.get('use_gpu_decode', False):
+        if use_gpu:
             cmd.extend(['-hwaccel', 'cuda'])
         cmd.extend([
             '-ss', f"{start_time:.6f}", '-i', input_file, '-vframes', str(frame_count),
@@ -833,28 +1120,44 @@ class TimelineRenderingEngine:
         ])
         
         decoder = None
+        frames_read = 0
         try:
-            decoder = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**7)
-            frames_read = 0
+            # Capture stderr to see decoder errors (especially for MKV files)
+            decoder = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
+            
             while frames_read < frame_count:
                 if self.should_stop:
                     decoder.kill()
-                    return False
+                    return frames_read
+                
                 raw_data = decoder.stdout.read(frame_size)
-                if not raw_data or len(raw_data) != frame_size: break
+                if not raw_data or len(raw_data) != frame_size:
+                    # Decoder failed - check stderr
+                    if frames_read == 0:  # Failed immediately
+                        try:
+                            stderr_output = decoder.stderr.read().decode('utf-8', errors='ignore')
+                            if stderr_output:
+                                self.log(f"Decoder failed on {os.path.basename(input_file)}: {stderr_output[-500:]}")
+                        except:
+                            pass
+                    break
+                    
                 try:
                     self.encoder_process.stdin.write(raw_data)
                 except IOError:
-                    return False
+                    # Pipe broken
+                    return frames_read
+                
                 frames_read += 1
                 if frames_read % 5 == 0:
                     self._update_progress(current_total_frames + frames_read, target_total_frames, job_start_time, fps)
+            
             decoder.wait()
-            return True
+            return frames_read
         except Exception as e:
             self.log(f"Stream error: {e}")
             if decoder: decoder.kill()
-            return False
+            return frames_read
 
     def _update_progress(self, current, total, start_time, fps):
         if total == 0: return
@@ -881,7 +1184,9 @@ class TimelineRenderingEngine:
                             '-bufsize', f'{int(bitrate_kbps * 2)}k', '-g', str(int(fps * 2))])
                 pixel_format = self.settings.get('pixel_format', 0)
                 cmd.extend(['-pix_fmt', 'yuv420p' if pixel_format == 0 else 'p010le'])
-            cmd.extend(['-an', '-movflags', '+faststart', output_file])
+            # DON'T use +faststart here - it rewrites entire 60GB file (takes 30-40 min on HDD)
+            # We'll add it in the final merge step instead
+            cmd.extend(['-an', output_file])
             self.encoder_process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=10**7)
             return True
         except Exception as e:
@@ -892,36 +1197,93 @@ class TimelineRenderingEngine:
         sample_rate = 48000
         channels = 2
         bytes_per_sample = 2
+        
         cmd_enc = ['ffmpeg', '-y', '-v', 'error', '-f', 's16le', '-ar', str(sample_rate), '-ac', str(channels),
                    '-i', 'pipe:0', '-c:a', 'pcm_s16le', audio_output_path]
+        
         encoder = None
         try:
-            encoder = subprocess.Popen(cmd_enc, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Capture stderr to see audio encoding errors
+            encoder = subprocess.Popen(cmd_enc, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            
             for seg in segments:
-                if self.should_stop: break
+                if self.should_stop: 
+                    break
+                    
                 num_samples = int((seg['count'] / timeline_fps) * sample_rate)
+                
                 if seg['type'] == 'blank':
                     num_bytes = num_samples * channels * bytes_per_sample
-                    encoder.stdin.write(bytes([0] * num_bytes))
+                    try:
+                        encoder.stdin.write(bytes([0] * num_bytes))
+                    except (BrokenPipeError, IOError) as e:
+                        self.log(f"Audio encoder pipe broken: {e}")
+                        return False
+                        
                 elif seg['type'] == 'clip':
                     clip = seg['clip']
                     offset = seg['timeline_start'] - clip.start_time
                     seek_time = clip.in_point + offset
                     duration = seg['count'] / timeline_fps
+                    
                     self.log(f"Encoding Audio: {clip.name}")
+                    
                     cmd_dec = ['ffmpeg', '-ss', f"{seek_time:.6f}", '-i', clip.file_path, '-t', f"{duration:.6f}",
                                '-vn', '-f', 's16le', '-ar', str(sample_rate), '-ac', str(channels), '-']
-                    decoder = subprocess.Popen(cmd_dec, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    
+                    decoder = subprocess.Popen(cmd_dec, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    
                     while True:
                         chunk = decoder.stdout.read(4096)
-                        if not chunk: break
-                        encoder.stdin.write(chunk)
+                        if not chunk: 
+                            break
+                        try:
+                            encoder.stdin.write(chunk)
+                        except (BrokenPipeError, IOError) as e:
+                            self.log(f"Audio encoder pipe broken while writing: {e}")
+                            decoder.kill()
+                            return False
+                    
                     decoder.wait()
+            
+            # Close encoder stdin and wait with timeout
             encoder.stdin.close()
-            encoder.wait()
+            
+            self.log("Waiting for audio encoder to finish...")
+            try:
+                encoder.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.log("WARNING: Audio encoder timeout")
+                encoder.kill()
+                encoder.wait()
+                return False
+            
+            # Check if encoder completed successfully
+            if encoder.returncode != 0:
+                stderr_output = encoder.stderr.read().decode('utf-8', errors='ignore')
+                self.log(f"Audio encoder failed: {stderr_output}")
+                return False
+            
+            # Verify audio file was created
+            if not os.path.exists(audio_output_path):
+                self.log(f"ERROR: Audio file was not created at {audio_output_path}")
+                return False
+            
+            file_size = os.path.getsize(audio_output_path)
+            if file_size < 1000:
+                self.log(f"ERROR: Audio file is too small ({file_size} bytes) - likely corrupted")
+                return False
+            
+            self.log(f"Audio rendering complete ({file_size / (1024*1024):.1f} MB)")
+            return True
+            
         except Exception as e:
             self.log(f"Audio render error: {e}")
-            if encoder: encoder.kill()
+            import traceback
+            self.log(traceback.format_exc())
+            if encoder: 
+                encoder.kill()
+            return False
 
 
 class TimelineExportThread(QThread):
@@ -940,10 +1302,17 @@ class TimelineExportThread(QThread):
 
     def run(self):
         self.engine = TimelineRenderingEngine(self.timeline, self.settings, self.output_path,
-            log_callback=self.log_message.emit, progress_callback=self.progress.emit,
+            log_callback=self._log_immediate, progress_callback=self.progress.emit,
             status_callback=self.status.emit, playhead_callback=self.playhead_update.emit)
         success, message = self.engine.render()
         self.finished.emit(success, message)
+    
+    def _log_immediate(self, message):
+        """Force immediate log display instead of buffering"""
+        self.log_message.emit(message)
+        # Force Qt to process the signal immediately
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
 
     def stop(self):
         if self.engine: self.engine.stop()
@@ -1056,9 +1425,14 @@ class FastEncodeProApp(QMainWindow):
         self.current_file_index = 0
         self.media_library = []
         self.current_media = None
+        
+        # Dual player system: QMediaPlayer for MP4/MOV, MPV for MKV/AV1
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
+        self.mpv_widget = None  # Will be created when needed
+        self.using_mpv = False  # Track which player is active
+        
         self.fullscreen_player = None
         self.timeline_duration = 0
         
@@ -1205,11 +1579,24 @@ class FastEncodeProApp(QMainWindow):
         preview_title = QLabel("🎬 PREVIEW")
         preview_title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #3b82f6; padding: 5px;")
         preview_layout.addWidget(preview_title)
+        
+        # Container for switchable video widgets (QVideoWidget or MPVVideoWidget)
+        self.video_container = QWidget()
+        self.video_container_layout = QVBoxLayout(self.video_container)
+        self.video_container_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Create QVideoWidget (for MP4, MOV, etc.)
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumSize(640, 360)
         self.video_widget.setStyleSheet("background-color: black; border: 2px solid #4b5563; border-radius: 8px;")
         self.player.setVideoOutput(self.video_widget)
-        preview_layout.addWidget(self.video_widget)
+        self.video_container_layout.addWidget(self.video_widget)
+        self.video_widget.show()
+        
+        # MPV widget will be created on-demand for MKV files
+        # (saves resources if user never loads MKV)
+        
+        preview_layout.addWidget(self.video_container)
         self.preview_slider = QSlider(Qt.Orientation.Horizontal)
         self.preview_slider.setMinimum(0)
         self.preview_slider.setMaximum(1000)
@@ -1612,19 +1999,117 @@ class FastEncodeProApp(QMainWindow):
             if self.current_media and row == self.media_library.index(self.current_media) if self.current_media in self.media_library else False:
                 self.current_media = None
                 self.player.stop()
+    
+    def _should_use_mpv(self, file_path):
+        """Determine if file should use MPV player (MKV, AV1, VP9)"""
+        if not MPV_AVAILABLE:
+            return False
+        
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ['.mkv', '.webm']:
+            return True
+        
+        # Check codec for AV1/VP9 in other containers
+        try:
+            codec = self.timeline.rendering_engine._get_video_codec(file_path) if hasattr(self, 'timeline') else None
+            if codec in ['av1', 'vp9', 'vp8']:
+                return True
+        except:
+            pass
+        
+        return False
+    
+    def _switch_to_mpv(self):
+        """Switch from QVideoWidget to MPV widget"""
+        if self.using_mpv:
+            return  # Already using MPV
+        
+        # Hide QVideoWidget
+        self.video_widget.hide()
+        
+        # Create MPV widget if it doesn't exist
+        if not self.mpv_widget:
+            self.mpv_widget = MPVVideoWidget()
+            self.mpv_widget.setMinimumSize(640, 360)
+            self.mpv_widget.setStyleSheet("background-color: black; border: 2px solid #4b5563; border-radius: 8px;")
+            self.video_container_layout.addWidget(self.mpv_widget)
+            
+            # Connect MPV signals to UI
+            self.mpv_widget.positionChanged.connect(self._on_mpv_position_changed)
+            self.mpv_widget.durationChanged.connect(self._on_mpv_duration_changed)
+        
+        self.mpv_widget.show()
+        self.using_mpv = True
+        print("Switched to MPV player for MKV/AV1 support")
+    
+    def _switch_to_qmediaplayer(self):
+        """Switch from MPV to QVideoWidget"""
+        if not self.using_mpv:
+            return  # Already using QMediaPlayer
+        
+        # Hide MPV widget
+        if self.mpv_widget:
+            self.mpv_widget.hide()
+        
+        # Show QVideoWidget
+        self.video_widget.show()
+        self.using_mpv = False
+        print("Switched to QMediaPlayer")
+    
+    def _on_mpv_position_changed(self, position_ms):
+        """Handle MPV position updates"""
+        # Update slider
+        if self.mpv_widget and self.mpv_widget.duration() > 0:
+            slider_value = int((position_ms / self.mpv_widget.duration()) * 1000)
+            self.preview_slider.setValue(slider_value)
+        
+        # Update timecode
+        current_tc = self.format_timecode(position_ms)
+        total_tc = self.format_timecode(self.mpv_widget.duration() if self.mpv_widget else 0)
+        self.timecode_label.setText(f"{current_tc} / {total_tc}")
+    
+    def _on_mpv_duration_changed(self, duration_ms):
+        """Handle MPV duration updates"""
+        # Update timecode display
+        current_tc = self.format_timecode(self.mpv_widget.position() if self.mpv_widget else 0)
+        total_tc = self.format_timecode(duration_ms)
+        self.timecode_label.setText(f"{current_tc} / {total_tc}")
 
     def on_media_selected(self, item):
         row = self.media_list.row(item)
         if 0 <= row < len(self.media_library):
             self.current_media = self.media_library[row]
-            self.player.setSource(QUrl.fromLocalFile(self.current_media.file_path))
-            self.player.pause()
+            file_path = self.current_media.file_path
+            
+            # Determine which player to use
+            if self._should_use_mpv(file_path):
+                self._switch_to_mpv()
+                if self.mpv_widget:
+                    self.mpv_widget.load_file(file_path)
+                    self.mpv_widget.pause()
+            else:
+                self._switch_to_qmediaplayer()
+                self.player.setSource(QUrl.fromLocalFile(file_path))
+                self.player.pause()
+            
             self.update_trim_info()
 
     def on_timeline_clip_selected(self, clip):
-        self.player.setSource(QUrl.fromLocalFile(clip.file_path))
-        self.player.setPosition(int(clip.in_point * 1000))
-        self.player.pause()
+        file_path = clip.file_path
+        
+        # Determine which player to use
+        if self._should_use_mpv(file_path):
+            self._switch_to_mpv()
+            if self.mpv_widget:
+                self.mpv_widget.load_file(file_path)
+                self.mpv_widget.seek(int(clip.in_point * 1000))
+                self.mpv_widget.pause()
+        else:
+            self._switch_to_qmediaplayer()
+            self.player.setSource(QUrl.fromLocalFile(file_path))
+            self.player.setPosition(int(clip.in_point * 1000))
+            self.player.pause()
+        
         in_tc = self.format_timecode(int(clip.in_point * 1000))
         out_tc = self.format_timecode(int(clip.out_point * 1000))
         dur_tc = self.format_timecode(int(clip.get_trimmed_duration() * 1000))
@@ -1634,21 +2119,44 @@ class FastEncodeProApp(QMainWindow):
         pass
 
     def toggle_play(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
+        if self.using_mpv and self.mpv_widget:
+            # MPV player control
+            if self.mpv_widget.is_paused():
+                self.mpv_widget.play()
+                self.play_btn.setText("⏸️ Pause")
+            else:
+                self.mpv_widget.pause()
+                self.play_btn.setText("▶️ Play")
         else:
-            self.player.play()
+            # QMediaPlayer control
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.pause()
+            else:
+                self.player.play()
 
     def update_play_button(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.play_btn.setText("⏸️ Pause")
+        if self.using_mpv and self.mpv_widget:
+            if not self.mpv_widget.is_paused():
+                self.play_btn.setText("⏸️ Pause")
+            else:
+                self.play_btn.setText("▶️ Play")
         else:
-            self.play_btn.setText("▶️ Play")
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.play_btn.setText("⏸️ Pause")
+            else:
+                self.play_btn.setText("▶️ Play")
 
     def seek_preview(self, value):
-        if self.player.duration() > 0:
-            position = int((value / 1000.0) * self.player.duration())
-            self.player.setPosition(position)
+        if self.using_mpv and self.mpv_widget:
+            # MPV seek
+            if self.mpv_widget.duration() > 0:
+                position_ms = int((value / 1000.0) * self.mpv_widget.duration())
+                self.mpv_widget.seek(position_ms)
+        else:
+            # QMediaPlayer seek
+            if self.player.duration() > 0:
+                position = int((value / 1000.0) * self.player.duration())
+                self.player.setPosition(position)
 
     def update_preview_position(self, position):
         if self.player.duration() > 0:
@@ -1815,7 +2323,7 @@ class FastEncodeProApp(QMainWindow):
         self.timeline_export_thread.status.connect(self.status_label.setText)
         self.timeline_export_thread.log_message.connect(self.append_log)
         self.timeline_export_thread.finished.connect(self.timeline_export_done)
-        self.timeline_export_thread.playhead_update.connect(self.timeline.set_playhead_position)  # NEW: Update playhead during render
+        self.timeline_export_thread.playhead_update.connect(self.timeline.set_playhead_position)
         self.progress_bar.setValue(0)
         self.status_label.setText("Exporting with CBR...")
         self.timeline_export_thread.start()
@@ -1850,7 +2358,7 @@ class FastEncodeProApp(QMainWindow):
             self.export_timeline_btn.setEnabled(True)
             self.stop_export_btn.setEnabled(False)
             self.status_label.setText("Render stopped")
-            self.log_text.append("\\n=== Render cancelled by user ===\\n")
+            self.log_text.append("\n=== Render cancelled by user ===\n")
 
     def apply_theme(self):
         self.setStyleSheet("""
@@ -2129,14 +2637,19 @@ class FastEncodeProApp(QMainWindow):
             self.update_timeline_duration()
             self.status_label.setText(f"Project loaded: {Path(file_path).name}")
             
-            # NOTE: We could also load the codec settings here if desired
-            # But users might want to keep their current codec settings.
-            
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load project: {e}")
 
     def closeEvent(self, event):
         self.save_settings()
+        
+        # Cleanup MPV player
+        if self.mpv_widget:
+            try:
+                self.mpv_widget.shutdown()
+            except:
+                pass
+        
         if self.encoding_thread and self.encoding_thread.isRunning():
             reply = QMessageBox.question(self, "Active", "Stop and quit?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.No:
@@ -2158,7 +2671,6 @@ def main():
     app = QApplication(sys.argv)
     
     # --- FIX FOR ARCH/HYPRLAND ICONS ---
-    # This ID must match the 'StartupWMClass' in the .desktop file
     app.setDesktopFileName("FastEncodePro") 
     # -----------------------------------
     

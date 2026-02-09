@@ -427,34 +427,75 @@ class MPVVideoWidget(QWidget):
         try:
             print("Starting MPV initialization...")
             
-            # Force Qt to fully realize the widget
-            self.show()
-            from PyQt6.QtWidgets import QApplication
-            QApplication.processEvents()
+            # Detect if running on Wayland
+            import os as os_check
+            session_type = os_check.environ.get('XDG_SESSION_TYPE', '').lower()
+            wayland_display = os_check.environ.get('WAYLAND_DISPLAY', '')
+            is_wayland = session_type == 'wayland' or wayland_display
             
-            print("Widget shown, getting window ID...")
+            print(f"Session type: {session_type}")
+            print(f"Wayland display: {wayland_display}")
+            print(f"Detected Wayland: {is_wayland}")
             
-            # Get window ID after widget is fully shown
-            wid = int(self.winId())
-            print(f"Got window ID: {wid}")
+            # CRITICAL: Always use CPU decode for MPV preview
+            # Hardware decode causes issues with AV1 on RTX 20-series
+            # The main rendering engine will still use GPU for encode
+            hwdec_mode = 'no'  # Force CPU decode - ALWAYS
+            print("MPV Preview: Hardware decode DISABLED (CPU decode)")
+            print("(Note: Main rendering still uses GPU encode)")
             
-            print("Creating MPV instance...")
-            
-            # Initialize MPV
-            self.mpv_player = mpv.MPV(
-                wid=str(wid),
-                vo='gpu',
-                hwdec='auto',
-                keep_open='yes',
-                idle='yes',
-                osc='no',
-                input_default_bindings='no',
-                input_vo_keyboard='no',
-                log_handler=print,
-                loglevel='info'
-            )
+            if is_wayland:
+                print("=" * 60)
+                print("Wayland detected - Using MPV without window embedding")
+                print("Note: Video will render in MPV's own context")
+                print("=" * 60)
+                
+                # On Wayland, don't use wid (window embedding doesn't work)
+                self.mpv_player = mpv.MPV(
+                    # NO wid parameter on Wayland!
+                    vo='gpu',
+                    hwdec=hwdec_mode,  # Always CPU decode
+                    keep_open='yes',
+                    idle='yes',
+                    osc='no',
+                    input_default_bindings='no',
+                    input_vo_keyboard='no',
+                    log_handler=print,
+                    loglevel='info',
+                    # Wayland-specific: embed in current window without wid
+                    force_window='yes',
+                    ontop='no',
+                    border='no',
+                    geometry=f'{self.width()}x{self.height()}+0+0'
+                )
+            else:
+                print("X11 detected - Using window embedding with wid")
+                
+                # Force Qt to fully realize the widget
+                self.show()
+                from PyQt6.QtWidgets import QApplication
+                QApplication.processEvents()
+                
+                # Get window ID after widget is fully shown
+                wid = int(self.winId())
+                print(f"Got window ID: {wid}")
+                
+                # On X11, use traditional wid embedding
+                self.mpv_player = mpv.MPV(
+                    wid=str(wid),
+                    vo='gpu',
+                    hwdec=hwdec_mode,  # Always CPU decode
+                    keep_open='yes',
+                    idle='yes',
+                    osc='no',
+                    input_default_bindings='no',
+                    input_vo_keyboard='no',
+                    log_handler=print,
+                    loglevel='info'
+                )
             
             print("MPV instance created successfully!")
+            print(f"MPV hwdec mode: {hwdec_mode} (CPU decode forced for preview)")
             
             # Set up event observers
             @self.mpv_player.property_observer('duration')
@@ -1936,10 +1977,20 @@ class FastEncodeProApp(QMainWindow):
         perf_layout.addWidget(self.gpu_check)
 
         self.gpu_decode_check = QCheckBox("Enable GPU Hardware Decode (CUDA/NVDEC)")
-        self.gpu_decode_check.setChecked(True)
+        self.gpu_decode_check.setChecked(False)  # Default OFF - safer, especially for AV1 on RTX 20-series
         self.gpu_decode_check.setStyleSheet("font-size: 11pt; color: white;")
         self.gpu_decode_check.stateChanged.connect(lambda: self.update_quality_label(self.quality_slider.value()))
         perf_layout.addWidget(self.gpu_decode_check)
+        
+        # Add info about GPU decode compatibility
+        gpu_decode_info = QLabel(
+            "ℹ️ AV1 hardware decode requires RTX 30-series or newer\n"
+            "   RTX 20-series: Keep OFF for AV1 files (use CPU decode)\n"
+            "   RTX 30+: Can enable for faster AV1 preview"
+        )
+        gpu_decode_info.setStyleSheet("font-size: 9pt; color: #94a3b8; padding: 5px 20px;")
+        gpu_decode_info.setWordWrap(True)
+        perf_layout.addWidget(gpu_decode_info)
         threads_row = QHBoxLayout()
         threads_row.addWidget(QLabel("CPU Threads (0=auto):"))
         self.threads_spin = QSpinBox()
@@ -2619,7 +2670,7 @@ class FastEncodeProApp(QMainWindow):
         self.pixel_combo.setCurrentIndex(1)
         self.audio_combo.setCurrentIndex(0)
         self.gpu_check.setChecked(True)
-        self.gpu_decode_check.setChecked(True)
+        self.gpu_decode_check.setChecked(False)  # Default OFF - safer for all GPUs
         self.threads_spin.setValue(0)
         self.quality_slider.setValue(500 if self.codec_combo.currentIndex() == 0 else 100)
         self.denoise_combo.setCurrentIndex(0)

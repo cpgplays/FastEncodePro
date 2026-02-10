@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
 FastEncode Pro - Timeline Edition v0.08
-GPU-Accelerated Video Editor with Full MKV Support
+GPU-Accelerated Video Editor with Native Wayland MPV Support
 
 v0.08 Features:
-- MKV Video Preview (MPV Integration)
-- AV1 Codec Support (CPU Decode Fallback)
-- Fixed Audio Rendering (Proper Error Handling)
-- Fixed Merge Crashes (Non-Blocking Merge)
+- Native Wayland MPV Player (No XWayland Required)
+- Audio + GPU Decode + Smooth Playback
+- Works with Desktop Icons/Taskbar on Arch
+- Universal Format Support (All codecs)
+- Fixed Audio Rendering (Multi-track Mixing + Volume Control)
+- Fixed Timeline Snapping & Scrubber Shake
+- Timeline Playback (EDL Preview) + Realtime Audio Mixing
 - Dwell Clicking & Eye Tracking Support
 """
 
+# CRITICAL: Set C locale FIRST before any other imports
+# MPV requires this or it will crash with SIGSEGV
+import locale
+import os
+locale.setlocale(locale.LC_NUMERIC, 'C')
+os.environ['LC_NUMERIC'] = 'C'
+print("✅ Locale set to C for MPV")
+
 import sys
 import shutil
-import os
 import subprocess
 import tempfile
 import json
@@ -21,40 +31,33 @@ import time
 import math
 from pathlib import Path
 
-# Try to import MPV for MKV support
-print("Checking for python-mpv library...")
+# Check for python-mpv (import AFTER locale is set)
+MPV_AVAILABLE = False
 try:
     import mpv
     MPV_AVAILABLE = True
-    print(f"✅ python-mpv found! Version: {mpv.__version__ if hasattr(mpv, '__version__') else 'unknown'}")
-except ImportError as e:
-    MPV_AVAILABLE = False
-    print("=" * 60)
-    print("❌ WARNING: python-mpv not installed. MKV preview disabled.")
-    print(f"   Import error: {e}")
-    print("=" * 60)
-    print("Install instructions:")
-    print("")
-    print("Arch/Manjaro/CachyOS:")
-    print("  sudo pacman -S mpv python-mpv")
-    print("")
-    print("Debian/Ubuntu:")
-    print("  sudo apt install libmpv-dev mpv")
-    print("  pip install python-mpv --break-system-packages")
-    print("")
-    print("Fedora:")
-    print("  sudo dnf install mpv python3-mpv")
-    print("=" * 60)
-    print("")
+    print("✅ python-mpv available")
+except ImportError:
+    print("⚠️  python-mpv not installed - install with: sudo pacman -S python-mpv")
 
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRectF, QObject
-from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor, QAction, QPainterPath, QMouseEvent
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor, QAction, QPainterPath, QMouseEvent, QImage, QPixmap
 
 __version__ = "0.08"
 __author__ = "cpgplays"
+
+# --- HELPER FUNCTIONS ---
+
+def get_audio_stream_count_static(filepath):
+    """Count audio streams in a file to detect multi-track recordings"""
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', filepath]
+        out = subprocess.check_output(cmd).decode().strip()
+        if not out: return 0
+        return len(out.splitlines())
+    except:
+        return 1
 
 # --- ACCESSIBILITY CLASSES ---
 
@@ -177,214 +180,10 @@ class DwellClickFilter(QObject):
 
 # --- END ACCESSIBILITY CLASSES ---
 
-class FullscreenVideoPlayer(QWidget):
-    """Fullscreen video player with always-visible overlay controls"""
-
-    def __init__(self, player, parent=None):
-        super().__init__(parent, Qt.WindowType.Window)
-        self.player = player
-        self.setWindowState(Qt.WindowState.WindowFullScreen)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setStyleSheet("background-color: black;")
-        self.original_video_output = self.player.videoOutput()
-        self.was_playing = (self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
-        self.video_widget = QVideoWidget()
-        self.video_widget.setStyleSheet("background-color: black;")
-        main_layout.addWidget(self.video_widget, stretch=1)
-        controls_panel = QWidget()
-        controls_panel.setStyleSheet("""
-            QWidget {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(0,0,0,200), stop:1 rgba(0,0,0,240));
-                padding: 20px;
-            }
-        """)
-        controls_layout = QVBoxLayout(controls_panel)
-        controls_layout.setSpacing(15)
-        controls_layout.setContentsMargins(40, 20, 40, 20)
-        self.timecode_label = QLabel("00:00:00 / 00:00:00")
-        self.timecode_label.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 28pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
-        self.timecode_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        controls_layout.addWidget(self.timecode_label)
-        self.scrubber = QSlider(Qt.Orientation.Horizontal)
-        self.scrubber.setMinimum(0)
-        self.scrubber.setMaximum(1000)
-        self.scrubber.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.scrubber.setStyleSheet("""
-            QSlider {
-                min-height: 60px;
-                max-height: 60px;
-                background: transparent;
-            }
-            QSlider::groove:horizontal {
-                border: none;
-                height: 30px;
-                background: rgba(100, 100, 100, 255);
-                border-radius: 15px;
-            }
-            QSlider::handle:horizontal {
-                background: #3b82f6;
-                border: 4px solid white;
-                width: 50px;
-                height: 50px;
-                margin: -10px 0;
-                border-radius: 25px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #3b82f6;
-                border-radius: 15px;
-            }
-        """)
-        controls_layout.addWidget(self.scrubber)
-        buttons_row = QHBoxLayout()
-        buttons_row.setSpacing(20)
-        buttons_row.addStretch()
-        self.play_pause_btn = QPushButton("⏸️ PAUSE")
-        self.play_pause_btn.setMinimumSize(300, 80)
-        self.play_pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus) 
-        self.play_pause_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3b82f6;
-                color: white;
-                font-size: 24pt;
-                font-weight: bold;
-                border-radius: 15px;
-                border: 4px solid white;
-            }
-            QPushButton:hover {
-                background-color: #2563eb;
-            }
-            QPushButton:focus {
-                border: 6px solid #f59e0b; /* Orange focus for switches */
-            }
-            QPushButton:pressed {
-                background-color: #1d4ed8;
-            }
-        """)
-        self.play_pause_btn.clicked.connect(self.toggle_playback)
-        buttons_row.addWidget(self.play_pause_btn)
-        self.exit_btn = QPushButton("✕ EXIT")
-        self.exit_btn.setMinimumSize(200, 80)
-        self.exit_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.exit_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #ef4444;
-                color: white;
-                font-size: 20pt;
-                font-weight: bold;
-                border-radius: 15px;
-                border: 4px solid white;
-            }
-            QPushButton:hover {
-                background-color: #dc2626;
-            }
-            QPushButton:focus {
-                border: 6px solid #f59e0b;
-            }
-            QPushButton:pressed {
-                background-color: #b91c1c;
-            }
-        """)
-        self.exit_btn.clicked.connect(self.exit_fullscreen)
-        buttons_row.addWidget(self.exit_btn)
-        buttons_row.addStretch()
-        controls_layout.addLayout(buttons_row)
-        main_layout.addWidget(controls_panel, stretch=0)
-        try:
-            self.player.setVideoOutput(self.video_widget)
-            if self.was_playing:
-                self.player.play()
-        except Exception as e:
-            print(f"Error setting video output: {e}")
-        self.scrubber.sliderMoved.connect(self.seek)
-        self.scrubber.sliderPressed.connect(self.on_scrubber_pressed)
-        self.scrubber.sliderReleased.connect(self.on_scrubber_released)
-        self.player.positionChanged.connect(self.update_position)
-        self.player.durationChanged.connect(self.update_duration)
-        self.player.playbackStateChanged.connect(self.update_play_button)
-        self.user_dragging = False
-        self.update_duration(self.player.duration())
-        self.update_position(self.player.position())
-        self.update_play_button()
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
-            self.exit_fullscreen()
-        elif event.key() == Qt.Key.Key_Space:
-            self.toggle_playback()
-        super().keyPressEvent(event)
-
-    def toggle_playback(self):
-        try:
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self.player.pause()
-            else:
-                self.player.play()
-        except Exception as e:
-            print(f"Playback toggle error: {e}")
-
-    def update_play_button(self):
-        try:
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self.play_pause_btn.setText("⏸️ PAUSE")
-            else:
-                self.play_pause_btn.setText("▶️ PLAY")
-        except:
-            pass
-
-    def on_scrubber_pressed(self):
-        self.user_dragging = True
-
-    def on_scrubber_released(self):
-        self.user_dragging = False
-        self.seek(self.scrubber.value())
-
-    def seek(self, value):
-        if self.player.duration() > 0:
-            position = int((value / 1000.0) * self.player.duration())
-            self.player.setPosition(position)
-
-    def update_position(self, position):
-        if not self.user_dragging and self.player.duration() > 0:
-            value = int((position / self.player.duration()) * 1000)
-            self.scrubber.setValue(value)
-        self.timecode_label.setText(f"{self.format_time(position)} / {self.format_time(self.player.duration())}")
-
-    def update_duration(self, duration):
-        self.scrubber.setMaximum(1000)
-        self.timecode_label.setText(f"{self.format_time(self.player.position())} / {self.format_time(duration)}")
-
-    def format_time(self, ms):
-        s = ms // 1000
-        h = s // 3600
-        m = (s % 3600) // 60
-        s = s % 60
-        return f"{h:02d}:{m:02d}:{s:02d}"
-
-    def exit_fullscreen(self):
-        try:
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self.player.pause()
-            self.player.setVideoOutput(self.original_video_output)
-        except Exception as e:
-            print(f"Error restoring video output: {e}")
-        self.close()
-
-
-# --- MPV VIDEO WIDGET FOR MKV SUPPORT ---
+# --- MPV VIDEO WIDGET - COMPLETE PLAYER ---
 
 class MPVVideoWidget(QWidget):
-    """MPV-based video widget for MKV/AV1/VP9 playback support"""
+    """MPV-based video player - complete solution with audio, GPU decode, smooth playback"""
     
     positionChanged = pyqtSignal(int)  # Emits position in milliseconds
     durationChanged = pyqtSignal(int)  # Emits duration in milliseconds
@@ -392,190 +191,171 @@ class MPVVideoWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         
-        # CRITICAL: Make this a native window BEFORE MPV tries to embed
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
-        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
+        if not MPV_AVAILABLE:
+            # Show error message
+            layout = QVBoxLayout(self)
+            error_label = QLabel("⚠️ MPV Not Available\n\nInstall: sudo pacman -S python-mpv")
+            error_label.setStyleSheet("color: #ef4444; font-size: 14pt; font-weight: bold;")
+            error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(error_label)
+            self.mpv = None
+            return
         
-        self.mpv_player = None
+        # Show info message about separate window
+        layout = QVBoxLayout(self)
+        info_label = QLabel(
+            "🎬 Video Preview\n\n"
+            "Video plays in a separate MPV window\n"
+            "(Native Wayland support - no XWayland needed)\n\n"
+            "Use the playback controls below"
+        )
+        info_label.setStyleSheet("""
+            QLabel {
+                color: #60a5fa;
+                font-size: 12pt;
+                background-color: #1e293b;
+                border: 2px solid #3b82f6;
+                border-radius: 8px;
+                padding: 20px;
+            }
+        """)
+        info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(info_label)
+        
+        # State
         self.current_file = None
         self._is_paused = True
         self._duration_ms = 0
         self._position_ms = 0
-        self._mpv_initialized = False
         
-        # Timer to update position
+        # Position update timer
         self.position_timer = QTimer(self)
         self.position_timer.timeout.connect(self._update_position)
         self.position_timer.setInterval(100)
         
         # Set black background
-        self.setStyleSheet("background-color: black;")
+        self.setStyleSheet("background-color: #0f172a;")
         self.setMinimumSize(640, 360)
         
-        print("MPV widget created (MPV will initialize on first file load)")
+        # Initialize MPV
+        self.mpv = None
+        self._init_mpv()
+        
+        print("MPV video widget created")
     
-    def _initialize_mpv(self):
-        """Initialize MPV player (called when first file is loaded)"""
-        if self._mpv_initialized:
-            print("MPV already initialized")
-            return True
-            
+    def _init_mpv(self):
+        """Initialize MPV player as separate window (native Wayland/X11)"""
         if not MPV_AVAILABLE:
-            print("MPV_AVAILABLE is False - python-mpv not imported")
-            return False
+            return
         
         try:
-            print("Starting MPV initialization...")
+            import mpv
             
-            # Detect if running on Wayland
-            import os as os_check
-            session_type = os_check.environ.get('XDG_SESSION_TYPE', '').lower()
-            wayland_display = os_check.environ.get('WAYLAND_DISPLAY', '')
-            is_wayland = session_type == 'wayland' or wayland_display
+            print("Initializing MPV with separate window (native Wayland support)")
             
-            print(f"Session type: {session_type}")
-            print(f"Wayland display: {wayland_display}")
-            print(f"Detected Wayland: {is_wayland}")
+            # Create MPV instance - it will create its own window
+            self.mpv = mpv.MPV(
+                # NO wid parameter - MPV creates its own window
+                vo='gpu',  # GPU video output
+                hwdec='auto',  # GPU decode
+                keep_open='yes',
+                idle='yes',
+                # Window configuration
+                force_window='yes',
+                ontop='no',  # Don't stay on top
+                border='yes',  # Show window border
+                title='FastEncodePro - Video Preview',
+                geometry='640x360',  # Initial size
+                # No OSD/controls
+                osc='no',
+                input_default_bindings='no',
+                input_vo_keyboard='no',
+                # Audio
+                audio_client_name='FastEncodePro',
+                # Performance
+                cache='yes',
+            )
             
-            # CRITICAL: Always use CPU decode for MPV preview
-            # Hardware decode causes issues with AV1 on RTX 20-series
-            # The main rendering engine will still use GPU for encode
-            hwdec_mode = 'no'  # Force CPU decode - ALWAYS
-            print("MPV Preview: Hardware decode DISABLED (CPU decode)")
-            print("(Note: Main rendering still uses GPU encode)")
+            print("✅ MPV initialized as separate window")
+            print("   Video will appear in a separate floating window")
+            print("   This works natively on Wayland without XWayland")
             
-            if is_wayland:
-                print("=" * 60)
-                print("Wayland detected - Using MPV without window embedding")
-                print("Note: Video will render in MPV's own context")
-                print("=" * 60)
-                
-                # On Wayland, don't use wid (window embedding doesn't work)
-                self.mpv_player = mpv.MPV(
-                    # NO wid parameter on Wayland!
-                    vo='gpu',
-                    hwdec=hwdec_mode,  # Always CPU decode
-                    keep_open='yes',
-                    idle='yes',
-                    osc='no',
-                    input_default_bindings='no',
-                    input_vo_keyboard='no',
-                    log_handler=print,
-                    loglevel='info',
-                    # Wayland-specific: embed in current window without wid
-                    force_window='yes',
-                    ontop='no',
-                    border='no',
-                    geometry=f'{self.width()}x{self.height()}+0+0'
-                )
-            else:
-                print("X11 detected - Using window embedding with wid")
-                
-                # Force Qt to fully realize the widget
-                self.show()
-                from PyQt6.QtWidgets import QApplication
-                QApplication.processEvents()
-                
-                # Get window ID after widget is fully shown
-                wid = int(self.winId())
-                print(f"Got window ID: {wid}")
-                
-                # On X11, use traditional wid embedding
-                self.mpv_player = mpv.MPV(
-                    wid=str(wid),
-                    vo='gpu',
-                    hwdec=hwdec_mode,  # Always CPU decode
-                    keep_open='yes',
-                    idle='yes',
-                    osc='no',
-                    input_default_bindings='no',
-                    input_vo_keyboard='no',
-                    log_handler=print,
-                    loglevel='info'
-                )
-            
-            print("MPV instance created successfully!")
-            print(f"MPV hwdec mode: {hwdec_mode} (CPU decode forced for preview)")
-            
-            # Set up event observers
-            @self.mpv_player.property_observer('duration')
+            # Set up property observers
+            @self.mpv.property_observer('duration')
             def duration_observer(_name, value):
-                if value:
+                if value and value > 0:
                     self._duration_ms = int(value * 1000)
                     self.durationChanged.emit(self._duration_ms)
             
-            @self.mpv_player.property_observer('time-pos')
-            def time_observer(_name, value):
+            @self.mpv.property_observer('time-pos')
+            def position_observer(_name, value):
                 if value is not None:
                     self._position_ms = int(value * 1000)
             
-            print("Event observers registered")
-            
-            self._mpv_initialized = True
-            return True
+            @self.mpv.property_observer('pause')
+            def pause_observer(_name, value):
+                self._is_paused = value
             
         except Exception as e:
-            print(f"MPV initialization FAILED with exception:")
-            print(f"  Error type: {type(e).__name__}")
-            print(f"  Error message: {e}")
+            print(f"❌ MPV initialization failed: {e}")
             import traceback
             traceback.print_exc()
-            self.mpv_player = None
-            return False
+            self.mpv = None
     
     def load_file(self, file_path):
         """Load a video file"""
-        print(f"MPV load_file called with: {file_path}")
-        print(f"File exists: {os.path.exists(file_path)}")
-        
-        # Initialize MPV on first file load (lazy initialization)
-        if not self._mpv_initialized:
-            if not self._initialize_mpv():
-                return False
-        
-        if not self.mpv_player:
+        if not self.mpv:
+            print("MPV not available")
             return False
+        
+        print(f"MPV loading: {file_path}")
         
         try:
             self.current_file = file_path
-            print(f"Calling mpv_player.loadfile({file_path})")
-            self.mpv_player.loadfile(file_path)
-            self.mpv_player.pause = True  # Start paused
+            self.mpv.loadfile(file_path)
+            self.mpv.pause = True
             self._is_paused = True
-            print("MPV loadfile succeeded")
+            print("✅ File loaded")
             return True
+            
         except Exception as e:
-            print(f"MPV load error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ Load error: {e}")
             return False
     
     def play(self):
         """Start playback"""
-        if self.mpv_player and self.current_file:
-            self.mpv_player.pause = False
-            self._is_paused = False
-            self.position_timer.start()
+        if not self.mpv or not self.current_file:
+            return
+        
+        self.mpv.pause = False
+        self._is_paused = False
+        self.position_timer.start()
+        print("▶️ Playing")
     
     def pause(self):
         """Pause playback"""
-        if self.mpv_player:
-            self.mpv_player.pause = True
-            self._is_paused = True
-            self.position_timer.stop()
+        if not self.mpv:
+            return
+        
+        self.mpv.pause = True
+        self._is_paused = True
+        self.position_timer.stop()
+        print("⏸️ Paused")
     
     def is_paused(self):
-        """Check if playback is paused"""
+        """Check if paused"""
         return self._is_paused
     
     def seek(self, position_ms):
-        """Seek to position in milliseconds"""
-        if self.mpv_player:
-            try:
-                self.mpv_player.seek(position_ms / 1000.0, reference='absolute')
-                self._position_ms = position_ms
-            except:
-                pass
+        """Seek to position"""
+        if not self.mpv:
+            return
+        
+        try:
+            self.mpv.seek(position_ms / 1000.0, reference='absolute')
+            self._position_ms = position_ms
+        except:
+            pass
     
     def position(self):
         """Get current position in milliseconds"""
@@ -586,36 +366,54 @@ class MPVVideoWidget(QWidget):
         return self._duration_ms
     
     def _update_position(self):
-        """Emit position update signal"""
+        """Emit position update"""
         self.positionChanged.emit(self._position_ms)
     
     def stop(self):
         """Stop playback"""
-        if self.mpv_player:
-            self.mpv_player.command('stop')
+        if not self.mpv:
+            return
+        
+        try:
+            self.mpv.command('stop')
             self._is_paused = True
             self._position_ms = 0
             self.position_timer.stop()
+        except:
+            pass
     
+    def set_audio_complex_filter(self, filter_string):
+        """Set lavfi complex filter for audio mixing"""
+        if not self.mpv: return
+        try:
+            # Setting lavfi-complex property directly
+            self.mpv.lavfi_complex = filter_string
+        except Exception as e:
+            print(f"MPV Audio Filter Error: {e}")
+
     def shutdown(self):
-        """Cleanup MPV player"""
-        if self.mpv_player:
+        """Cleanup"""
+        self.position_timer.stop()
+        if self.mpv:
             try:
-                self.position_timer.stop()
-                self.mpv_player.terminate()
+                self.mpv.terminate()
             except:
                 pass
 
 
 class TimelineClip:
     """Represents a clip on the timeline"""
-    def __init__(self, file_path, track, start_time, in_point=0, out_point=None, duration=None):
+    def __init__(self, file_path, track, start_time, in_point=0, out_point=None, duration=None, volumes=None):
         self.file_path = file_path
         self.track = track
         self.start_time = start_time
         self.in_point = in_point
         self.name = Path(file_path).name
         self.full_duration = duration if duration is not None else self.get_video_duration()
+        self.audio_streams = get_audio_stream_count_static(self.file_path)
+        # Volume levels for audio tracks (1.0 = 100%)
+        self.volumes = volumes if volumes else [1.0] * max(1, self.audio_streams)
+        
         if out_point is None or out_point <= 0:
             self.out_point = self.full_duration
         else:
@@ -650,7 +448,8 @@ class TimelineClip:
             "start_time": self.start_time,
             "in_point": self.in_point,
             "out_point": self.out_point,
-            "duration": self.full_duration
+            "duration": self.full_duration,
+            "volumes": self.volumes
         }
 
     @staticmethod
@@ -661,7 +460,8 @@ class TimelineClip:
             data["start_time"],
             data["in_point"],
             data["out_point"],
-            data["duration"]
+            data["duration"],
+            data.get("volumes", [1.0])
         )
 
 
@@ -669,6 +469,7 @@ class TimelineWidget(QWidget):
     """Visual timeline editor with drag-and-drop clips"""
     clip_selected = pyqtSignal(object)
     playhead_moved = pyqtSignal(float)
+    timeline_clicked = pyqtSignal() # New signal for focus
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -681,7 +482,7 @@ class TimelineWidget(QWidget):
         self.scroll_offset = 0
         self.setMinimumHeight(250)
         self.setMouseTracking(True)
-        self.track_height = 60
+        self.track_height = 80 # Increased for audio visuals
         self.num_tracks = 4
         self.playhead_position = 0
         self.dragging_playhead = False
@@ -731,21 +532,34 @@ class TimelineWidget(QWidget):
         width = int(clip.get_trimmed_duration() * self.zoom_level)
         y = ruler_height + clip.track * self.track_height + 5
         height = self.track_height - 10
+        
         if clip == self.selected_clip:
             color = QColor("#3b82f6")
         else:
             color = QColor("#10b981")
+            
         painter.setBrush(QBrush(color))
         painter.setPen(QPen(QColor("white"), 2))
         painter.drawRoundedRect(x, y, width, height, 5, 5)
+        
+        # Draw Audio Track Indicators
+        if clip.audio_streams > 0:
+            audio_height = height / (clip.audio_streams + 1)
+            painter.setBrush(QColor(0, 0, 0, 50))
+            painter.setPen(Qt.PenStyle.NoPen)
+            for i in range(clip.audio_streams):
+                ay = y + height - ((i + 1) * 15) - 5
+                painter.drawRect(x + 5, int(ay), width - 10, 10)
+        
         painter.setPen(QColor("white"))
         font = QFont("Arial", 9, QFont.Weight.Bold)
         painter.setFont(font)
         text_rect = painter.boundingRect(x + 5, y + 5, width - 10, height - 10, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, clip.name)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, clip.name)
-        duration_text = f"{clip.get_trimmed_duration():.1f}s"
-        duration_rect = painter.boundingRect(x + 5, y + height - 20, width - 10, 15, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, duration_text)
-        painter.drawText(duration_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, duration_text)
+        
+        info_text = f"{clip.get_trimmed_duration():.1f}s | {clip.audio_streams} Audio Trk"
+        duration_rect = painter.boundingRect(x + 5, y + height - 20, width - 10, 15, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, info_text)
+        painter.drawText(duration_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, info_text)
 
     def time_to_x(self, time):
         return int((time - self.scroll_offset) * self.zoom_level)
@@ -762,23 +576,58 @@ class TimelineWidget(QWidget):
         self.playhead_position = max(0, time)
         if auto_scroll:
             playhead_x = (self.playhead_position - self.scroll_offset) * self.zoom_level
-            left_margin = self.width() * 0.2
-            right_margin = self.width() * 0.8
+            left_margin = self.width() * 0.1  # 10% Margin
+            right_margin = self.width() * 0.9 # 90% Margin
+            
+            # FIX: Smooth Scrolling - only scroll if playhead pushes the edge
+            # This prevents the "shake" by not constantly centering the view
             if playhead_x > right_margin:
-                self.scroll_offset = self.playhead_position - (right_margin / self.zoom_level)
+                self.scroll_offset += (playhead_x - right_margin) / self.zoom_level
             elif playhead_x < left_margin and self.scroll_offset > 0:
-                self.scroll_offset = max(0, self.playhead_position - (left_margin / self.zoom_level))
+                self.scroll_offset = max(0, self.scroll_offset - (left_margin - playhead_x) / self.zoom_level)
+                
         self.update()
         self.playhead_moved.emit(self.playhead_position)
 
+    def get_snap_time(self, time):
+        """Find nearest clip start/end to snap to"""
+        snap_threshold_pixels = 15
+        snap_threshold_time = snap_threshold_pixels / self.zoom_level
+        closest_snap = None
+        min_dist = float('inf')
+        
+        # Snap to 0
+        if abs(time) < snap_threshold_time:
+            closest_snap = 0
+            min_dist = abs(time)
+        
+        for clip in self.clips:
+            # Snap to Start
+            dist_start = abs(time - clip.start_time)
+            if dist_start < snap_threshold_time and dist_start < min_dist:
+                min_dist = dist_start
+                closest_snap = clip.start_time
+            # Snap to End
+            dist_end = abs(time - clip.get_end_time())
+            if dist_end < snap_threshold_time and dist_end < min_dist:
+                min_dist = dist_end
+                closest_snap = clip.get_end_time()
+        
+        return closest_snap if closest_snap is not None else time
+
     def mousePressEvent(self, event):
+        self.timeline_clicked.emit()
         if event.button() == Qt.MouseButton.LeftButton:
             click_x = event.position().x()
             click_y = event.position().y()
-            click_time = self.x_to_time(click_x)
+            raw_time = self.x_to_time(click_x)
+            
+            # Apply snapping on click
+            click_time = self.get_snap_time(raw_time)
+            
             if click_y < 40:
                 self.dragging_playhead = True
-                self.set_playhead_position(click_time, auto_scroll=False)
+                self.set_playhead_position(click_time, auto_scroll=True)
                 return
             clicked_track = self.y_to_track(click_y)
             if clicked_track < 0:
@@ -797,15 +646,24 @@ class TimelineWidget(QWidget):
 
     def mouseMoveEvent(self, event):
         click_x = event.position().x()
-        click_time = self.x_to_time(click_x)
+        raw_time = self.x_to_time(click_x)
+        
+        # Apply snapping on drag
+        click_time = self.get_snap_time(raw_time)
+        
         if self.dragging_playhead:
-            self.set_playhead_position(click_time, auto_scroll=False)
+            # Enable auto_scroll=True to fix "disappearing" issue, but relies on set_playhead_position
+            # smoothing logic to prevent shaking
+            self.set_playhead_position(click_time, auto_scroll=True)
             return
         if self.dragging_clip:
             new_time = click_time - self.drag_offset
+            # Also snap clip start
+            snapped_start = self.get_snap_time(new_time)
+            
             new_track = self.y_to_track(event.position().y())
             if new_track >= 0:
-                self.dragging_clip.start_time = max(0, new_time)
+                self.dragging_clip.start_time = max(0, snapped_start)
                 self.dragging_clip.track = new_track
                 self.update()
 
@@ -1226,7 +1084,8 @@ class TimelineRenderingEngine:
             if current_total_frames == 0:  # Log once per file
                 self.log(f"Detected AV1 codec - using CPU decode (GPU AV1 decode requires RTX 30+)")
         
-        cmd = ['ffmpeg']
+        # FIX: ADDED -v error to prevent stderr deadlock which causes 99% stall
+        cmd = ['ffmpeg', '-v', 'error']
         if use_gpu:
             cmd.extend(['-hwaccel', 'cuda'])
         cmd.extend([
@@ -1238,8 +1097,9 @@ class TimelineRenderingEngine:
         decoder = None
         frames_read = 0
         try:
-            # Capture stderr to see decoder errors (especially for MKV files)
-            decoder = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
+            # FIX: 99% Stall - Use DEVNULL for stderr to prevent pipe buffer filling up with invisible warnings
+            # If stderr fills (64KB), ffmpeg blocks indefinitely, causing deadlock.
+            decoder = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**7)
             
             while frames_read < frame_count:
                 if self.should_stop:
@@ -1248,14 +1108,7 @@ class TimelineRenderingEngine:
                 
                 raw_data = decoder.stdout.read(frame_size)
                 if not raw_data or len(raw_data) != frame_size:
-                    # Decoder failed - check stderr
-                    if frames_read == 0:  # Failed immediately
-                        try:
-                            stderr_output = decoder.stderr.read().decode('utf-8', errors='ignore')
-                            if stderr_output:
-                                self.log(f"Decoder failed on {os.path.basename(input_file)}: {stderr_output[-500:]}")
-                        except:
-                            pass
+                    # Decoder finished early or failed (detected by EOF)
                     break
                     
                 try:
@@ -1344,10 +1197,36 @@ class TimelineRenderingEngine:
                     
                     self.log(f"Encoding Audio: {clip.name}")
                     
-                    cmd_dec = ['ffmpeg', '-ss', f"{seek_time:.6f}", '-i', clip.file_path, '-t', f"{duration:.6f}",
-                               '-vn', '-f', 's16le', '-ar', str(sample_rate), '-ac', str(channels), '-']
+                    # FIX: Multi-track Support (Mix all source streams with Volume Control)
+                    n_streams = get_audio_stream_count_static(clip.file_path)
                     
-                    decoder = subprocess.Popen(cmd_dec, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    cmd_dec = ['ffmpeg', '-v', 'error', '-ss', f"{seek_time:.6f}", '-i', clip.file_path, '-t', f"{duration:.6f}"]
+                    
+                    # Ensure we have volumes for all streams
+                    while len(clip.volumes) < n_streams:
+                        clip.volumes.append(1.0)
+                    
+                    if n_streams > 0:
+                         # Construct complex filter to set volume and mix: [0:a:0]volume=1.0[a0];...
+                        filter_parts = []
+                        inputs = []
+                        for i in range(n_streams):
+                            vol = clip.volumes[i] if i < len(clip.volumes) else 1.0
+                            filter_parts.append(f"[0:a:{i}]volume={vol}[a{i}]")
+                            inputs.append(f"[a{i}]")
+                        
+                        input_tags = "".join(inputs)
+                        filter_cmd = f"{';'.join(filter_parts)};{input_tags}amix=inputs={n_streams}:duration=first:dropout_transition=0[out]"
+                        cmd_dec.extend(['-filter_complex', filter_cmd, '-map', '[out]'])
+                    else:
+                        # Fallback for no audio
+                        cmd_dec.append('-vn')
+                    
+                    # Output PCM S16LE for piping
+                    cmd_dec.extend(['-f', 's16le', '-ar', str(sample_rate), '-ac', str(channels), '-'])
+                    
+                    # FIX: Use DEVNULL for stderr to prevent pipe buffer deadlock
+                    decoder = subprocess.Popen(cmd_dec, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                     
                     while True:
                         chunk = decoder.stdout.read(4096)
@@ -1542,15 +1421,11 @@ class FastEncodeProApp(QMainWindow):
         self.media_library = []
         self.current_media = None
         
-        # Dual player system: QMediaPlayer for MP4/MOV, MPV for MKV/AV1
-        self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.player.setAudioOutput(self.audio_output)
-        self.mpv_widget = None  # Will be created when needed
-        self.using_mpv = False  # Track which player is active
+        # Single player system: OpenCV for ALL formats
+        self.video_widget = None  # Will be created in timeline tab
         
-        self.fullscreen_player = None
         self.timeline_duration = 0
+        self.is_timeline_mode = False
         
         # --- ACCESSIBILITY INIT ---
         self.dwell_filter = DwellClickFilter(self)
@@ -1696,21 +1571,22 @@ class FastEncodeProApp(QMainWindow):
         preview_title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #3b82f6; padding: 5px;")
         preview_layout.addWidget(preview_title)
         
-        # Container for switchable video widgets (QVideoWidget or MPVVideoWidget)
+        # Container for switchable video widgets (QVideoWidget or FFmpegVideoWidget)
         self.video_container = QWidget()
         self.video_container_layout = QVBoxLayout(self.video_container)
         self.video_container_layout.setContentsMargins(0, 0, 0, 0)
         
         # Create QVideoWidget (for MP4, MOV, etc.)
-        self.video_widget = QVideoWidget()
+        # Create MPV video widget (supports ALL formats with audio and GPU decode)
+        self.video_widget = MPVVideoWidget()
         self.video_widget.setMinimumSize(640, 360)
         self.video_widget.setStyleSheet("background-color: black; border: 2px solid #4b5563; border-radius: 8px;")
-        self.player.setVideoOutput(self.video_widget)
         self.video_container_layout.addWidget(self.video_widget)
         self.video_widget.show()
         
-        # MPV widget will be created on-demand for MKV files
-        # (saves resources if user never loads MKV)
+        # Connect signals
+        self.video_widget.positionChanged.connect(self._on_position_changed)
+        self.video_widget.durationChanged.connect(self._on_duration_changed)
         
         preview_layout.addWidget(self.video_container)
         self.preview_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1735,28 +1611,57 @@ class FastEncodeProApp(QMainWindow):
         self.fullscreen_btn.clicked.connect(self.enter_fullscreen)
         controls_row.addWidget(self.fullscreen_btn)
         preview_layout.addLayout(controls_row)
+        
+        # --- TRIM & MIXER PANEL ---
         trim_panel = QWidget()
-        trim_layout = QVBoxLayout(trim_panel)
-        trim_layout.setContentsMargins(5, 5, 5, 5)
-        trim_title = QLabel("✂️ TRIM POINTS")
-        trim_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #fbbf24; padding: 5px;")
-        trim_layout.addWidget(trim_title)
+        trim_layout = QHBoxLayout(trim_panel)
+        trim_layout.setContentsMargins(0, 5, 0, 5)
+        
+        # Trim Controls (Left)
+        trim_box = QGroupBox("✂️ Trim")
+        trim_box.setStyleSheet(self.groupbox_style())
+        trim_box_layout = QVBoxLayout(trim_box)
         trim_buttons = QHBoxLayout()
         set_in_btn = QPushButton("[ Set IN")
         set_in_btn.setStyleSheet(self.button_style("#10b981"))
-        set_in_btn.setMinimumHeight(45)
+        set_in_btn.setMinimumHeight(35)
         set_in_btn.clicked.connect(self.set_media_in_point)
         trim_buttons.addWidget(set_in_btn)
         set_out_btn = QPushButton("Set OUT ]")
         set_out_btn.setStyleSheet(self.button_style("#10b981"))
-        set_out_btn.setMinimumHeight(45)
+        set_out_btn.setMinimumHeight(35)
         set_out_btn.clicked.connect(self.set_media_out_point)
         trim_buttons.addWidget(set_out_btn)
-        trim_layout.addLayout(trim_buttons)
+        trim_box_layout.addLayout(trim_buttons)
         self.trim_info = QLabel("In: 00:00:00 | Out: 00:00:00 | Duration: 00:00:00")
-        self.trim_info.setStyleSheet("font-size: 10pt; color: #9ca3af; padding: 5px;")
+        self.trim_info.setStyleSheet("font-size: 9pt; color: #9ca3af; padding: 2px;")
         self.trim_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        trim_layout.addWidget(self.trim_info)
+        trim_box_layout.addWidget(self.trim_info)
+        trim_layout.addWidget(trim_box)
+        
+        # Mixer Controls (Right)
+        mixer_box = QGroupBox("🎚️ Audio Mixer")
+        mixer_box.setStyleSheet(self.groupbox_style())
+        mixer_box_layout = QVBoxLayout(mixer_box)
+        
+        self.track1_slider = QSlider(Qt.Orientation.Horizontal)
+        self.track1_slider.setRange(0, 200)
+        self.track1_slider.setValue(100)
+        self.track1_slider.setStyleSheet(self.slider_style())
+        self.track1_slider.valueChanged.connect(self.update_clip_volume)
+        mixer_box_layout.addWidget(QLabel("Track 1 (Game)"))
+        mixer_box_layout.addWidget(self.track1_slider)
+        
+        self.track2_slider = QSlider(Qt.Orientation.Horizontal)
+        self.track2_slider.setRange(0, 200)
+        self.track2_slider.setValue(100)
+        self.track2_slider.setStyleSheet(self.slider_style())
+        self.track2_slider.valueChanged.connect(self.update_clip_volume)
+        mixer_box_layout.addWidget(QLabel("Track 2 (Mic)"))
+        mixer_box_layout.addWidget(self.track2_slider)
+        
+        trim_layout.addWidget(mixer_box)
+        
         preview_layout.addWidget(trim_panel)
         top_layout.addWidget(preview_panel, stretch=2)
         layout.addWidget(top_section, stretch=3)
@@ -1783,6 +1688,7 @@ class FastEncodeProApp(QMainWindow):
         self.timeline.setStyleSheet("background-color: #111827; border: 2px solid #4b5563; border-radius: 8px;")
         self.timeline.clip_selected.connect(self.on_timeline_clip_selected)
         self.timeline.playhead_moved.connect(self.on_timeline_playhead_moved)
+        self.timeline.timeline_clicked.connect(self.activate_timeline_mode)
         timeline_layout.addWidget(self.timeline, stretch=1)
         timeline_controls = QHBoxLayout()
         add_to_timeline_btn = QPushButton("➕ Add to Timeline")
@@ -1813,9 +1719,6 @@ class FastEncodeProApp(QMainWindow):
         timeline_controls.addWidget(self.stop_export_btn)
         timeline_layout.addLayout(timeline_controls)
         layout.addWidget(timeline_section, stretch=2)
-        self.player.positionChanged.connect(self.update_preview_position)
-        self.player.durationChanged.connect(self.update_preview_duration)
-        self.player.playbackStateChanged.connect(self.update_play_button)
         return tab
 
     def create_codec_tab(self):
@@ -2124,240 +2027,175 @@ class FastEncodeProApp(QMainWindow):
             del self.media_library[row]
             if self.current_media and row == self.media_library.index(self.current_media) if self.current_media in self.media_library else False:
                 self.current_media = None
-                self.player.stop()
+                if self.video_widget:
+                    self.video_widget.stop()
     
-    def _should_use_mpv(self, file_path):
-        """Determine if file should use MPV player (MKV, AV1, VP9)"""
-        if not MPV_AVAILABLE:
-            return False
-        
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext in ['.mkv', '.webm']:
-            return True
-        
-        # Check codec for AV1/VP9 in other containers
-        try:
-            codec = self.timeline.rendering_engine._get_video_codec(file_path) if hasattr(self, 'timeline') else None
-            if codec in ['av1', 'vp9', 'vp8']:
-                return True
-        except:
-            pass
-        
-        return False
-    
-    def _switch_to_mpv(self):
-        """Switch from QVideoWidget to MPV widget"""
-        if self.using_mpv:
-            return  # Already using MPV
-        
-        try:
-            # Hide QVideoWidget
-            self.video_widget.hide()
-            
-            # Create MPV widget if it doesn't exist
-            if not self.mpv_widget:
-                print("Creating MPV widget...")
-                self.mpv_widget = MPVVideoWidget()
-                
-                if not self.mpv_widget.mpv_player:
-                    # MPV failed to initialize
-                    error_msg = "MPV player failed to initialize. MKV preview not available.\n\n"
-                    error_msg += "Installation instructions:\n\n"
-                    error_msg += "Arch/Manjaro/CachyOS:\n"
-                    error_msg += "  sudo pacman -S mpv python-mpv\n\n"
-                    error_msg += "Debian/Ubuntu:\n"
-                    error_msg += "  sudo apt install libmpv-dev mpv\n"
-                    error_msg += "  pip install python-mpv --break-system-packages\n\n"
-                    error_msg += "Fedora:\n"
-                    error_msg += "  sudo dnf install mpv python3-mpv\n\n"
-                    error_msg += "Rendering will still work (uses FFmpeg directly)."
-                    
-                    QMessageBox.warning(self, "MPV Not Available", error_msg)
-                    
-                    # Fall back to showing QVideoWidget (won't play, but won't crash)
-                    self.video_widget.show()
-                    self.using_mpv = False
-                    return
-                
-                self.mpv_widget.setMinimumSize(640, 360)
-                self.mpv_widget.setStyleSheet("background-color: black; border: 2px solid #4b5563; border-radius: 8px;")
-                self.video_container_layout.addWidget(self.mpv_widget)
-                
-                # Connect MPV signals to UI
-                self.mpv_widget.positionChanged.connect(self._on_mpv_position_changed)
-                self.mpv_widget.durationChanged.connect(self._on_mpv_duration_changed)
-                
-                print("MPV widget created successfully")
-            
-            self.mpv_widget.show()
-            self.using_mpv = True
-            print("Switched to MPV player for MKV/AV1 support")
-            
-        except Exception as e:
-            print(f"ERROR creating MPV widget: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Show error to user
-            QMessageBox.critical(self, "MPV Error", f"Failed to initialize MPV player:\n\n{str(e)}\n\nMKV preview will not work, but rendering will still function.")
-            
-            # Fall back to QVideoWidget
-            self.video_widget.show()
-            self.using_mpv = False
-    
-    def _switch_to_qmediaplayer(self):
-        """Switch from MPV to QVideoWidget"""
-        if not self.using_mpv:
-            return  # Already using QMediaPlayer
-        
-        # Hide MPV widget
-        if self.mpv_widget:
-            self.mpv_widget.hide()
-        
-        # Show QVideoWidget
-        self.video_widget.show()
-        self.using_mpv = False
-        print("Switched to QMediaPlayer")
-    
-    def _on_mpv_position_changed(self, position_ms):
-        """Handle MPV position updates"""
+    def _on_position_changed(self, position_ms):
+        """Handle video position updates"""
         # Update slider
-        if self.mpv_widget and self.mpv_widget.duration() > 0:
-            slider_value = int((position_ms / self.mpv_widget.duration()) * 1000)
+        if self.video_widget and self.video_widget.duration() > 0:
+            slider_value = int((position_ms / self.video_widget.duration()) * 1000)
             self.preview_slider.setValue(slider_value)
         
         # Update timecode
         current_tc = self.format_timecode(position_ms)
-        total_tc = self.format_timecode(self.mpv_widget.duration() if self.mpv_widget else 0)
+        total_tc = self.format_timecode(self.video_widget.duration() if self.video_widget else 0)
         self.timecode_label.setText(f"{current_tc} / {total_tc}")
     
-    def _on_mpv_duration_changed(self, duration_ms):
-        """Handle MPV duration updates"""
+    def _on_duration_changed(self, duration_ms):
+        """Handle video duration updates"""
         # Update timecode display
-        current_tc = self.format_timecode(self.mpv_widget.position() if self.mpv_widget else 0)
+        current_tc = self.format_timecode(self.video_widget.position() if self.video_widget else 0)
         total_tc = self.format_timecode(duration_ms)
         self.timecode_label.setText(f"{current_tc} / {total_tc}")
 
     def on_media_selected(self, item):
+        self.is_timeline_mode = False
         row = self.media_list.row(item)
         if 0 <= row < len(self.media_library):
             self.current_media = self.media_library[row]
             file_path = self.current_media.file_path
             
-            # Debug: Check the file path being used
-            print("=" * 60)
-            print(f"Media selected: {self.current_media.name if hasattr(self.current_media, 'name') else 'unknown'}")
-            print(f"File path: {file_path}")
-            print(f"File exists: {os.path.exists(file_path)}")
-            print(f"File extension: {os.path.splitext(file_path)[1]}")
-            print(f"MPV_AVAILABLE: {MPV_AVAILABLE}")
-            print("=" * 60)
+            # Apply audio mix logic for preview
+            self.apply_audio_mix_preview(file_path, volumes=[1.0, 1.0])
             
-            # Determine which player to use
-            if self._should_use_mpv(file_path):
-                print(f"File requires MPV (detected as MKV/AV1)")
-                self._switch_to_mpv()
-                
-                # Only try to load if MPV actually initialized
-                if self.mpv_widget and self.mpv_widget.mpv_player:
-                    print("MPV player available, loading file...")
-                    self.mpv_widget.load_file(file_path)
-                    self.mpv_widget.pause()
-                else:
-                    print("MPV player not available, falling back to QMediaPlayer")
-                    # MPV failed - use QMediaPlayer instead (won't preview but won't crash)
-                    self._switch_to_qmediaplayer()
-                    self.player.setSource(QUrl.fromLocalFile(file_path))
-                    self.player.pause()
-            else:
-                print("Using QMediaPlayer")
-                self._switch_to_qmediaplayer()
-                self.player.setSource(QUrl.fromLocalFile(file_path))
-                self.player.pause()
+            # Load file in OpenCV widget (supports ALL formats)
+            if self.video_widget:
+                if self.video_widget.load_file(file_path):
+                    self.video_widget.pause()
             
             self.update_trim_info()
 
+    def activate_timeline_mode(self):
+        self.is_timeline_mode = True
+        self.trim_info.setText("Timeline Mode Active - Click Play to Preview Sequence")
+
     def on_timeline_clip_selected(self, clip):
-        file_path = clip.file_path
+        self.is_timeline_mode = True
         
-        # Determine which player to use
-        if self._should_use_mpv(file_path):
-            self._switch_to_mpv()
-            
-            # Only try to load if MPV actually initialized
-            if self.mpv_widget and self.mpv_widget.mpv_player:
-                self.mpv_widget.load_file(file_path)
-                self.mpv_widget.seek(int(clip.in_point * 1000))
-                self.mpv_widget.pause()
-            else:
-                # MPV failed - use QMediaPlayer instead
-                self._switch_to_qmediaplayer()
-                self.player.setSource(QUrl.fromLocalFile(file_path))
-                self.player.setPosition(int(clip.in_point * 1000))
-                self.player.pause()
-        else:
-            self._switch_to_qmediaplayer()
-            self.player.setSource(QUrl.fromLocalFile(file_path))
-            self.player.setPosition(int(clip.in_point * 1000))
-            self.player.pause()
+        # Update Mixer Sliders based on clip volume data
+        if clip.volumes:
+            if len(clip.volumes) > 0:
+                self.track1_slider.setValue(int(clip.volumes[0] * 100))
+            if len(clip.volumes) > 1:
+                self.track2_slider.setValue(int(clip.volumes[1] * 100))
+        
+        # Apply mix for single clip preview immediately
+        self.apply_audio_mix_preview(clip.file_path, clip.volumes)
         
         in_tc = self.format_timecode(int(clip.in_point * 1000))
         out_tc = self.format_timecode(int(clip.out_point * 1000))
         dur_tc = self.format_timecode(int(clip.get_trimmed_duration() * 1000))
-        self.trim_info.setText(f"Timeline Clip | In: {in_tc} | Out: {out_tc} | Duration: {dur_tc}")
+        self.trim_info.setText(f"Selected: {clip.name} | In: {in_tc} | Out: {out_tc}")
+
+    def update_clip_volume(self):
+        """Update volume data for selected clip from sliders"""
+        if self.timeline.selected_clip:
+            clip = self.timeline.selected_clip
+            # Ensure volumes list is big enough
+            while len(clip.volumes) < 2:
+                clip.volumes.append(1.0)
+            
+            clip.volumes[0] = self.track1_slider.value() / 100.0
+            clip.volumes[1] = self.track2_slider.value() / 100.0
+            
+            # Update live preview mix
+            self.apply_audio_mix_preview(clip.file_path, clip.volumes)
+
+    def apply_audio_mix_preview(self, file_path, volumes):
+        """Configure MPV to mix multiple audio tracks for preview"""
+        if not self.video_widget: return
+        
+        n_streams = get_audio_stream_count_static(file_path)
+        
+        if n_streams > 1:
+            # Construct lavfi-complex string to mix tracks with volume
+            # [aid1]volume=v1[a1];[aid2]volume=v2[a2];[a1][a2]amix=inputs=2[ao]
+            filter_parts = []
+            inputs = []
+            for i in range(n_streams):
+                vol = volumes[i] if i < len(volumes) else 1.0
+                # aid starts at 1 usually in mpv properties, but filter mapping uses internal IDs
+                # Easier approach: map all audio streams
+                # Note: MPV's --lavfi-complex uses [aid1], [aid2] etc to refer to tracks
+                filter_parts.append(f"[aid{i+1}]volume={vol}[a{i}]")
+                inputs.append(f"[a{i}]")
+            
+            input_tags = "".join(inputs)
+            filter_str = f"{';'.join(filter_parts)};{input_tags}amix=inputs={n_streams}:duration=first:dropout_transition=0[ao]"
+            
+            # Apply to MPV
+            self.video_widget.set_audio_complex_filter(filter_str)
+        else:
+            # Clear filter for single track files
+            self.video_widget.set_audio_complex_filter("")
 
     def on_timeline_playhead_moved(self, time):
         pass
 
     def toggle_play(self):
-        if self.using_mpv and self.mpv_widget:
-            # MPV player control
-            if self.mpv_widget.is_paused():
-                self.mpv_widget.play()
-                self.play_btn.setText("⏸️ Pause")
-            else:
-                self.mpv_widget.pause()
-                self.play_btn.setText("▶️ Play")
+        if not self.video_widget:
+            return
+
+        # If in timeline mode and starting playback, build EDL
+        if self.is_timeline_mode and self.video_widget.is_paused():
+            self.play_timeline_sequence()
+        elif self.video_widget.is_paused():
+            self.video_widget.play()
+            self.play_btn.setText("⏸️ Pause")
         else:
-            # QMediaPlayer control
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self.player.pause()
-            else:
-                self.player.play()
+            self.video_widget.pause()
+            self.play_btn.setText("▶️ Play")
+
+    def play_timeline_sequence(self):
+        """Generates an EDL and plays the full timeline in MPV"""
+        if not self.timeline.clips:
+            return
+
+        # Create temporary EDL file
+        # Format: # mpv EDL v0
+        # filename, start, length
+        edl_content = "# mpv EDL v0\n"
+        sorted_clips = sorted(self.timeline.clips, key=lambda c: c.start_time)
+        
+        for clip in sorted_clips:
+            # MPV EDL uses seconds
+            length = clip.get_trimmed_duration()
+            edl_content += f"{clip.file_path},{clip.in_point},{length}\n"
+            
+        try:
+            # Write to temp file
+            fd, path = tempfile.mkstemp(suffix='.edl', text=True)
+            with os.fdopen(fd, 'w') as f:
+                f.write(edl_content)
+            
+            print(f"Playing EDL: {path}")
+            
+            # Apply global mix based on first clip (assumption for preview)
+            if sorted_clips:
+                first_clip = sorted_clips[0]
+                self.apply_audio_mix_preview(first_clip.file_path, first_clip.volumes)
+                
+            # Load EDL into MPV
+            if self.video_widget.load_file(path):
+                # Seek to current playhead
+                self.video_widget.seek(int(self.timeline.playhead_position * 1000))
+                self.video_widget.play()
+                self.play_btn.setText("⏸️ Pause")
+        except Exception as e:
+            print(f"EDL Error: {e}")
 
     def update_play_button(self):
-        if self.using_mpv and self.mpv_widget:
-            if not self.mpv_widget.is_paused():
-                self.play_btn.setText("⏸️ Pause")
-            else:
-                self.play_btn.setText("▶️ Play")
-        else:
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        if self.video_widget:
+            if not self.video_widget.is_paused():
                 self.play_btn.setText("⏸️ Pause")
             else:
                 self.play_btn.setText("▶️ Play")
 
     def seek_preview(self, value):
-        if self.using_mpv and self.mpv_widget:
-            # MPV seek
-            if self.mpv_widget.duration() > 0:
-                position_ms = int((value / 1000.0) * self.mpv_widget.duration())
-                self.mpv_widget.seek(position_ms)
-        else:
-            # QMediaPlayer seek
-            if self.player.duration() > 0:
-                position = int((value / 1000.0) * self.player.duration())
-                self.player.setPosition(position)
-
-    def update_preview_position(self, position):
-        if self.player.duration() > 0:
-            value = int((position / self.player.duration()) * 1000)
-            self.preview_slider.setValue(value)
-        self.timecode_label.setText(f"{self.format_timecode(position)} / {self.format_timecode(self.player.duration())}")
-
-    def update_preview_duration(self, duration):
-        self.preview_slider.setMaximum(1000)
-        self.timecode_label.setText(f"{self.format_timecode(self.player.position())} / {self.format_timecode(duration)}")
+        if self.video_widget and self.video_widget.duration() > 0:
+            position_ms = int((value / 1000.0) * self.video_widget.duration())
+            self.video_widget.seek(position_ms)
 
     def format_timecode(self, ms):
         s = ms // 1000
@@ -2367,20 +2205,19 @@ class FastEncodeProApp(QMainWindow):
         return f"{h:02d}:{m:02d}:{s:02d}"
 
     def enter_fullscreen(self):
-        if self.current_media or self.player.source().isValid():
-            self.fullscreen_player = FullscreenVideoPlayer(self.player, self)
-            self.fullscreen_player.show()
+        # Fullscreen disabled (removed QMediaPlayer dependency)
+        pass
 
     def set_media_in_point(self):
-        if self.current_media:
-            self.current_media.in_point = self.player.position() / 1000.0
+        if self.current_media and self.video_widget:
+            self.current_media.in_point = self.video_widget.position() / 1000.0
             if self.current_media.out_point <= self.current_media.in_point:
                 self.current_media.out_point = self.current_media.duration
             self.update_trim_info()
 
     def set_media_out_point(self):
-        if self.current_media:
-            self.current_media.out_point = self.player.position() / 1000.0
+        if self.current_media and self.video_widget:
+            self.current_media.out_point = self.video_widget.position() / 1000.0
             if self.current_media.out_point <= self.current_media.in_point:
                 self.current_media.in_point = 0
             self.update_trim_info()
@@ -2834,10 +2671,10 @@ class FastEncodeProApp(QMainWindow):
     def closeEvent(self, event):
         self.save_settings()
         
-        # Cleanup MPV player
-        if self.mpv_widget:
+        # Cleanup video player
+        if self.video_widget:
             try:
-                self.mpv_widget.shutdown()
+                self.video_widget.shutdown()
             except:
                 pass
         

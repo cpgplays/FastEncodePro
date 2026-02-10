@@ -25,7 +25,20 @@ GPU-accelerated video encoder with advanced noise reduction.
 
 ---
 
+<img width="1918" height="1038" alt="image" src="https://github.com/user-attachments/assets/e7957385-ca9d-4580-9a55-481eafa54f97" />
+
+
+<img width="1918" height="1038" alt="image" src="https://github.com/user-attachments/assets/e80250cf-5897-4e36-8af8-84ab49577f59" />
+
+
+<img width="1918" height="1038" alt="image" src="https://github.com/user-attachments/assets/fa04421e-bc18-4279-a42c-de5f84bb68ca" />
+<img width="1918" height="1038" alt="image" src="https://github.com/user-attachments/assets/9ae5cddc-02a0-45ff-a670-ccb2f1cf68a1" />
+
+
 ## 📦 Installation
+
+
+
 
 ### Requirements
 

@@ -58,3 +58,9 @@ Built with assistance from Claude (Anthropic)
 Powered by FFmpeg and NVIDIA NVENC
 UI built with PyQt6
 Made with ❤️ by cpgplays
+
+<img width="1918" height="1038" alt="image" src="https://github.com/user-attachments/assets/c769f9a4-b763-48ee-af0c-36d84b65e80d" />
+
+<img width="1918" height="1038" alt="image" src="https://github.com/user-attachments/assets/ee054eb4-cea3-49f3-98a8-c81879a4f67f" />
+<img width="1918" height="1038" alt="image" src="https://github.com/user-attachments/assets/940afbeb-c9f1-40b8-999f-be1a38ad8a81" />
+<img width="1918" height="1038" alt="image" src="https://github.com/user-attachments/assets/6f720e9d-546f-456b-a5ca-4b38f7991b97" />

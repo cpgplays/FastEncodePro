@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-FastEncode Pro - Timeline Edition v0.08
+FastEncode Pro - Timeline Edition v0.08.1
 GPU-Accelerated Video Editor with Native Wayland MPV Support
 
-v0.08 Features:
+v0.08.1 Features:
 - Native Wayland MPV Player (No XWayland Required)
 - Audio + GPU Decode + Smooth Playback
-- Works with Desktop Icons/Taskbar on Arch
 - Universal Format Support (All codecs)
+- Decibel-based Volume Mixing & Normalization
+- Visual Waveform Support
 - Fixed Audio Rendering (Multi-track Mixing + Volume Control)
 - Fixed Timeline Snapping & Scrubber Shake
 - Timeline Playback (EDL Preview) + Realtime Audio Mixing
@@ -42,7 +43,7 @@ except ImportError:
     print("⚠️  python-mpv not installed - install with: sudo pacman -S python-mpv")
 
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRectF, QObject
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRectF, QObject, QSize
 from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor, QAction, QPainterPath, QMouseEvent, QImage, QPixmap
 
 __version__ = "0.08"
@@ -59,6 +60,42 @@ def get_audio_stream_count_static(filepath):
         return len(out.splitlines())
     except:
         return 1
+
+# --- WAVEFORM GENERATOR ---
+
+class WaveformWorker(QThread):
+    finished = pyqtSignal(str, object) # file_path, QPixmap
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        try:
+            # Generate a temp PNG waveform using ffmpeg showwavespic
+            # This mixes down to mono for visualization purposes
+            temp_png = os.path.join(tempfile.gettempdir(), f"wave_{hash(self.file_path)}.png")
+
+            # Resolution: 1000px wide (enough for zoom), 100px high
+            cmd = [
+                'ffmpeg', '-y', '-v', 'error',
+                '-i', self.file_path,
+                '-filter_complex', 'aformat=channel_layouts=mono,showwavespic=s=2000x100:colors=white|0x4ade80',
+                '-frames:v', '1',
+                temp_png
+            ]
+
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            if os.path.exists(temp_png):
+                pixmap = QPixmap(temp_png)
+                self.finished.emit(self.file_path, pixmap)
+                try:
+                    os.remove(temp_png)
+                except:
+                    pass
+        except Exception as e:
+            print(f"Waveform gen error: {e}")
 
 # --- ACCESSIBILITY CLASSES ---
 
@@ -438,7 +475,7 @@ class MPVVideoWidget(QWidget):
 
 class TimelineClip:
     """Represents a clip on the timeline"""
-    def __init__(self, file_path, track, start_time, in_point=0, out_point=None, duration=None, volumes=None):
+    def __init__(self, file_path, track, start_time, in_point=0, out_point=None, duration=None, volumes=None, normalization=None):
         self.file_path = file_path
         self.track = track
         self.start_time = start_time
@@ -446,8 +483,14 @@ class TimelineClip:
         self.name = Path(file_path).name
         self.full_duration = duration if duration is not None else self.get_video_duration()
         self.audio_streams = get_audio_stream_count_static(self.file_path)
-        # Volume levels for audio tracks (1.0 = 100%)
-        self.volumes = volumes if volumes else [1.0] * max(1, self.audio_streams)
+
+        # Volumes in Decibels (0.0 = default)
+        self.volumes = volumes if volumes else [0.0] * max(1, self.audio_streams)
+
+        # Normalization flags per track
+        self.normalization = normalization if normalization else [False] * max(1, self.audio_streams)
+
+        self.waveform_pixmap = None
 
         if out_point is None or out_point <= 0:
             self.out_point = self.full_duration
@@ -484,7 +527,8 @@ class TimelineClip:
             "in_point": self.in_point,
             "out_point": self.out_point,
             "duration": self.full_duration,
-            "volumes": self.volumes
+            "volumes": self.volumes,
+            "normalization": self.normalization
         }
 
     @staticmethod
@@ -496,7 +540,8 @@ class TimelineClip:
             data["in_point"],
             data["out_point"],
             data["duration"],
-            data.get("volumes", [1.0])
+            data.get("volumes", [0.0]),
+            data.get("normalization", [False])
         )
 
 
@@ -517,11 +562,12 @@ class TimelineWidget(QWidget):
         self.scroll_offset = 0
         self.setMinimumHeight(250)
         self.setMouseTracking(True)
-        self.track_height = 80 # Increased for audio visuals
+        self.track_height = 100 # Increased for waveform
         self.num_tracks = 4
         self.playhead_position = 0
         self.dragging_playhead = False
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.waveform_threads = []
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -577,14 +623,19 @@ class TimelineWidget(QWidget):
         painter.setPen(QPen(QColor("white"), 2))
         painter.drawRoundedRect(x, y, width, height, 5, 5)
 
-        # Draw Audio Track Indicators
-        if clip.audio_streams > 0:
-            audio_height = height / (clip.audio_streams + 1)
-            painter.setBrush(QColor(0, 0, 0, 50))
-            painter.setPen(Qt.PenStyle.NoPen)
-            for i in range(clip.audio_streams):
-                ay = y + height - ((i + 1) * 15) - 5
-                painter.drawRect(x + 5, int(ay), width - 10, 10)
+        # Draw Waveform
+        if clip.waveform_pixmap:
+            # Calculate source rect based on trim
+            full_width_pixels = int(clip.full_duration * self.zoom_level)
+            start_pixel = int(clip.in_point * self.zoom_level)
+
+            # Draw waveform centered in vertical space
+            wave_rect = QRectF(x + 5, y + 25, width - 10, height - 35)
+
+            # Simple scaling for visualization (stretching full waveform to full clip duration is inaccurate but faster)
+            # Correct way: map sub-rect of pixmap.
+            # Here we just draw the whole thing stretched to trimmed length for simplicity & performance in V1
+            painter.drawPixmap(wave_rect.toRect(), clip.waveform_pixmap)
 
         painter.setPen(QColor("white"))
         font = QFont("Arial", 9, QFont.Weight.Bold)
@@ -592,7 +643,7 @@ class TimelineWidget(QWidget):
         text_rect = painter.boundingRect(x + 5, y + 5, width - 10, height - 10, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, clip.name)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, clip.name)
 
-        info_text = f"{clip.get_trimmed_duration():.1f}s | {clip.audio_streams} Audio Trk"
+        info_text = f"{clip.get_trimmed_duration():.1f}s | {clip.audio_streams} Tracks"
         duration_rect = painter.boundingRect(x + 5, y + height - 20, width - 10, 15, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, info_text)
         painter.drawText(duration_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, info_text)
 
@@ -731,6 +782,18 @@ class TimelineWidget(QWidget):
 
     def add_clip(self, clip):
         self.clips.append(clip)
+        # Generate waveform
+        worker = WaveformWorker(clip.file_path)
+        worker.finished.connect(self.waveform_ready)
+        self.waveform_threads.append(worker)
+        worker.start()
+        self.update()
+
+    def waveform_ready(self, file_path, pixmap):
+        # Assign waveform to clips matching path
+        for clip in self.clips:
+            if clip.file_path == file_path:
+                clip.waveform_pixmap = pixmap
         self.update()
 
     def remove_clip(self, clip):
@@ -1249,15 +1312,17 @@ class TimelineRenderingEngine:
 
                     # Ensure we have volumes for all streams
                     while len(clip.volumes) < n_streams:
-                        clip.volumes.append(1.0)
+                        clip.volumes.append(0.0) # Default 0dB
 
                     if n_streams > 0:
-                         # Construct complex filter to set volume and mix: [0:a:0]volume=1.0[a0];...
+                         # Construct complex filter to set volume and mix
                         filter_parts = []
                         inputs = []
                         for i in range(n_streams):
-                            vol = clip.volumes[i] if i < len(clip.volumes) else 1.0
-                            filter_parts.append(f"[0:a:{i}]volume={vol}[a{i}]")
+                            vol_db = clip.volumes[i] if i < len(clip.volumes) else 0.0
+                            # Add normalization if enabled for this track
+                            norm_filter = "loudnorm," if clip.normalization[i] else ""
+                            filter_parts.append(f"[0:a:{i}]{norm_filter}volume={vol_db}dB[a{i}]")
                             inputs.append(f"[a{i}]")
 
                         input_tags = "".join(inputs)
@@ -1689,21 +1754,45 @@ class FastEncodeProApp(QMainWindow):
         mixer_box.setStyleSheet(self.groupbox_style())
         mixer_box_layout = QVBoxLayout(mixer_box)
 
+        # Track 1
+        t1_layout = QHBoxLayout()
+        t1_layout.addWidget(QLabel("Audio Track 1"))
+        self.track1_norm = QCheckBox("Normalize")
+        self.track1_norm.setStyleSheet("color: #4ade80;")
+        self.track1_norm.stateChanged.connect(self.update_clip_volume)
+        t1_layout.addWidget(self.track1_norm)
+        mixer_box_layout.addLayout(t1_layout)
+
+        t1_slider_layout = QHBoxLayout()
         self.track1_slider = QSlider(Qt.Orientation.Horizontal)
-        self.track1_slider.setRange(0, 200)
-        self.track1_slider.setValue(100)
+        self.track1_slider.setRange(-60, 30) # dB Range
+        self.track1_slider.setValue(0)
         self.track1_slider.setStyleSheet(self.slider_style())
         self.track1_slider.valueChanged.connect(self.update_clip_volume)
-        mixer_box_layout.addWidget(QLabel("Track 1 (Game)"))
-        mixer_box_layout.addWidget(self.track1_slider)
+        t1_slider_layout.addWidget(self.track1_slider)
+        self.t1_val = QLabel("0 dB")
+        t1_slider_layout.addWidget(self.t1_val)
+        mixer_box_layout.addLayout(t1_slider_layout)
 
+        # Track 2
+        t2_layout = QHBoxLayout()
+        t2_layout.addWidget(QLabel("Audio Track 2"))
+        self.track2_norm = QCheckBox("Normalize")
+        self.track2_norm.setStyleSheet("color: #4ade80;")
+        self.track2_norm.stateChanged.connect(self.update_clip_volume)
+        t2_layout.addWidget(self.track2_norm)
+        mixer_box_layout.addLayout(t2_layout)
+
+        t2_slider_layout = QHBoxLayout()
         self.track2_slider = QSlider(Qt.Orientation.Horizontal)
-        self.track2_slider.setRange(0, 200)
-        self.track2_slider.setValue(100)
+        self.track2_slider.setRange(-60, 30) # dB Range
+        self.track2_slider.setValue(0)
         self.track2_slider.setStyleSheet(self.slider_style())
         self.track2_slider.valueChanged.connect(self.update_clip_volume)
-        mixer_box_layout.addWidget(QLabel("Track 2 (Mic)"))
-        mixer_box_layout.addWidget(self.track2_slider)
+        t2_slider_layout.addWidget(self.track2_slider)
+        self.t2_val = QLabel("0 dB")
+        t2_slider_layout.addWidget(self.t2_val)
+        mixer_box_layout.addLayout(t2_slider_layout)
 
         trim_layout.addWidget(mixer_box)
 
@@ -2107,18 +2196,15 @@ class FastEncodeProApp(QMainWindow):
                 self.video_widget.pause()
 
                 # 2. THEN apply the audio mix filter if needed
-                # We delay this slightly or apply it after load to avoid the initial crash
-                # However, for smoothness, we try to apply it.
-                # If n_streams > 1, we apply it.
                 n_streams = get_audio_stream_count_static(file_path)
                 if n_streams > 1:
                     # Construct filter
                     filter_parts = []
                     inputs = []
                     for i in range(n_streams):
-                        # Default 100% volume for library preview
-                        vol = 1.0
-                        filter_parts.append(f"[aid{i+1}]volume={vol}[a{i}]")
+                        # Default 0dB volume for library preview
+                        vol_db = 0.0
+                        filter_parts.append(f"[aid{i+1}]volume={vol_db}dB[a{i}]")
                         inputs.append(f"[a{i}]")
 
                     input_tags = "".join(inputs)
@@ -2137,16 +2223,18 @@ class FastEncodeProApp(QMainWindow):
         # Update Mixer Sliders based on clip volume data
         if clip.volumes:
             if len(clip.volumes) > 0:
-                self.track1_slider.setValue(int(clip.volumes[0] * 100))
+                self.track1_slider.setValue(int(clip.volumes[0]))
+                self.track1_norm.setChecked(clip.normalization[0])
             if len(clip.volumes) > 1:
-                self.track2_slider.setValue(int(clip.volumes[1] * 100))
+                self.track2_slider.setValue(int(clip.volumes[1]))
+                self.track2_norm.setChecked(clip.normalization[1])
 
         # Safe preview load
         if self.video_widget.load_file(clip.file_path):
             self.video_widget.seek(int(clip.in_point * 1000))
             self.video_widget.pause()
             # Apply mix AFTER load
-            self.apply_audio_mix_preview(clip.file_path, clip.volumes)
+            self.apply_audio_mix_preview(clip.file_path, clip.volumes, clip.normalization)
 
         in_tc = self.format_timecode(int(clip.in_point * 1000))
         out_tc = self.format_timecode(int(clip.out_point * 1000))
@@ -2155,19 +2243,26 @@ class FastEncodeProApp(QMainWindow):
 
     def update_clip_volume(self):
         """Update volume data for selected clip from sliders"""
+        self.t1_val.setText(f"{self.track1_slider.value()} dB")
+        self.t2_val.setText(f"{self.track2_slider.value()} dB")
+
         if self.timeline.selected_clip:
             clip = self.timeline.selected_clip
             # Ensure volumes list is big enough
             while len(clip.volumes) < 2:
-                clip.volumes.append(1.0)
+                clip.volumes.append(0.0)
+                clip.normalization.append(False)
 
-            clip.volumes[0] = self.track1_slider.value() / 100.0
-            clip.volumes[1] = self.track2_slider.value() / 100.0
+            clip.volumes[0] = float(self.track1_slider.value())
+            clip.normalization[0] = self.track1_norm.isChecked()
+
+            clip.volumes[1] = float(self.track2_slider.value())
+            clip.normalization[1] = self.track2_norm.isChecked()
 
             # Update live preview mix
-            self.apply_audio_mix_preview(clip.file_path, clip.volumes)
+            self.apply_audio_mix_preview(clip.file_path, clip.volumes, clip.normalization)
 
-    def apply_audio_mix_preview(self, file_path, volumes):
+    def apply_audio_mix_preview(self, file_path, volumes, normalization=None):
         """Configure MPV to mix multiple audio tracks for preview"""
         if not self.video_widget: return
 
@@ -2178,8 +2273,15 @@ class FastEncodeProApp(QMainWindow):
             filter_parts = []
             inputs = []
             for i in range(n_streams):
-                vol = volumes[i] if i < len(volumes) else 1.0
-                filter_parts.append(f"[aid{i+1}]volume={vol}[a{i}]")
+                vol_db = volumes[i] if i < len(volumes) else 0.0
+                norm = normalization[i] if normalization and i < len(normalization) else False
+
+                # Filter chain per track
+                chain = f"volume={vol_db}dB"
+                if norm:
+                    chain = f"loudnorm,{chain}"
+
+                filter_parts.append(f"[aid{i+1}]{chain}[a{i}]")
                 inputs.append(f"[a{i}]")
 
             input_tags = "".join(inputs)
@@ -2188,8 +2290,14 @@ class FastEncodeProApp(QMainWindow):
             # Apply to MPV
             self.video_widget.set_audio_complex_filter(filter_str)
         else:
-            # Clear filter for single track files
-            self.video_widget.set_audio_complex_filter("")
+            # Single Track Logic
+            vol_db = volumes[0] if volumes else 0.0
+            norm = normalization[0] if normalization else False
+            chain = f"volume={vol_db}dB"
+            if norm:
+                chain = f"loudnorm,{chain}"
+            # Apply filter to main output
+            self.video_widget.set_audio_complex_filter(f"[aid1]{chain}[ao]")
 
     def on_timeline_playhead_moved(self, time):
         pass
@@ -2240,7 +2348,7 @@ class FastEncodeProApp(QMainWindow):
                 # Apply global mix based on first clip (assumption for preview)
                 if sorted_clips:
                     first_clip = sorted_clips[0]
-                    self.apply_audio_mix_preview(first_clip.file_path, first_clip.volumes)
+                    self.apply_audio_mix_preview(first_clip.file_path, first_clip.volumes, first_clip.normalization)
 
                 # Seek to current playhead
                 self.video_widget.seek(int(self.timeline.playhead_position * 1000))

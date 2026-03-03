@@ -1252,6 +1252,70 @@ class TimelineRenderingEngine:
         try:
             cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
                    '-s', f'{width}x{height}', '-r', str(fps), '-i', 'pipe:0']
+            
+            # Build filter chain for timeline rendering
+            filter_complex = []
+            
+            # Denoise filter
+            denoise = self.settings.get('denoise_level', 0)
+            if denoise > 0:
+                denoise_values = ['', 'hqdn3d=1.5:1.5:6:6', 'hqdn3d=2:2:8:8', 'hqdn3d=3:3:10:10', 
+                                  'hqdn3d=4:4:12:12', 'hqdn3d=6:6:15:15', 'hqdn3d=8:8:18:18']
+                if denoise < len(denoise_values): filter_complex.append(denoise_values[denoise])
+            
+            # Deflicker filter
+            deflicker = self.settings.get('deflicker_level', 0)
+            if deflicker > 0:
+                deflicker_values = ['', 'deflicker=mode=pm:size=5', 'deflicker=mode=pm:size=10', 
+                                    'deflicker=mode=pm:size=15', 'deflicker=mode=am:size=20', 'deflicker=mode=am:size=30']
+                if deflicker < len(deflicker_values): filter_complex.append(deflicker_values[deflicker])
+            
+            # Exposure correction
+            exposure = self.settings.get('exposure_level', 0)
+            if exposure > 0:
+                exposure_values = {
+                    1: 'eq=brightness=0.05:saturation=1.1',      # +0.25 EV
+                    2: 'eq=brightness=0.1:saturation=1.15',      # +0.5 EV
+                    3: 'eq=brightness=0.15:saturation=1.2',      # +0.75 EV
+                    4: 'eq=brightness=0.2:saturation=1.25',      # +1.0 EV
+                    5: 'eq=brightness=0.3:saturation=1.3',       # +1.5 EV
+                    6: 'eq=brightness=0.4:saturation=1.35',      # +2.0 EV
+                    7: 'eq=brightness=-0.05:saturation=0.95',    # -0.25 EV
+                    8: 'eq=brightness=-0.1:saturation=0.9',      # -0.5 EV
+                    9: 'eq=brightness=-0.15:saturation=0.85',    # -0.75 EV
+                    10: 'eq=brightness=-0.2:saturation=0.8',     # -1.0 EV
+                    11: 'eq=brightness=-0.3:saturation=0.75',    # -1.5 EV
+                    12: 'eq=brightness=-0.4:saturation=0.7',     # -2.0 EV
+                }
+                if exposure in exposure_values: filter_complex.append(exposure_values[exposure])
+            
+            # Temporal smoothing
+            temporal = self.settings.get('temporal_level', 0)
+            if temporal > 0:
+                temporal_values = ['', 
+                                   'tmix=frames=3:weights="1 1 1"',
+                                   'tmix=frames=5:weights="1 1 2 1 1"',
+                                   'tmix=frames=7:weights="1 1 2 2 2 1 1"',
+                                   'tmix=frames=9:weights="1 1 2 3 3 3 2 1 1"',
+                                   'tmix=frames=11:weights="1 2 2 3 4 4 4 3 2 2 1"']
+                if temporal < len(temporal_values): filter_complex.append(temporal_values[temporal])
+            
+            # Sharpness
+            sharpness = self.settings.get('sharpness_level', 0)
+            if sharpness > 0:
+                sharpness_values = ['',
+                                    'unsharp=3:3:0.3:3:3:0',
+                                    'unsharp=5:5:0.5:5:5:0',
+                                    'unsharp=5:5:0.8:5:5:0.4',
+                                    'unsharp=5:5:1.2:5:5:0.6',
+                                    'unsharp=7:7:1.5:7:7:0.8',
+                                    'unsharp=7:7:2.0:7:7:1.0']
+                if sharpness < len(sharpness_values): filter_complex.append(sharpness_values[sharpness])
+            
+            # Apply filters if any are enabled
+            if filter_complex:
+                cmd.extend(['-vf', ','.join(filter_complex)])
+            
             codec = self.settings.get('video_codec', 'hevc_nvenc')
             cmd.extend(['-c:v', codec])
             if 'nvenc' in codec:
@@ -1472,14 +1536,63 @@ class EncodingThread(QThread):
             cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
         cmd.extend(['-i', self.input_file])
         filter_complex = []
+        
+        # Denoise filter
         denoise = self.settings['denoise_level']
         if denoise > 0:
             denoise_values = ['', 'hqdn3d=1.5:1.5:6:6', 'hqdn3d=2:2:8:8', 'hqdn3d=3:3:10:10', 'hqdn3d=4:4:12:12', 'hqdn3d=6:6:15:15', 'hqdn3d=8:8:18:18']
             if denoise < len(denoise_values): filter_complex.append(denoise_values[denoise])
+        
+        # Deflicker filter
         deflicker = self.settings['deflicker_level']
         if deflicker > 0:
             deflicker_values = ['', 'deflicker=mode=pm:size=5', 'deflicker=mode=pm:size=10', 'deflicker=mode=pm:size=15', 'deflicker=mode=am:size=20', 'deflicker=mode=am:size=30']
             if deflicker < len(deflicker_values): filter_complex.append(deflicker_values[deflicker])
+        
+        # NEW: Exposure correction
+        exposure = self.settings.get('exposure_level', 0)
+        if exposure > 0:
+            # exposure_combo: ["Off", "+0.25 EV", "+0.5 EV", "+0.75 EV", "+1.0 EV", "+1.5 EV", "+2.0 EV", 
+            #                  "-0.25 EV", "-0.5 EV", "-0.75 EV", "-1.0 EV", "-1.5 EV", "-2.0 EV"]
+            exposure_values = {
+                1: 'eq=brightness=0.05:saturation=1.1',      # +0.25 EV
+                2: 'eq=brightness=0.1:saturation=1.15',      # +0.5 EV
+                3: 'eq=brightness=0.15:saturation=1.2',      # +0.75 EV
+                4: 'eq=brightness=0.2:saturation=1.25',      # +1.0 EV
+                5: 'eq=brightness=0.3:saturation=1.3',       # +1.5 EV
+                6: 'eq=brightness=0.4:saturation=1.35',      # +2.0 EV
+                7: 'eq=brightness=-0.05:saturation=0.95',    # -0.25 EV
+                8: 'eq=brightness=-0.1:saturation=0.9',      # -0.5 EV
+                9: 'eq=brightness=-0.15:saturation=0.85',    # -0.75 EV
+                10: 'eq=brightness=-0.2:saturation=0.8',     # -1.0 EV
+                11: 'eq=brightness=-0.3:saturation=0.75',    # -1.5 EV
+                12: 'eq=brightness=-0.4:saturation=0.7',     # -2.0 EV
+            }
+            if exposure in exposure_values: filter_complex.append(exposure_values[exposure])
+        
+        # NEW: Temporal smoothing (frame blending for noise reduction)
+        temporal = self.settings.get('temporal_level', 0)
+        if temporal > 0:
+            temporal_values = ['', 
+                               'tmix=frames=3:weights="1 1 1"',        # Light
+                               'tmix=frames=5:weights="1 1 2 1 1"',    # Medium
+                               'tmix=frames=7:weights="1 1 2 2 2 1 1"', # Strong
+                               'tmix=frames=9:weights="1 1 2 3 3 3 2 1 1"', # Very Strong
+                               'tmix=frames=11:weights="1 2 2 3 4 4 4 3 2 2 1"'] # Maximum
+            if temporal < len(temporal_values): filter_complex.append(temporal_values[temporal])
+        
+        # NEW: Sharpness (to restore detail after heavy denoise)
+        sharpness = self.settings.get('sharpness_level', 0)
+        if sharpness > 0:
+            sharpness_values = ['',
+                                'unsharp=3:3:0.3:3:3:0',         # Subtle
+                                'unsharp=5:5:0.5:5:5:0',         # Light
+                                'unsharp=5:5:0.8:5:5:0.4',       # Medium
+                                'unsharp=5:5:1.2:5:5:0.6',       # Strong
+                                'unsharp=7:7:1.5:7:7:0.8',       # Very Strong
+                                'unsharp=7:7:2.0:7:7:1.0']       # Ultra Sharp
+            if sharpness < len(sharpness_values): filter_complex.append(sharpness_values[sharpness])
+        
         if filter_complex: cmd.extend(['-vf', ','.join(filter_complex)])
         codec = self.settings['video_codec']
         cmd.extend(['-c:v', codec])
@@ -1988,6 +2101,7 @@ class FastEncodeProApp(QMainWindow):
         filters_group = QGroupBox("🎨 Filters (Optional)")
         filters_group.setStyleSheet(self.groupbox_style())
         filters_layout = QVBoxLayout()
+        
         denoise_row = QHBoxLayout()
         denoise_row.addWidget(QLabel("Denoise:"))
         self.denoise_combo = QComboBox()
@@ -1995,6 +2109,7 @@ class FastEncodeProApp(QMainWindow):
         self.denoise_combo.setStyleSheet(self.combo_style())
         denoise_row.addWidget(self.denoise_combo)
         filters_layout.addLayout(denoise_row)
+        
         deflicker_row = QHBoxLayout()
         deflicker_row.addWidget(QLabel("Deflicker:"))
         self.deflicker_combo = QComboBox()
@@ -2002,6 +2117,35 @@ class FastEncodeProApp(QMainWindow):
         self.deflicker_combo.setStyleSheet(self.combo_style())
         deflicker_row.addWidget(self.deflicker_combo)
         filters_layout.addLayout(deflicker_row)
+        
+        # NEW: Exposure correction
+        exposure_row = QHBoxLayout()
+        exposure_row.addWidget(QLabel("Exposure:"))
+        self.exposure_combo = QComboBox()
+        self.exposure_combo.addItems(["Off", "+0.25 EV", "+0.5 EV", "+0.75 EV", "+1.0 EV", "+1.5 EV", "+2.0 EV", 
+                                       "-0.25 EV", "-0.5 EV", "-0.75 EV", "-1.0 EV", "-1.5 EV", "-2.0 EV"])
+        self.exposure_combo.setStyleSheet(self.combo_style())
+        exposure_row.addWidget(self.exposure_combo)
+        filters_layout.addLayout(exposure_row)
+        
+        # NEW: Temporal smoothing (noise reduction across frames)
+        temporal_row = QHBoxLayout()
+        temporal_row.addWidget(QLabel("Temporal Smoothing:"))
+        self.temporal_combo = QComboBox()
+        self.temporal_combo.addItems(["Off", "Light", "Medium", "Strong", "Very Strong", "Maximum"])
+        self.temporal_combo.setStyleSheet(self.combo_style())
+        temporal_row.addWidget(self.temporal_combo)
+        filters_layout.addLayout(temporal_row)
+        
+        # NEW: Sharpness (to restore detail after denoise)
+        sharpness_row = QHBoxLayout()
+        sharpness_row.addWidget(QLabel("Sharpness:"))
+        self.sharpness_combo = QComboBox()
+        self.sharpness_combo.addItems(["Off", "Subtle", "Light", "Medium", "Strong", "Very Strong", "Ultra Sharp"])
+        self.sharpness_combo.setStyleSheet(self.combo_style())
+        sharpness_row.addWidget(self.sharpness_combo)
+        filters_layout.addLayout(sharpness_row)
+        
         filters_group.setLayout(filters_layout)
         scroll_layout.addWidget(filters_group)
 
@@ -2562,85 +2706,420 @@ class FastEncodeProApp(QMainWindow):
 
     def apply_theme(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #111827; }
-            QWidget { background-color: #111827; color: white; font-size: 10pt; }
-            QLabel { color: white; }
-            QGroupBox { font-weight: bold; }
+            QMainWindow {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0a0e1a, stop:0.5 #111827, stop:1 #0a0e1a);
+            }
+            QWidget {
+                background-color: transparent;
+                color: #00d9ff;
+                font-size: 10pt;
+            }
+            QLabel {
+                color: #00d9ff;
+            }
+            QGroupBox {
+                font-weight: bold;
+            }
+            
+            /* Scrollbar with depth */
+            QScrollBar:vertical {
+                background: #0a0e1a;
+                width: 14px;
+                border: 1px solid #1a2332;
+                border-radius: 7px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00d9ff, stop:1 #4ade80);
+                border: 2px solid #00d9ff;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #00f0ff;
+                border: 2px solid #fff;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
 
-            /* High Contrast Focus for Switch Users */
+            /* High Contrast Focus */
             *:focus {
-                border: 4px solid #f59e0b; /* Bright Orange Focus Ring */
+                border: 4px solid #f59e0b;
                 outline: none;
             }
         """)
 
     def tab_style(self):
         return """
-            QTabWidget::pane { border: 2px solid #4b5563; background-color: #111827; border-radius: 8px; }
-            QTabBar::tab { background-color: #1f2937; color: white; padding: 12px 24px; margin: 2px;
-                border-top-left-radius: 8px; border-top-right-radius: 8px; font-size: 11pt; font-weight: bold; }
-            QTabBar::tab:selected { background-color: #3b82f6; color: white; }
-            QTabBar::tab:hover { background-color: #374151; }
-            QTabBar::tab:focus { border: 4px solid #f59e0b; }
+            QTabWidget::pane {
+                border: 3px solid #00d9ff;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0f1419, stop:1 #0a0e1a);
+                border-radius: 12px;
+                border-top-left-radius: 0px;
+                /* Panel depth */
+                box-shadow: 
+                    inset 0 2px 4px rgba(0, 0, 0, 0.5),
+                    0 4px 8px rgba(0, 0, 0, 0.3);
+                margin-top: 4px;
+            }
+            QTabBar::tab {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1a2332, stop:1 #111827);
+                color: #00d9ff;
+                padding: 14px 30px;
+                margin: 0px 2px;
+                border: 2px solid #1a2332;
+                border-bottom: none;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                font-size: 11pt;
+                font-weight: bold;
+                /* Tab depth */
+                box-shadow: 0 -2px 4px rgba(0, 0, 0, 0.3);
+            }
+            QTabBar::tab:selected {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #00f0ff, stop:0.5 #00d9ff, stop:1 #4ade80);
+                color: #000;
+                border: 3px solid #00f0ff;
+                border-bottom: none;
+                padding-bottom: 2px;
+                /* Selected tab pops forward */
+                box-shadow: 
+                    0 -4px 8px rgba(0, 0, 0, 0.4),
+                    0 0 15px rgba(0, 240, 255, 0.6);
+                font-weight: bold;
+            }
+            QTabBar::tab:hover:!selected {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1a2332, stop:1 #0f1419);
+                border: 2px solid #00d9ff;
+                border-bottom: none;
+                box-shadow: 0 -2px 6px rgba(0, 217, 255, 0.3);
+            }
+            QTabBar::tab:focus {
+                border: 3px solid #f59e0b;
+                border-bottom: none;
+            }
         """
 
     def groupbox_style(self):
         return """
-            QGroupBox { background-color: #1f2937; border: 2px solid #4b5563; border-radius: 10px;
-                padding: 15px; margin-top: 10px; font-size: 11pt; font-weight: bold; color: #4ade80; }
-            QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 5px 10px;
-                background-color: #111827; border-radius: 5px; }
+            QGroupBox {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1a1f2e, stop:1 #0f1419);
+                border: 3px solid #00d9ff;
+                border-radius: 12px;
+                padding: 25px 15px 15px 15px;
+                margin-top: 20px;
+                font-size: 12pt;
+                font-weight: bold;
+                color: #00f0ff;
+                /* 3D depth effect */
+                box-shadow: 
+                    0 4px 6px rgba(0, 0, 0, 0.5),
+                    inset 0 1px 0 rgba(0, 217, 255, 0.3),
+                    0 0 20px rgba(0, 217, 255, 0.2);
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 8px 20px;
+                margin-left: 10px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00d9ff, stop:0.5 #00f0ff, stop:1 #00d9ff);
+                color: #000;
+                border-radius: 6px;
+                font-weight: bold;
+                border: 2px solid #00f0ff;
+                /* Title depth */
+                box-shadow: 
+                    0 2px 4px rgba(0, 0, 0, 0.6),
+                    0 0 10px rgba(0, 240, 255, 0.5);
+            }
         """
 
     def button_style(self, color):
-        hover = self.brighten(color, 1.2)
-        pressed = self.brighten(color, 0.8)
+        # Map colors to cyberpunk equivalents
+        color_map = {
+            '#4ade80': '#00f0ff',  # Green -> Cyan
+            '#3b82f6': '#4ade80',  # Blue -> Green/teal
+            '#ef4444': '#ff0066',  # Red -> Neon pink
+            '#f59e0b': '#ffaa00',  # Orange -> Neon orange
+        }
+        cyber_color = color_map.get(color, color)
+        
+        hover = self.brighten(cyber_color, 1.3)
+        pressed = self.brighten(cyber_color, 0.7)
+        
         return f"""
-            QPushButton {{ background-color: {color}; color: white; border: none; border-radius: 10px;
-                padding: 8px 16px; font-size: 11pt; font-weight: bold; }}
-            QPushButton:hover {{ background-color: {hover}; }}
-            QPushButton:pressed {{ background-color: {pressed}; }}
-            QPushButton:disabled {{ background-color: #4b5563; color: #9ca3af; }}
-            QPushButton:focus {{ border: 4px solid #f59e0b; }}
+            QPushButton {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {hover}, stop:0.5 {cyber_color}, stop:1 {pressed});
+                color: #000;
+                border: 3px solid {cyber_color};
+                border-radius: 10px;
+                padding: 12px 24px;
+                font-size: 11pt;
+                font-weight: bold;
+                /* 3D button depth */
+                box-shadow: 
+                    0 4px 6px rgba(0, 0, 0, 0.4),
+                    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+                    0 0 10px rgba(0, 217, 255, 0.3);
+            }}
+            QPushButton:hover {{
+                background: {cyber_color};
+                border: 3px solid #fff;
+                /* Hover glow */
+                box-shadow: 
+                    0 6px 12px rgba(0, 0, 0, 0.5),
+                    0 0 20px {cyber_color},
+                    inset 0 1px 0 rgba(255, 255, 255, 0.5);
+            }}
+            QPushButton:pressed {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {pressed}, stop:1 {cyber_color});
+                border: 4px solid {cyber_color};
+                /* Pressed inset */
+                box-shadow: 
+                    inset 0 3px 6px rgba(0, 0, 0, 0.6),
+                    0 0 15px {cyber_color};
+                padding-top: 14px;
+                padding-bottom: 10px;
+            }}
+            QPushButton:disabled {{
+                background: #1a1f2e;
+                color: #4a5568;
+                border: 2px solid #2d3748;
+                box-shadow: none;
+            }}
+            QPushButton:focus {{
+                border: 4px solid #f59e0b;
+                box-shadow: 0 0 15px #f59e0b;
+            }}
         """
 
     def list_style(self):
         return """
-            QListWidget { background-color: #1f2937; border: 2px solid #4b5563; border-radius: 8px;
-                padding: 5px; font-size: 10pt; color: white; }
-            QListWidget::item { padding: 8px; border-radius: 5px; }
-            QListWidget::item:selected { background-color: #3b82f6; color: white; }
-            QListWidget::item:hover { background-color: #374151; }
-            QListWidget:focus { border: 4px solid #f59e0b; }
+            QListWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0f1419, stop:1 #0a0e1a);
+                border: 3px solid #00d9ff;
+                border-radius: 10px;
+                padding: 8px;
+                font-size: 10pt;
+                color: #00f0ff;
+                font-weight: bold;
+                /* List depth */
+                box-shadow: 
+                    inset 0 2px 4px rgba(0, 0, 0, 0.5),
+                    0 4px 8px rgba(0, 0, 0, 0.3);
+            }
+            QListWidget::item {
+                padding: 12px;
+                border-radius: 6px;
+                border: 1px solid transparent;
+                margin: 2px;
+            }
+            QListWidget::item:selected {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00d9ff, stop:0.5 #00f0ff, stop:1 #4ade80);
+                color: #000;
+                font-weight: bold;
+                border: 2px solid #fff;
+                /* Selected item pops forward */
+                box-shadow: 
+                    0 3px 6px rgba(0, 0, 0, 0.4),
+                    0 0 10px rgba(0, 240, 255, 0.5);
+            }
+            QListWidget::item:hover {
+                background: #1a2332;
+                border: 2px solid #00d9ff;
+                box-shadow: 0 2px 4px rgba(0, 217, 255, 0.3);
+            }
+            QListWidget:focus {
+                border: 4px solid #f59e0b;
+                box-shadow: 0 0 15px #f59e0b;
+            }
         """
 
     def slider_style(self):
         return """
-            QSlider::groove:horizontal { border: none; height: 12px; background: #4b5563; border-radius: 6px; }
-            QSlider::handle:horizontal { background: #4ade80; border: 3px solid white; width: 24px;
-                height: 24px; margin: -6px 0; border-radius: 12px; }
-            QSlider::sub-page:horizontal { background: #4ade80; border-radius: 6px; }
-            QSlider::handle:horizontal:focus { border: 4px solid #f59e0b; width: 28px; height: 28px; margin: -8px 0; }
+            QSlider::groove:horizontal {
+                border: 2px solid #1a2332;
+                height: 10px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0a0e1a, stop:1 #1a1f2e);
+                border-radius: 5px;
+                /* Inset groove */
+                box-shadow: 
+                    inset 0 2px 4px rgba(0, 0, 0, 0.5),
+                    0 1px 0 rgba(255, 255, 255, 0.1);
+            }
+            QSlider::handle:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #00f0ff, stop:0.5 #4ade80, stop:1 #00d9ff);
+                border: 3px solid #fff;
+                width: 22px;
+                height: 22px;
+                margin: -8px 0;
+                border-radius: 11px;
+                /* 3D handle */
+                box-shadow: 
+                    0 3px 6px rgba(0, 0, 0, 0.5),
+                    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+                    0 0 10px rgba(0, 240, 255, 0.4);
+            }
+            QSlider::handle:horizontal:hover {
+                background: #00f0ff;
+                border: 3px solid #fff;
+                width: 26px;
+                height: 26px;
+                margin: -10px 0;
+                /* Hover glow */
+                box-shadow: 
+                    0 4px 8px rgba(0, 0, 0, 0.6),
+                    0 0 20px rgba(0, 240, 255, 0.8),
+                    inset 0 1px 0 rgba(255, 255, 255, 0.6);
+            }
+            QSlider::sub-page:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00d9ff, stop:1 #4ade80);
+                border-radius: 5px;
+                /* Progress glow */
+                box-shadow: 0 0 5px rgba(0, 217, 255, 0.5);
+            }
+            QSlider::handle:horizontal:focus {
+                border: 4px solid #f59e0b;
+                box-shadow: 0 0 15px #f59e0b;
+            }
         """
 
     def combo_style(self):
         return """
-            QComboBox { background-color: #1f2937; border: 2px solid #4b5563; border-radius: 8px;
-                padding: 6px; font-size: 10pt; color: white; }
-            QComboBox::drop-down { border: none; width: 30px; }
-            QComboBox::down-arrow { image: none; border-left: 5px solid transparent; border-right: 5px solid transparent;
-                border-top: 8px solid white; margin-right: 8px; }
-            QComboBox QAbstractItemView { background-color: #1f2937; border: 2px solid #4b5563;
-                selection-background-color: #4ade80; selection-color: black; color: white; padding: 5px; }
-            QComboBox:focus { border: 4px solid #f59e0b; }
+            QComboBox {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1a1f2e, stop:1 #0f1419);
+                border: 2px solid #00d9ff;
+                border-radius: 8px;
+                padding: 8px 10px;
+                font-size: 10pt;
+                color: #00f0ff;
+                font-weight: bold;
+                /* Dropdown depth */
+                box-shadow: 
+                    inset 0 2px 4px rgba(0, 0, 0, 0.3),
+                    0 2px 4px rgba(0, 0, 0, 0.3);
+            }
+            QComboBox:hover {
+                border: 2px solid #00f0ff;
+                box-shadow: 
+                    inset 0 2px 4px rgba(0, 0, 0, 0.3),
+                    0 0 10px rgba(0, 217, 255, 0.4);
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 32px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #00f0ff, stop:1 #00d9ff);
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+                /* Button depth */
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+            }
+            QComboBox::drop-down:hover {
+                background: #00f0ff;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 6px solid transparent;
+                border-right: 6px solid transparent;
+                border-top: 10px solid #000;
+                margin-right: 10px;
+            }
+            QComboBox QAbstractItemView {
+                background: #0f1419;
+                border: 3px solid #00d9ff;
+                selection-background-color: #00f0ff;
+                selection-color: #000;
+                color: #00f0ff;
+                padding: 8px;
+                font-weight: bold;
+                /* Dropdown menu depth */
+                box-shadow: 
+                    0 8px 16px rgba(0, 0, 0, 0.6),
+                    inset 0 1px 0 rgba(0, 217, 255, 0.2);
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 10px;
+                border-bottom: 1px solid #1a2332;
+                border-radius: 4px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background: #1a2332;
+                border: 1px solid #00d9ff;
+            }
+            QComboBox:focus {
+                border: 3px solid #f59e0b;
+                box-shadow: 0 0 15px #f59e0b;
+            }
         """
 
     def spinbox_style(self):
         return """
-            QSpinBox, QDoubleSpinBox { background-color: #1f2937; border: 2px solid #4b5563; border-radius: 8px;
-                padding: 6px; font-size: 10pt; color: white; }
-            QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 20px; background-color: #4b5563; }
-            QSpinBox:focus, QDoubleSpinBox:focus { border: 4px solid #f59e0b; }
+            QSpinBox, QDoubleSpinBox {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1a1f2e, stop:1 #0f1419);
+                border: 2px solid #00d9ff;
+                border-radius: 8px;
+                padding: 8px;
+                font-size: 10pt;
+                color: #00f0ff;
+                font-weight: bold;
+                /* Spinbox depth */
+                box-shadow: 
+                    inset 0 2px 4px rgba(0, 0, 0, 0.3),
+                    0 2px 4px rgba(0, 0, 0, 0.3);
+            }
+            QSpinBox:hover, QDoubleSpinBox:hover {
+                border: 2px solid #00f0ff;
+                box-shadow: 
+                    inset 0 2px 4px rgba(0, 0, 0, 0.3),
+                    0 0 10px rgba(0, 217, 255, 0.4);
+            }
+            QSpinBox::up-button, QSpinBox::down-button,
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                width: 26px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #00f0ff, stop:1 #00d9ff);
+                border: none;
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+            QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
+                background: #00f0ff;
+            }
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-bottom: 8px solid #000;
+            }
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 8px solid #000;
+            }
+            QSpinBox:focus, QDoubleSpinBox:focus {
+                border: 3px solid #f59e0b;
+                box-shadow: 0 0 15px #f59e0b;
+            }
         """
 
     def brighten(self, hex_color, factor):
@@ -2684,6 +3163,9 @@ class FastEncodeProApp(QMainWindow):
         self.quality_slider.setValue(500 if self.codec_combo.currentIndex() == 0 else 100)
         self.denoise_combo.setCurrentIndex(0)
         self.deflicker_combo.setCurrentIndex(0)
+        self.exposure_combo.setCurrentIndex(0)
+        self.temporal_combo.setCurrentIndex(0)
+        self.sharpness_combo.setCurrentIndex(0)
         self.on_codec_changed()
         self.save_settings()
 
@@ -2713,6 +3195,9 @@ class FastEncodeProApp(QMainWindow):
             'bitrate_mbps': self.quality_slider.value(),
             'denoise_level': self.denoise_combo.currentIndex(),
             'deflicker_level': self.deflicker_combo.currentIndex(),
+            'exposure_level': self.exposure_combo.currentIndex(),
+            'temporal_level': self.temporal_combo.currentIndex(),
+            'sharpness_level': self.sharpness_combo.currentIndex(),
             'timeline_fps': timeline_fps,
             'export_res_index': export_res_index,
             'scale_algo': scale_algo,

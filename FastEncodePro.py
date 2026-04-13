@@ -52,6 +52,112 @@ def get_audio_stream_count_static(filepath):
     except:
         return 1
 
+
+def get_export_target_labels():
+    return [
+        "Master / color grading (NVENC P7)",
+        "YouTube - long form (NVENC P5, same CBR)",
+        "YouTube Shorts (NVENC P5, same CBR)",
+        "TikTok / Reels / Shorts vertical (NVENC P5, same CBR)",
+        "Instagram - feed / square (NVENC P5, same CBR)",
+        "X (Twitter) / General social (NVENC P5, same CBR)",
+    ]
+
+
+def get_nvenc_preset_for_target(export_target_index):
+    return "p7" if export_target_index == 0 else "p5"
+
+
+def build_nvenc_cbr_args(settings, fps_value=None):
+    bitrate_kbps = int(settings.get('bitrate_mbps', 100) * 1000)
+    pixel_format = settings.get('pixel_format', 0)
+    pix_fmt = 'yuv420p' if pixel_format == 0 else 'p010le'
+    export_target_index = settings.get('export_target_index', 0)
+    preset = get_nvenc_preset_for_target(export_target_index)
+    gop = str(int((fps_value or 30) * 2))
+
+    return [
+        '-preset', preset, '-tune', 'hq', '-rc', 'cbr',
+        '-b:v', f'{bitrate_kbps}k', '-maxrate', f'{bitrate_kbps}k',
+        '-bufsize', f'{int(bitrate_kbps * 2)}k',
+        '-g', gop, '-bf', '3', '-b_ref_mode', 'middle',
+        '-pix_fmt', pix_fmt,
+    ]
+
+
+def get_cuvid_decoder_for_codec(codec_name):
+    codec_name = (codec_name or "").lower()
+    # NVDEC (CUVID) decoders. If unavailable, ffmpeg will error; we only
+    # opt into these when user explicitly requests hardware decode.
+    mapping = {
+        "h264": "h264_cuvid",
+        "hevc": "hevc_cuvid",
+        "h265": "hevc_cuvid",
+        "av1": "av1_cuvid",
+        "vp9": "vp9_cuvid",
+        "mpeg2video": "mpeg2_cuvid",
+        "mpeg4": "mpeg4_cuvid",
+    }
+    return mapping.get(codec_name)
+
+
+def build_hw_decode_input_args(file_path, codec_name, use_gpu_decode):
+    if not use_gpu_decode:
+        return ['-i', file_path]
+
+    # Keep decode on NVDEC without forcing CUDA frame surfaces into a
+    # software-only filter graph. The compositor uses regular trim/scale/
+    # overlay filters, so ffmpeg must be free to hand those filters normal
+    # frames instead of device-only frames.
+    return ['-hwaccel', 'cuda', '-i', file_path]
+
+
+def has_optional_video_filters(settings):
+    return any(
+        settings.get(key, 0) > 0
+        for key in ('denoise_level', 'deflicker_level', 'exposure_level', 'temporal_level', 'sharpness_level')
+    )
+
+
+def detect_hardware_capabilities():
+    caps = {
+        'nvidia_smi': False,
+        'gpu_name': 'Unknown GPU',
+        'nvenc_h264': False,
+        'nvenc_hevc': False,
+        'nvdec': False,
+    }
+
+    try:
+        if shutil.which('nvidia-smi'):
+            caps['nvidia_smi'] = True
+            smi = subprocess.run(
+                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                capture_output=True, text=True, timeout=2
+            )
+            name = (smi.stdout or '').strip().splitlines()
+            if name and name[0]:
+                caps['gpu_name'] = name[0]
+    except Exception:
+        pass
+
+    try:
+        enc = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, timeout=3)
+        enc_text = (enc.stdout or '') + (enc.stderr or '')
+        caps['nvenc_h264'] = 'h264_nvenc' in enc_text
+        caps['nvenc_hevc'] = 'hevc_nvenc' in enc_text
+    except Exception:
+        pass
+
+    try:
+        dec = subprocess.run(['ffmpeg', '-hide_banner', '-decoders'], capture_output=True, text=True, timeout=3)
+        dec_text = (dec.stdout or '') + (dec.stderr or '')
+        caps['nvdec'] = ('h264_cuvid' in dec_text) or ('hevc_cuvid' in dec_text) or ('av1_cuvid' in dec_text)
+    except Exception:
+        pass
+
+    return caps
+
 # --- WAVEFORM GENERATOR ---
 
 class WaveformWorker(QThread):
@@ -950,19 +1056,18 @@ class TimelineRenderingEngine:
 
             self.log(f"Resolution: {export_width}x{export_height} @ {timeline_fps} FPS")
             self.log(f"Total Duration: {timeline_duration:.2f}s")
+            optional_filters_enabled = has_optional_video_filters(self.settings)
+            self.log(f"Optional codec-tab filters: {'ON' if optional_filters_enabled else 'OFF'}")
+            self.log("Compositor path: decode -> software filter graph -> NVENC encode")
 
             cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats']
 
-            # Global Hardware Decoding if requested
-            use_gpu = self.settings.get('use_gpu_decode', False)
+            use_gpu_decode = self.settings.get('use_gpu_decode', False)
 
-            # 1. ADD INPUTS
+            # 1. ADD INPUTS (apply HW decode per-input; required for multi-input graphs)
             for clip in sorted_clips:
                 codec = self._get_video_codec(clip.file_path)
-                # Don't try to HW Decode AV1 on RTX 20 series
-                if use_gpu and codec != 'av1':
-                    cmd.extend(['-hwaccel', 'cuda'])
-                cmd.extend(['-i', clip.file_path])
+                cmd.extend(build_hw_decode_input_args(clip.file_path, codec, use_gpu_decode))
 
             # 2. BUILD THE COMPOSITING GRAPH
             filter_complex = []
@@ -982,7 +1087,9 @@ class TimelineRenderingEngine:
                 filter_complex.append(f"{v_in}trim=start={clip.in_point}:end={clip.out_point},setpts=PTS-STARTPTS{v_trimmed}")
 
                 # Scale the clip perfectly into the canvas dimensions, padding with black if aspect ratio mismatches
-                scale_str = f"scale={export_width}:{export_height}:force_original_aspect_ratio=decrease,pad={export_width}:{export_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={timeline_fps}"
+                # Keep per-clip branch lightweight: avoid per-input fps conversion
+                # here and enforce timeline fps once at output stage.
+                scale_str = f"scale={export_width}:{export_height}:force_original_aspect_ratio=decrease,pad={export_width}:{export_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
                 filter_complex.append(f"{v_trimmed}{scale_str}{v_scaled}")
 
                 # Overlay the scaled clip onto the running background canvas
@@ -1031,12 +1138,16 @@ class TimelineRenderingEngine:
             last_v = f"[bg{len(sorted_clips)}]"
 
             # Apply global user filters
+            # Apply optional user filters first, then normalize fps once globally.
             user_filters = self._build_video_filters()
             if user_filters:
-                filter_complex.append(f"{last_v}{','.join(user_filters)}[out_v]")
-                map_v = "[out_v]"
+                filter_complex.append(f"{last_v}{','.join(user_filters)}[v_filtered]")
+                pre_fps_v = "[v_filtered]"
             else:
-                map_v = last_v
+                pre_fps_v = last_v
+
+            filter_complex.append(f"{pre_fps_v}fps={timeline_fps}[out_v]")
+            map_v = "[out_v]"
 
             # Mix Audio
             if audio_inputs:
@@ -1056,16 +1167,7 @@ class TimelineRenderingEngine:
             codec = self.settings.get('video_codec', 'hevc_nvenc')
             cmd.extend(['-c:v', codec])
             if 'nvenc' in codec:
-                bitrate_kbps = int(self.settings.get('bitrate_mbps', 100) * 1000)
-                pixel_format = self.settings.get('pixel_format', 0)
-                pix_fmt = 'yuv420p' if pixel_format == 0 else 'p010le'
-                cmd.extend([
-                    '-preset', 'p7', '-tune', 'hq', '-rc', 'cbr',
-                    '-b:v', f'{bitrate_kbps}k', '-maxrate', f'{bitrate_kbps}k',
-                    '-bufsize', f'{int(bitrate_kbps * 2)}k',
-                    '-g', str(int(timeline_fps * 2)),
-                    '-pix_fmt', pix_fmt,
-                ])
+                cmd.extend(build_nvenc_cbr_args(self.settings, timeline_fps))
 
             # Set audio encode and explicitly clamp total duration
             cmd.extend([
@@ -1189,9 +1291,13 @@ class EncodingThread(QThread):
 
     def build_ffmpeg_command(self):
         cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
-        if self.settings.get('use_gpu_decode', True):
-            cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
-        cmd.extend(['-i', self.input_file])
+        use_gpu_decode = self.settings.get('use_gpu_decode', False)
+        codec_name = None
+        try:
+            codec_name = self.settings.get('input_codec_name')
+        except Exception:
+            codec_name = None
+        cmd.extend(build_hw_decode_input_args(self.input_file, codec_name, use_gpu_decode))
         filter_complex = []
 
         denoise = self.settings.get('denoise_level', 0)
@@ -1253,13 +1359,7 @@ class EncodingThread(QThread):
             cmd.extend(['-profile:v', str(profile), '-vendor', 'apl0', '-qscale:v', str(qscale)])
         elif 'nvenc' in codec:
             if self.settings['use_gpu']:
-                target_bitrate_mbps = self.settings.get('bitrate_mbps', 100)
-                target_bitrate_kbps = int(target_bitrate_mbps * 1000)
-                cmd.extend(['-rc', 'cbr', '-b:v', f'{target_bitrate_kbps}k', '-maxrate', f'{target_bitrate_kbps}k',
-                            '-bufsize', f'{int(target_bitrate_kbps * 2)}k', '-preset', 'p7', '-tune', 'hq',
-                            '-g', '60', '-bf', '3', '-b_ref_mode', 'middle'])
-                if self.settings['pixel_format'] == 0: cmd.extend(['-pix_fmt', 'yuv420p'])
-                else: cmd.extend(['-pix_fmt', 'p010le'])
+                cmd.extend(build_nvenc_cbr_args(self.settings, 30))
             else: cmd.extend(['-preset', 'medium'])
         cmd.extend(['-c:a', self.settings['audio_codec']])
         if self.settings['audio_codec'] == 'aac': cmd.extend(['-b:a', '320k'])
@@ -1300,6 +1400,7 @@ class FastEncodeProApp(QMainWindow):
         self.is_timeline_mode = False
 
         self.dwell_filter = DwellClickFilter(self)
+        self.hw_caps = detect_hardware_capabilities()
 
         self.app_settings = QSettings("FastEncodePro", "App")
         self.output_folder = self.app_settings.value("output_folder", "")
@@ -1325,6 +1426,23 @@ class FastEncodeProApp(QMainWindow):
 
         self.apply_theme()
         self.load_settings()
+
+    def apply_auto_hardware_settings(self, update_status=False):
+        nvenc_available = self.hw_caps.get('nvenc_h264', False) or self.hw_caps.get('nvenc_hevc', False)
+        nvdec_available = self.hw_caps.get('nvdec', False)
+
+        self.gpu_check.setEnabled(nvenc_available)
+        self.gpu_decode_check.setEnabled(nvdec_available)
+        self.gpu_check.setChecked(nvenc_available)
+        self.gpu_decode_check.setChecked(nvdec_available)
+
+        gpu_name = self.hw_caps.get('gpu_name', 'Unknown GPU')
+        self.hw_detect_label.setText(
+            f"Auto hardware detect: {gpu_name} | NVENC: {'YES' if nvenc_available else 'NO'} | NVDEC: {'YES' if nvdec_available else 'NO'}"
+        )
+
+        if update_status:
+            self.status_label.setText("Applied automatic hardware settings")
 
     def create_accessibility_tab(self):
         tab = QWidget()
@@ -1665,6 +1783,19 @@ class FastEncodeProApp(QMainWindow):
         nvenc_row.addWidget(self.pixel_combo)
         codec_layout.addLayout(nvenc_row)
 
+        export_target_row = QHBoxLayout()
+        self.export_target_label = QLabel("Export target:")
+        export_target_row.addWidget(self.export_target_label)
+        self.export_target_combo = QComboBox()
+        self.export_target_combo.addItems(get_export_target_labels())
+        self.export_target_combo.setCurrentIndex(0)
+        self.export_target_combo.setStyleSheet(self.combo_style())
+        self.export_target_combo.currentIndexChanged.connect(
+            lambda _: self.update_quality_label(self.quality_slider.value())
+        )
+        export_target_row.addWidget(self.export_target_combo)
+        codec_layout.addLayout(export_target_row)
+
         codec_group.setLayout(codec_layout)
         scroll_layout.addWidget(codec_group)
 
@@ -1811,6 +1942,17 @@ class FastEncodeProApp(QMainWindow):
         self.gpu_decode_check.stateChanged.connect(lambda: self.update_quality_label(self.quality_slider.value()))
         perf_layout.addWidget(self.gpu_decode_check)
 
+        auto_hw_btn = QPushButton("🔍 Auto Detect Hardware")
+        auto_hw_btn.setStyleSheet(self.button_style("#3b82f6"))
+        auto_hw_btn.setMinimumHeight(36)
+        auto_hw_btn.clicked.connect(lambda: self.apply_auto_hardware_settings(update_status=True))
+        perf_layout.addWidget(auto_hw_btn)
+
+        self.hw_detect_label = QLabel("Auto hardware detect: pending")
+        self.hw_detect_label.setStyleSheet("font-size: 9pt; color: #93c5fd; padding: 2px 5px;")
+        self.hw_detect_label.setWordWrap(True)
+        perf_layout.addWidget(self.hw_detect_label)
+
         gpu_decode_info = QLabel(
             "ℹ️ AV1 hardware decode requires RTX 30-series or newer\n"
             "   RTX 20-series: Keep OFF for AV1 files (use CPU decode)\n"
@@ -1843,6 +1985,7 @@ class FastEncodeProApp(QMainWindow):
         scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
+        self.apply_auto_hardware_settings()
         self.on_codec_changed()
         self.update_quality_label(100)
         return tab
@@ -2337,6 +2480,8 @@ class FastEncodeProApp(QMainWindow):
         self.prores_combo.setVisible(is_prores)
         self.nvenc_label.setVisible(is_nvenc)
         self.pixel_combo.setVisible(is_nvenc)
+        self.export_target_label.setVisible(is_nvenc)
+        self.export_target_combo.setVisible(is_nvenc)
 
         if is_prores:
             self.quality_slider.setMinimum(50)
@@ -2361,7 +2506,10 @@ class FastEncodeProApp(QMainWindow):
             profile_names = ["Proxy", "LT", "Standard", "HQ", "4444", "4444 XQ"]
             self.gpu_info.setText(f"✅ ProRes {profile_names[self.prores_combo.currentIndex()]} (~{value} Mbps CBR) | {decode_status}")
         else:
-            self.gpu_info.setText(f"✅ GPU: NVENC ({value} Mbps CBR) | {decode_status}")
+            target_idx = self.export_target_combo.currentIndex()
+            target_name = get_export_target_labels()[target_idx]
+            preset = get_nvenc_preset_for_target(target_idx).upper()
+            self.gpu_info.setText(f"✅ GPU: NVENC {preset} ({value} Mbps CBR) | {target_name} | {decode_status}")
 
     def update_estimated_size(self):
         if self.timeline_duration > 0:
@@ -2401,7 +2549,9 @@ class FastEncodeProApp(QMainWindow):
             return
 
         bitrate = self.quality_slider.value()
-        reply = QMessageBox.question(self, "Export Timeline", f"Export {len(self.timeline.clips)} clips?\n\nCodec: {settings['video_codec'].upper()}\nBitrate: {bitrate} Mbps (CBR - Constant)\nContainer: MOV\n\n✅ This will maintain consistent quality throughout!", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        export_target = get_export_target_labels()[self.export_target_combo.currentIndex()]
+        filters_state = "ON" if settings.get('has_optional_filters') else "OFF"
+        reply = QMessageBox.question(self, "Export Timeline", f"Export {len(self.timeline.clips)} clips?\n\nCodec: {settings['video_codec'].upper()}\nExport target: {export_target}\nOptional filters: {filters_state}\nBitrate: {bitrate} Mbps (CBR - Constant)\nContainer: MOV\n\n✅ This will maintain consistent quality throughout!", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
         self.export_timeline_btn.setEnabled(False)
@@ -2894,9 +3044,9 @@ class FastEncodeProApp(QMainWindow):
         self.codec_combo.setCurrentIndex(0)
         self.prores_combo.setCurrentIndex(5)
         self.pixel_combo.setCurrentIndex(1)
+        self.export_target_combo.setCurrentIndex(0)
         self.audio_combo.setCurrentIndex(0)
-        self.gpu_check.setChecked(True)
-        self.gpu_decode_check.setChecked(False)
+        self.apply_auto_hardware_settings()
         self.threads_spin.setValue(0)
         self.quality_slider.setValue(500 if self.codec_combo.currentIndex() == 0 else 100)
         self.denoise_combo.setCurrentIndex(0)
@@ -2923,6 +3073,7 @@ class FastEncodeProApp(QMainWindow):
             'video_codec': codec_map[self.codec_combo.currentIndex()],
             'prores_profile': self.prores_combo.currentIndex(),
             'pixel_format': self.pixel_combo.currentIndex(),
+            'export_target_index': self.export_target_combo.currentIndex(),
             'audio_codec': audio_map[self.audio_combo.currentIndex()],
             'use_gpu': self.gpu_check.isChecked(),
             'use_gpu_decode': self.gpu_decode_check.isChecked(),
@@ -2937,6 +3088,7 @@ class FastEncodeProApp(QMainWindow):
             'export_res_index': export_res_index,
             'scale_algo': scale_algo,
         }
+        settings['has_optional_filters'] = has_optional_video_filters(settings)
         return settings
 
     def start_encoding(self):

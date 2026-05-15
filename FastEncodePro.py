@@ -9,6 +9,12 @@ v0.9.0 Features:
 - Added Automatic Audio Sync detection.
 - Fixed Wayland ghost-window bugs during audio sync analysis.
 - Fixed PyQt6 thread-safety crashes for timeline waveforms.
+- Multi-clip export: video overlay uses timeline-aligned PTS (fixes black after first clip).
+- Timeline export audio: amix uses longest input (fixes silence after first clip).
+- Timeline EDL preview: native audio per segment (no first-clip-only lavfi on multi-file EDL).
+- Windows / PyInstaller: DLL search path bootstrap before ``import mpv``; import errors include pip + EXE hints.
+- MPV preview: Qt-thread-safe callbacks; deferred seek/lavfi after ``file-loaded`` (fixes EDL/timeline black screen).
+- Ship preview in EXE: ``pip install -r requirements-FastEncodePro.txt`` when building; PyInstaller ``--hidden-import=mpv`` + ``libmpv-2.dll``.
 """
 
 import locale
@@ -26,13 +32,51 @@ import time
 import math
 from pathlib import Path
 
+
+def _bootstrap_mpv_runtime_path():
+    """PyInstaller / frozen EXE: register folders where ``libmpv-2.dll`` is unpacked before ``import mpv``."""
+    if not getattr(sys, 'frozen', False):
+        return
+    bases = []
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        bases.append(os.path.abspath(meipass))
+    exe = getattr(sys, 'executable', '') or ''
+    exe_dir = os.path.abspath(os.path.dirname(exe)) if exe else ''
+    if exe_dir and exe_dir not in bases:
+        bases.append(exe_dir)
+    prepend = []
+    for base in bases:
+        if not base or not os.path.isdir(base):
+            continue
+        try:
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(base)
+        except (OSError, ValueError, FileNotFoundError, AttributeError):
+            pass
+        prepend.append(base)
+    if prepend:
+        os.environ['PATH'] = os.pathsep.join(prepend) + os.pathsep + os.environ.get('PATH', '')
+
+
+_bootstrap_mpv_runtime_path()
+
+# PyInstaller / Auto-py-to-exe: collect the pure-Python binding (no separate user install needed in EXE):
+#   Advanced → --hidden-import=mpv
+#   Optional: --collect-all mpv   (ships full package from site-packages)
+# You must still add ``libmpv-2.dll`` (+ any deps your build needs) under Add Binary.
+PYINSTALLER_HIDDEN_IMPORTS_MPV = ('mpv',)
+
 MPV_AVAILABLE = False
 try:
-    import mpv
+    import mpv  # noqa: F401
     MPV_AVAILABLE = True
     print("✅ python-mpv available")
-except ImportError:
-    print("⚠️  python-mpv not installed - install with: sudo pacman -S python-mpv")
+except (ImportError, OSError) as _mpv_err:
+    print(f"⚠️  python-mpv / libmpv unavailable: {_mpv_err}")
+    print("   Dev: pip install mpv   |   EXE: hidden-import=mpv + bundle libmpv-2.dll next to the app / in _MEIPASS.")
+except Exception as _mpv_err:
+    print(f"⚠️  python-mpv failed to load: {_mpv_err}")
 
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRectF, QObject, QSize
@@ -295,13 +339,37 @@ class MPVVideoWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
+        self.mpv = None
+        self.current_file = None
+        self._is_paused = True
+        self._duration_ms = 0
+        self._position_ms = 0
+        self._pending_audio_filter = None
+        self._file_loading = False
+        self._pending_seek_ms = None
+        self._pending_play = False  # If True, start playing once file-loaded fires
+
+        self.position_timer = QTimer(self)
+        self.position_timer.timeout.connect(self._update_position)
+        self.position_timer.setInterval(100)
+
+        self.setStyleSheet("background-color: #0f172a;")
+        self.setMinimumSize(640, 360)
+
         if not MPV_AVAILABLE:
             layout = QVBoxLayout(self)
-            error_label = QLabel("⚠️ MPV Not Available\n\nInstall: sudo pacman -S python-mpv")
-            error_label.setStyleSheet("color: #ef4444; font-size: 14pt; font-weight: bold;")
+            error_label = QLabel(
+                "⚠️ MPV preview unavailable\n\n"
+                "• Development: pip install mpv\n"
+                "• Linux: install python-mpv and mpv (distro packages)\n"
+                "• Frozen EXE (Auto-py-to-exe): Advanced → add --hidden-import=mpv\n"
+                "  and Add Binary: libmpv-2.dll (plus any DLLs your MPV build needs)"
+            )
+            error_label.setStyleSheet("color: #ef4444; font-size: 12pt; font-weight: bold;")
             error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            error_label.setWordWrap(True)
             layout.addWidget(error_label)
-            self.mpv = None
             return
 
         layout = QVBoxLayout(self)
@@ -324,21 +392,51 @@ class MPVVideoWidget(QWidget):
         info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(info_label)
 
-        self.current_file = None
-        self._is_paused = True
-        self._duration_ms = 0
-        self._position_ms = 0
-        self._pending_audio_filter = None
-
-        self.position_timer = QTimer(self)
-        self.position_timer.timeout.connect(self._update_position)
-        self.position_timer.setInterval(100)
-
-        self.setStyleSheet("background-color: #0f172a;")
-        self.setMinimumSize(640, 360)
-
-        self.mpv = None
         self._init_mpv()
+
+    def _mpv_emit_duration_ms(self, ms):
+        self._duration_ms = ms
+        self.durationChanged.emit(ms)
+
+    def _mpv_set_paused(self, value):
+        self._is_paused = bool(value)
+
+    def _mpv_apply_file_loaded_pending(self):
+        """Runs on Qt GUI thread (libmpv callbacks are not thread-safe with Qt)."""
+        if not self.mpv:
+            self._file_loading = False
+            return
+        try:
+            if self._pending_audio_filter is not None:
+                try:
+                    self.mpv.lavfi_complex = self._pending_audio_filter
+                except Exception:
+                    pass
+                self._pending_audio_filter = None
+            if self._pending_seek_ms is not None:
+                try:
+                    self.mpv.seek(self._pending_seek_ms / 1000.0, reference='absolute')
+                    self._position_ms = self._pending_seek_ms
+                except Exception:
+                    pass
+                self._pending_seek_ms = None
+            # If play was requested before the file finished loading, honour it now
+            if self._pending_play:
+                self._pending_play = False
+                try:
+                    self.mpv.pause = False
+                    self._is_paused = False
+                    self.position_timer.start()
+                except Exception:
+                    pass
+            else:
+                # Ensure we land on the correct frame paused, not a black frame
+                try:
+                    self.mpv.pause = True
+                except Exception:
+                    pass
+        finally:
+            self._file_loading = False
 
     def _init_mpv(self):
         if not MPV_AVAILABLE:
@@ -368,8 +466,8 @@ class MPVVideoWidget(QWidget):
             @self.mpv.property_observer('duration')
             def duration_observer(_name, value):
                 if value and value > 0:
-                    self._duration_ms = int(value * 1000)
-                    self.durationChanged.emit(self._duration_ms)
+                    ms = int(value * 1000)
+                    QTimer.singleShot(0, lambda m=ms: self._mpv_emit_duration_ms(m))
 
             @self.mpv.property_observer('time-pos')
             def position_observer(_name, value):
@@ -378,55 +476,71 @@ class MPVVideoWidget(QWidget):
 
             @self.mpv.property_observer('pause')
             def pause_observer(_name, value):
-                self._is_paused = value
+                v = bool(value)
+                QTimer.singleShot(0, lambda v=v: self._mpv_set_paused(v))
 
             @self.mpv.event_callback('file-loaded')
             def file_loaded_handler(event):
-                if self._pending_audio_filter:
-                    try:
-                        self.mpv.lavfi_complex = self._pending_audio_filter
-                    except Exception as e:
-                        pass
-                    self._pending_audio_filter = None
+                QTimer.singleShot(0, self._mpv_apply_file_loaded_pending)
 
-        except Exception as e:
+        except Exception:
             self.mpv = None
 
-    def load_file(self, file_path):
+    def load_file(self, file_path, seek_ms=None):
         if not self.mpv:
             return False
         try:
+            self._file_loading = True
+            self._pending_play = False  # Reset any pending play from previous load
             self.mpv.lavfi_complex = ""
             self._pending_audio_filter = None
+            self._pending_seek_ms = seek_ms
+            self._position_ms = seek_ms if seek_ms is not None else 0  # Pre-set so timecode shows correctly
             self.current_file = file_path
             self.mpv.loadfile(file_path)
             self.mpv.pause = True
             self._is_paused = True
             return True
-        except Exception as e:
+        except Exception:
+            self._file_loading = False
+            self._pending_seek_ms = None
             return False
 
     def play(self):
-        if not self.mpv or not self.current_file: return
-        self.mpv.pause = False
-        self._is_paused = False
-        self.position_timer.start()
+        if not self.mpv or not self.current_file:
+            return
+        try:
+            if self._file_loading:
+                # File hasn't finished loading yet — defer play until file-loaded fires
+                self._pending_play = True
+                self._is_paused = False  # Track intent
+            else:
+                self.mpv.pause = False
+                self._is_paused = False
+                self.position_timer.start()
+        except Exception:
+            pass
 
     def pause(self):
-        if not self.mpv: return
-        self.mpv.pause = True
-        self._is_paused = True
-        self.position_timer.stop()
+        if not self.mpv:
+            return
+        try:
+            self.mpv.pause = True
+            self._is_paused = True
+            self.position_timer.stop()
+        except Exception:
+            pass
 
     def is_paused(self):
         return self._is_paused
 
     def seek(self, position_ms):
-        if not self.mpv: return
+        if not self.mpv:
+            return
         try:
             self.mpv.seek(position_ms / 1000.0, reference='absolute')
             self._position_ms = position_ms
-        except:
+        except Exception:
             pass
 
     def position(self):
@@ -439,22 +553,26 @@ class MPVVideoWidget(QWidget):
         self.positionChanged.emit(self._position_ms)
 
     def stop(self):
-        if not self.mpv: return
+        if not self.mpv:
+            return
         try:
             self.mpv.command('stop')
             self._is_paused = True
             self._position_ms = 0
             self.position_timer.stop()
-        except:
+        except Exception:
             pass
 
     def set_audio_complex_filter(self, filter_string):
-        if not self.mpv: return
+        if not self.mpv:
+            return
         self._pending_audio_filter = filter_string
+        if self._file_loading:
+            return
         try:
-            if not self.mpv.core_idle:
-                self.mpv.lavfi_complex = filter_string
-        except Exception as e:
+            self.mpv.lavfi_complex = filter_string
+            self._pending_audio_filter = None
+        except Exception:
             pass
 
     def shutdown(self):
@@ -462,7 +580,7 @@ class MPVVideoWidget(QWidget):
         if self.mpv:
             try:
                 self.mpv.terminate()
-            except:
+            except Exception:
                 pass
 
 
@@ -675,7 +793,6 @@ class TimelineWidget(QWidget):
         return closest_snap if closest_snap is not None else time
 
     def mousePressEvent(self, event):
-        self.timeline_clicked.emit()
         if event.button() == Qt.MouseButton.LeftButton:
             click_x = event.position().x()
             click_y = event.position().y()
@@ -683,6 +800,8 @@ class TimelineWidget(QWidget):
             click_time = self.get_snap_time(raw_time)
 
             if click_y < 40:
+                # Ruler / playhead: whole-timeline preview mode (not single-clip edit).
+                self.timeline_clicked.emit()
                 self.dragging_playhead = True
                 self.set_playhead_position(click_time, auto_scroll=True)
                 return
@@ -698,6 +817,8 @@ class TimelineWidget(QWidget):
                     self.clip_selected.emit(clip)
                     self.update()
                     return
+            # Empty track click: sequence mode, clear clip selection.
+            self.timeline_clicked.emit()
             self.selected_clip = None
             self.update()
 
@@ -1083,8 +1204,12 @@ class TimelineRenderingEngine:
                 v_trimmed = f"[v{i}_trim]"
                 v_scaled = f"[v{i}_scale]"
 
-                # Trim the clip to its in/out points and reset timestamps to 0
-                filter_complex.append(f"{v_in}trim=start={clip.in_point}:end={clip.out_point},setpts=PTS-STARTPTS{v_trimmed}")
+                # Trim, reset at in-point, then shift PTS to timeline so overlay syncs with master canvas.
+                st = clip.start_time
+                filter_complex.append(
+                    f"{v_in}trim=start={clip.in_point}:end={clip.out_point},"
+                    f"setpts=PTS-STARTPTS+{st:.6f}/TB{v_trimmed}"
+                )
 
                 # Scale the clip perfectly into the canvas dimensions, padding with black if aspect ratio mismatches
                 # Keep per-clip branch lightweight: avoid per-input fps conversion
@@ -1152,7 +1277,7 @@ class TimelineRenderingEngine:
             # Mix Audio
             if audio_inputs:
                 inputs_str = "".join(audio_inputs)
-                filter_complex.append(f"{inputs_str}amix=inputs={len(audio_inputs)}:duration=first:dropout_transition=0[out_a]")
+                filter_complex.append(f"{inputs_str}amix=inputs={len(audio_inputs)}:duration=longest:dropout_transition=0[out_a]")
                 map_a = "[out_a]"
             else:
                 # Generate silent audio track if completely muted
@@ -1385,7 +1510,18 @@ class FastEncodeProApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"FastEncode Pro v{__version__} - Accessible Video Editor")
-        self.setGeometry(100, 100, 1400, 900)
+        # Fit inside the work area (excludes Win11 taskbar) so the timeline is not covered.
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            ag = screen.availableGeometry()
+            pad = 24
+            w = min(1400, max(800, ag.width() - pad * 2))
+            h = min(900, max(600, ag.height() - pad * 2))
+            x = ag.x() + max(0, (ag.width() - w) // 2)
+            y = ag.y() + max(0, (ag.height() - h) // 2)
+            self.setGeometry(x, y, w, h)
+        else:
+            self.setGeometry(100, 100, 1400, 900)
         self.input_files = []
         self.output_folder = ""
         self.encoding_thread = None
@@ -1398,6 +1534,8 @@ class FastEncodeProApp(QMainWindow):
 
         self.timeline_duration = 0
         self.is_timeline_mode = False
+        # True after ruler/empty-timeline click: Play runs full EDL. False after a clip is selected for preview.
+        self._play_uses_timeline_edl = False
 
         self.dwell_filter = DwellClickFilter(self)
         self.hw_caps = detect_hardware_capabilities()
@@ -2111,12 +2249,16 @@ class FastEncodeProApp(QMainWindow):
 
     def _on_duration_changed(self, duration_ms):
         """Handle video duration updates"""
-        current_tc = self.format_timecode(self.video_widget.position() if self.video_widget else 0)
+        # Don't read position() here - it's 0 during file load before seek completes.
+        # Use _position_ms directly from the widget which is set correctly by seek.
+        current_ms = self.video_widget._position_ms if self.video_widget else 0
+        current_tc = self.format_timecode(current_ms)
         total_tc = self.format_timecode(duration_ms)
         self.timecode_label.setText(f"{current_tc} / {total_tc}")
 
     def on_media_selected(self, item):
         self.is_timeline_mode = False
+        self._play_uses_timeline_edl = False
         row = self.media_list.row(item)
         if 0 <= row < len(self.media_library):
             self.current_media = self.media_library[row]
@@ -2142,10 +2284,12 @@ class FastEncodeProApp(QMainWindow):
 
     def activate_timeline_mode(self):
         self.is_timeline_mode = True
+        self._play_uses_timeline_edl = True
         self.trim_info.setText("Timeline Mode Active - Click Play to Preview Sequence")
 
     def on_timeline_clip_selected(self, clip):
         self.is_timeline_mode = True
+        self._play_uses_timeline_edl = False
 
         while len(clip.normalization) < len(clip.volumes):
             clip.normalization.append(False)
@@ -2163,8 +2307,8 @@ class FastEncodeProApp(QMainWindow):
         else:
             self.sync_status_label.setText("")
 
-        if self.video_widget.load_file(clip.file_path):
-            self.video_widget.seek(int(clip.in_point * 1000))
+        seek_ms = int(clip.in_point * 1000)
+        if self.video_widget.load_file(clip.file_path, seek_ms=seek_ms):
             self.video_widget.pause()
             self.apply_audio_mix_preview(clip.file_path, clip.volumes, clip.normalization)
 
@@ -2349,13 +2493,35 @@ class FastEncodeProApp(QMainWindow):
             self.append_log(f"❌ Auto-sync failed: {e}")
 
     def on_timeline_playhead_moved(self, time):
-        pass
+        """Timeline scrubber dragged - seek the player to match."""
+        if not self.video_widget:
+            return
+        seek_ms = int(time * 1000)
+        if self._play_uses_timeline_edl:
+            # Playing full timeline EDL - seek within it
+            if self.video_widget.duration() > 0:
+                self.video_widget.seek(seek_ms)
+        else:
+            # Single clip selected - seek within the clip, accounting for in_point
+            clip = self.timeline.selected_clip
+            if clip and self.video_widget.duration() > 0:
+                # Convert timeline time to position within the clip
+                clip_time = time - clip.start_time + clip.in_point
+                clip_time = max(clip.in_point, min(clip.out_point, clip_time))
+                self.video_widget.seek(int(clip_time * 1000))
 
     def toggle_play(self):
         if not self.video_widget:
             return
 
-        if self.is_timeline_mode and self.video_widget.is_paused():
+        # With a clip selected we are previewing that file in MPV — Play must not swap to EDL playback
+        # unless the user chose whole-timeline mode (ruler / empty track click).
+        play_full_timeline_edl = (
+            self.is_timeline_mode
+            and self.video_widget.is_paused()
+            and self._play_uses_timeline_edl
+        )
+        if play_full_timeline_edl:
             self.play_timeline_sequence()
         elif self.video_widget.is_paused():
             self.video_widget.play()
@@ -2373,21 +2539,21 @@ class FastEncodeProApp(QMainWindow):
 
         for clip in sorted_clips:
             length = clip.get_trimmed_duration()
-            edl_content += f"{clip.file_path},{clip.in_point},{length}\n"
+            # MPV EDL is picky about Windows backslashes; use forward slashes in entries.
+            fp = os.path.normpath(clip.file_path).replace('\\', '/')
+            edl_content += f"{fp},{clip.in_point},{length}\n"
 
         try:
             fd, path = tempfile.mkstemp(suffix='.edl', text=True)
             with os.fdopen(fd, 'w') as f:
                 f.write(edl_content)
 
+            # EDL switches files; lavfi from one clip breaks after the first segment — use native audio.
             self.video_widget.set_audio_complex_filter("")
 
-            if self.video_widget.load_file(path):
-                if sorted_clips:
-                    first_clip = sorted_clips[0]
-                    self.apply_audio_mix_preview(first_clip.file_path, first_clip.volumes, first_clip.normalization)
-
-                self.video_widget.seek(int(self.timeline.playhead_position * 1000))
+            edl_path = os.path.normpath(path).replace('\\', '/')
+            seek_ms = int(self.timeline.playhead_position * 1000)
+            if self.video_widget.load_file(edl_path, seek_ms=seek_ms):
                 self.video_widget.play()
                 self.play_btn.setText("⏸️ Pause")
         except Exception as e:

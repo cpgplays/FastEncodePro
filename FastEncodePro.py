@@ -15,6 +15,7 @@ v0.9.0 Features:
 - Windows / PyInstaller: DLL search path bootstrap before ``import mpv``; import errors include pip + EXE hints.
 - MPV preview: Qt-thread-safe callbacks; deferred seek/lavfi after ``file-loaded`` (fixes EDL/timeline black screen).
 - Ship preview in EXE: ``pip install -r requirements-FastEncodePro.txt`` when building; PyInstaller ``--hidden-import=mpv`` + ``libmpv-2.dll``.
+- THE FIX: Timeline scrubbers now track in real-time, empty clicks load the full EDL track sequence properly!
 """
 
 import locale
@@ -61,10 +62,6 @@ def _bootstrap_mpv_runtime_path():
 
 _bootstrap_mpv_runtime_path()
 
-# PyInstaller / Auto-py-to-exe: collect the pure-Python binding (no separate user install needed in EXE):
-#   Advanced → --hidden-import=mpv
-#   Optional: --collect-all mpv   (ships full package from site-packages)
-# You must still add ``libmpv-2.dll`` (+ any deps your build needs) under Add Binary.
 PYINSTALLER_HIDDEN_IMPORTS_MPV = ('mpv',)
 
 MPV_AVAILABLE = False
@@ -90,7 +87,7 @@ __author__ = "cpgplays"
 def get_audio_stream_count_static(filepath):
     try:
         cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', filepath]
-        out = subprocess.check_output(cmd).decode().strip()
+        out = subprocess.check_output(cmd, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).decode().strip()
         if not out: return 0
         return len(out.splitlines())
     except:
@@ -131,8 +128,6 @@ def build_nvenc_cbr_args(settings, fps_value=None):
 
 def get_cuvid_decoder_for_codec(codec_name):
     codec_name = (codec_name or "").lower()
-    # NVDEC (CUVID) decoders. If unavailable, ffmpeg will error; we only
-    # opt into these when user explicitly requests hardware decode.
     mapping = {
         "h264": "h264_cuvid",
         "hevc": "hevc_cuvid",
@@ -148,11 +143,6 @@ def get_cuvid_decoder_for_codec(codec_name):
 def build_hw_decode_input_args(file_path, codec_name, use_gpu_decode):
     if not use_gpu_decode:
         return ['-i', file_path]
-
-    # Keep decode on NVDEC without forcing CUDA frame surfaces into a
-    # software-only filter graph. The compositor uses regular trim/scale/
-    # overlay filters, so ffmpeg must be free to hand those filters normal
-    # frames instead of device-only frames.
     return ['-hwaccel', 'cuda', '-i', file_path]
 
 
@@ -177,7 +167,7 @@ def detect_hardware_capabilities():
             caps['nvidia_smi'] = True
             smi = subprocess.run(
                 ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=2
+                capture_output=True, text=True, timeout=2, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             name = (smi.stdout or '').strip().splitlines()
             if name and name[0]:
@@ -186,7 +176,7 @@ def detect_hardware_capabilities():
         pass
 
     try:
-        enc = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, timeout=3)
+        enc = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         enc_text = (enc.stdout or '') + (enc.stderr or '')
         caps['nvenc_h264'] = 'h264_nvenc' in enc_text
         caps['nvenc_hevc'] = 'hevc_nvenc' in enc_text
@@ -194,7 +184,7 @@ def detect_hardware_capabilities():
         pass
 
     try:
-        dec = subprocess.run(['ffmpeg', '-hide_banner', '-decoders'], capture_output=True, text=True, timeout=3)
+        dec = subprocess.run(['ffmpeg', '-hide_banner', '-decoders'], capture_output=True, text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         dec_text = (dec.stdout or '') + (dec.stderr or '')
         caps['nvdec'] = ('h264_cuvid' in dec_text) or ('hevc_cuvid' in dec_text) or ('av1_cuvid' in dec_text)
     except Exception:
@@ -223,7 +213,7 @@ class WaveformWorker(QThread):
                 temp_png
             ]
 
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
 
             if os.path.exists(temp_png):
                 image = QImage(temp_png)
@@ -348,7 +338,6 @@ class MPVVideoWidget(QWidget):
         self._pending_audio_filter = None
         self._file_loading = False
         self._pending_seek_ms = None
-        self._pending_play = False  # If True, start playing once file-loaded fires
 
         self.position_timer = QTimer(self)
         self.position_timer.timeout.connect(self._update_position)
@@ -420,21 +409,6 @@ class MPVVideoWidget(QWidget):
                 except Exception:
                     pass
                 self._pending_seek_ms = None
-            # If play was requested before the file finished loading, honour it now
-            if self._pending_play:
-                self._pending_play = False
-                try:
-                    self.mpv.pause = False
-                    self._is_paused = False
-                    self.position_timer.start()
-                except Exception:
-                    pass
-            else:
-                # Ensure we land on the correct frame paused, not a black frame
-                try:
-                    self.mpv.pause = True
-                except Exception:
-                    pass
         finally:
             self._file_loading = False
 
@@ -491,11 +465,9 @@ class MPVVideoWidget(QWidget):
             return False
         try:
             self._file_loading = True
-            self._pending_play = False  # Reset any pending play from previous load
             self.mpv.lavfi_complex = ""
             self._pending_audio_filter = None
             self._pending_seek_ms = seek_ms
-            self._position_ms = seek_ms if seek_ms is not None else 0  # Pre-set so timecode shows correctly
             self.current_file = file_path
             self.mpv.loadfile(file_path)
             self.mpv.pause = True
@@ -510,14 +482,9 @@ class MPVVideoWidget(QWidget):
         if not self.mpv or not self.current_file:
             return
         try:
-            if self._file_loading:
-                # File hasn't finished loading yet — defer play until file-loaded fires
-                self._pending_play = True
-                self._is_paused = False  # Track intent
-            else:
-                self.mpv.pause = False
-                self._is_paused = False
-                self.position_timer.start()
+            self.mpv.pause = False
+            self._is_paused = False
+            self.position_timer.start()
         except Exception:
             pass
 
@@ -609,7 +576,7 @@ class TimelineClip:
 
     def get_video_duration(self):
         try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.file_path], capture_output=True, text=True, )
+            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.file_path], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             return float(result.stdout.strip())
         except:
             return 60.0
@@ -755,7 +722,7 @@ class TimelineWidget(QWidget):
             return -1
         return max(0, min(self.num_tracks - 1, (y - ruler_height) // self.track_height))
 
-    def set_playhead_position(self, time, auto_scroll=True):
+    def set_playhead_position(self, time, auto_scroll=True, emit_signal=True):
         self.playhead_position = max(0, time)
         if auto_scroll:
             playhead_x = (self.playhead_position - self.scroll_offset) * self.zoom_level
@@ -768,7 +735,8 @@ class TimelineWidget(QWidget):
                 self.scroll_offset = max(0, self.scroll_offset - (left_margin - playhead_x) / self.zoom_level)
 
         self.update()
-        self.playhead_moved.emit(self.playhead_position)
+        if emit_signal:
+            self.playhead_moved.emit(self.playhead_position)
 
     def get_snap_time(self, time):
         snap_threshold_pixels = 15
@@ -800,14 +768,16 @@ class TimelineWidget(QWidget):
             click_time = self.get_snap_time(raw_time)
 
             if click_y < 40:
-                # Ruler / playhead: whole-timeline preview mode (not single-clip edit).
+                # Ruler / playhead: whole-timeline preview mode
                 self.timeline_clicked.emit()
                 self.dragging_playhead = True
                 self.set_playhead_position(click_time, auto_scroll=True)
                 return
+                
             clicked_track = self.y_to_track(click_y)
             if clicked_track < 0:
                 return
+                
             for clip in reversed(self.clips):
                 if (clip.track == clicked_track and clip.start_time <= click_time <= clip.get_end_time()):
                     self.selected_clip = clip
@@ -817,9 +787,10 @@ class TimelineWidget(QWidget):
                     self.clip_selected.emit(clip)
                     self.update()
                     return
+                    
             # Empty track click: sequence mode, clear clip selection.
-            self.timeline_clicked.emit()
             self.selected_clip = None
+            self.timeline_clicked.emit()
             self.update()
 
     def mouseMoveEvent(self, event):
@@ -919,7 +890,7 @@ class MediaLibraryItem:
 
     def get_video_duration(self):
         try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.file_path], capture_output=True, text=True, )
+            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.file_path], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             return float(result.stdout.strip())
         except:
             return 60.0
@@ -961,7 +932,7 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
     ]
 
     try:
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         audio_tracks = [int(x) for x in result.stdout.strip().split('\n') if x]
 
         if track1 >= len(audio_tracks) or track2 >= len(audio_tracks):
@@ -994,7 +965,7 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
             tmp1_path
         ]
 
-        result = subprocess.run(extract1_cmd, capture_output=True, timeout=60)
+        result = subprocess.run(extract1_cmd, capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         if result.returncode != 0:
             raise Exception(f"Failed to extract track {track1}: {result.stderr.decode()}")
 
@@ -1010,7 +981,7 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
             tmp2_path
         ]
 
-        result = subprocess.run(extract2_cmd, capture_output=True, timeout=60)
+        result = subprocess.run(extract2_cmd, capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         if result.returncode != 0:
             raise Exception(f"Failed to extract track {track2}: {result.stderr.decode()}")
 
@@ -1061,6 +1032,120 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
         try: os.unlink(tmp2_path)
         except: pass
 
+import hashlib
+
+def get_timeline_hash(timeline, settings):
+    state = []
+    if not timeline.clips:
+        return "empty"
+    for c in timeline.clips:
+        vol_str = ','.join(map(str, getattr(c, 'volumes', [])))
+        norm_str = ','.join(map(str, getattr(c, 'normalization', [])))
+        so = getattr(c, 'sync_offset', 0)
+        state.append(f"{c.file_path}|{c.start_time}|{c.in_point}|{c.out_point}|{vol_str}|{norm_str}|{so}")
+    
+    keys = ['denoise_level', 'deflicker_level', 'exposure_level', 'temporal_level', 'sharpness_level', 'export_res_index', 'timeline_fps']
+    for k in keys:
+        state.append(f"{k}:{settings.get(k, 0)}")
+        
+    return hashlib.md5("\n".join(state).encode('utf-8')).hexdigest()
+
+class BackgroundCacheThread(QThread):
+    progress = pyqtSignal(int)
+    status = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, str)
+
+    def __init__(self, timeline_copy, settings_copy, cache_path, current_hash):
+        super().__init__()
+        self.timeline = timeline_copy
+        self.settings = settings_copy
+        self.cache_path = cache_path
+        self.current_hash = current_hash
+        self.engine = None
+
+    def run(self):
+        self.engine = TimelineRenderingEngine(self.timeline, self.settings, self.cache_path,
+            log_callback=lambda m: None, progress_callback=self.progress.emit,
+            status_callback=self.status.emit, playhead_callback=lambda t: None,
+            is_cache_render=True)
+        success, message = self.engine.render()
+        self.finished.emit(success, message, self.current_hash)
+
+    def stop(self):
+        if self.engine:
+            self.engine.should_stop = True
+
+class TimelineCacheManager(QObject):
+    status_changed = pyqtSignal(str)
+    
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.cache_thread = None
+        self.debounce_timer = QTimer()
+        self.debounce_timer.setSingleShot(True)
+        self.debounce_timer.setInterval(1500)
+        self.debounce_timer.timeout.connect(self._start_cache_render)
+        
+        self.last_hash = ""
+        self.ready_hash = ""
+        self.cache_file = os.path.join(tempfile.gettempdir(), 'fep_timeline_cache.mp4')
+        
+    def trigger_update(self):
+        settings = self.app.get_settings()
+        if not has_optional_video_filters(settings):
+            self.status_changed.emit("Cache: Inactive")
+            self.ready_hash = ""
+            return
+            
+        current_hash = get_timeline_hash(self.app.timeline, settings)
+        if current_hash == self.ready_hash:
+            self.status_changed.emit("Cache: Ready ⚡")
+            return
+            
+        if self.last_hash != current_hash:
+            self.last_hash = current_hash
+            self.status_changed.emit("Cache: Waiting...")
+            self.debounce_timer.start()
+
+    def _start_cache_render(self):
+        if not self.app.timeline.clips:
+            self.status_changed.emit("")
+            return
+            
+        if self.cache_thread and self.cache_thread.isRunning():
+            self.cache_thread.stop()
+            self.cache_thread.wait()
+            
+        self.status_changed.emit("Cache: Rendering (0%)")
+        
+        import copy
+        class DummyTimeline: pass
+        tl_copy = DummyTimeline()
+        tl_copy.clips = copy.deepcopy(self.app.timeline.clips)
+        
+        settings = self.app.get_settings()
+        self.cache_thread = BackgroundCacheThread(tl_copy, settings, self.cache_file, self.last_hash)
+        self.cache_thread.progress.connect(self._on_progress)
+        self.cache_thread.finished.connect(self._on_finished)
+        self.cache_thread.start()
+        
+    def _on_progress(self, pct):
+        self.status_changed.emit(f"Cache: Rendering ({pct}%)")
+        
+    def _on_finished(self, success, msg, finished_hash):
+        if success and finished_hash == self.last_hash:
+            self.ready_hash = finished_hash
+            self.status_changed.emit("Cache: Ready ⚡")
+        elif not success and finished_hash == self.last_hash:
+            self.status_changed.emit("Cache: Error")
+            
+    def get_valid_cache_path(self):
+        settings = self.app.get_settings()
+        current_hash = get_timeline_hash(self.app.timeline, settings)
+        if current_hash == self.ready_hash and os.path.exists(self.cache_file):
+            return self.cache_file
+        return None
 
 class TimelineRenderingEngine:
     """
@@ -1070,7 +1155,8 @@ class TimelineRenderingEngine:
     No temp files. No System RAM bottlenecks. 100% GPU utilization.
     """
     def __init__(self, timeline, settings, output_path,
-                 log_callback, progress_callback, status_callback, playhead_callback=None):
+                 log_callback, progress_callback, status_callback, playhead_callback=None,
+                 is_cache_render=False, valid_cache_path=None):
         self.timeline = timeline
         self.settings = settings
         self.output_path = output_path
@@ -1078,6 +1164,8 @@ class TimelineRenderingEngine:
         self.progress = progress_callback
         self.status = status_callback
         self.playhead = playhead_callback
+        self.is_cache_render = is_cache_render
+        self.valid_cache_path = valid_cache_path
         self.should_stop = False
         self.encoder_process = None
 
@@ -1098,7 +1186,7 @@ class TimelineRenderingEngine:
         try:
             cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
                    '-show_entries', 'stream=width,height,codec_name', '-of', 'json', file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             data = json.loads(result.stdout)
             stream = data['streams'][0]
             return stream['width'], stream['height']
@@ -1109,7 +1197,7 @@ class TimelineRenderingEngine:
         try:
             cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
                    '-show_entries', 'stream=codec_name', '-of', 'json', file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             data = json.loads(result.stdout)
             return data['streams'][0]['codec_name']
         except:
@@ -1177,136 +1265,145 @@ class TimelineRenderingEngine:
 
             self.log(f"Resolution: {export_width}x{export_height} @ {timeline_fps} FPS")
             self.log(f"Total Duration: {timeline_duration:.2f}s")
-            optional_filters_enabled = has_optional_video_filters(self.settings)
-            self.log(f"Optional codec-tab filters: {'ON' if optional_filters_enabled else 'OFF'}")
-            self.log("Compositor path: decode -> software filter graph -> NVENC encode")
-
-            cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats']
-
-            use_gpu_decode = self.settings.get('use_gpu_decode', False)
-
-            # 1. ADD INPUTS (apply HW decode per-input; required for multi-input graphs)
-            for clip in sorted_clips:
-                codec = self._get_video_codec(clip.file_path)
-                cmd.extend(build_hw_decode_input_args(clip.file_path, codec, use_gpu_decode))
-
-            # 2. BUILD THE COMPOSITING GRAPH
-            filter_complex = []
-
-            # Create the master blank canvas at exact output specs
-            filter_complex.append(f"color=c=black:s={export_width}x{export_height}:r={timeline_fps}:d={timeline_duration}[bg0]")
-
-            audio_inputs = []
-
-            for i, clip in enumerate(sorted_clips):
-                # --- VIDEO GRAPH ---
-                v_in = f"[{i}:v]"
-                v_trimmed = f"[v{i}_trim]"
-                v_scaled = f"[v{i}_scale]"
-
-                # Trim, reset at in-point, then shift PTS to timeline so overlay syncs with master canvas.
-                st = clip.start_time
-                filter_complex.append(
-                    f"{v_in}trim=start={clip.in_point}:end={clip.out_point},"
-                    f"setpts=PTS-STARTPTS+{st:.6f}/TB{v_trimmed}"
-                )
-
-                # Scale the clip perfectly into the canvas dimensions, padding with black if aspect ratio mismatches
-                # Keep per-clip branch lightweight: avoid per-input fps conversion
-                # here and enforce timeline fps once at output stage.
-                scale_str = f"scale={export_width}:{export_height}:force_original_aspect_ratio=decrease,pad={export_width}:{export_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-                filter_complex.append(f"{v_trimmed}{scale_str}{v_scaled}")
-
-                # Overlay the scaled clip onto the running background canvas
-                bg_in = f"[bg{i}]"
-                bg_out = f"[bg{i+1}]"
-                end_time = clip.start_time + clip.get_trimmed_duration()
-                filter_complex.append(f"{bg_in}{v_scaled}overlay=enable='between(t,{clip.start_time},{end_time})':eof_action=pass{bg_out}")
-
-                # --- AUDIO GRAPH ---
-                n_streams = clip.audio_streams
-                for a_idx in range(n_streams):
-                    a_in = f"[{i}:a:{a_idx}]"
-                    a_trimmed = f"[a{i}_{a_idx}_trim]"
-
-                    filter_complex.append(f"{a_in}atrim=start={clip.in_point}:end={clip.out_point},asetpts=PTS-STARTPTS{a_trimmed}")
-
-                    # Compute delay: Base timeline placement + Track sync offset
-                    base_delay_ms = int(clip.start_time * 1000)
-                    sync_offset = clip.sync_offset if hasattr(clip, 'sync_offset') else 0
-
-                    if n_streams > 1 and sync_offset != 0:
-                        if sync_offset > 0 and a_idx == 0:
-                            base_delay_ms += sync_offset
-                        elif sync_offset < 0 and a_idx == 1:
-                            base_delay_ms += abs(sync_offset)
-
-                    vol_db = clip.volumes[a_idx] if a_idx < len(clip.volumes) else 0.0
-                    norm = clip.normalization[a_idx] if a_idx < len(clip.normalization) else False
-
-                    a_ready = f"[a{i}_{a_idx}_ready]"
-
-                    chain = ""
-                    # Apply delay if it exists
-                    if base_delay_ms > 0:
-                        chain += f"adelay={base_delay_ms}|{base_delay_ms},"
-
-                    chain += f"volume={vol_db}dB"
-
-                    if norm:
-                        chain += ",loudnorm"
-
-                    filter_complex.append(f"{a_trimmed}{chain}{a_ready}")
-                    audio_inputs.append(a_ready)
-
-            # --- FINAL OUTPUT MAPPING ---
-            last_v = f"[bg{len(sorted_clips)}]"
-
-            # Apply global user filters
-            # Apply optional user filters first, then normalize fps once globally.
-            user_filters = self._build_video_filters()
-            if user_filters:
-                filter_complex.append(f"{last_v}{','.join(user_filters)}[v_filtered]")
-                pre_fps_v = "[v_filtered]"
+            
+            if not getattr(self, 'is_cache_render', False) and getattr(self, 'valid_cache_path', None) and os.path.exists(self.valid_cache_path):
+                self.log("💎 Found valid background render cache! Bypassing CPU filters for maximum speed...")
+                cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
+                cmd.extend(['-hwaccel', 'auto', '-i', self.valid_cache_path])
+                
+                codec = self.settings.get('video_codec', 'hevc_nvenc')
+                cmd.extend(['-c:v', codec])
+                if 'nvenc' in codec:
+                    cmd.extend(build_nvenc_cbr_args(self.settings, timeline_fps))
+                
+                cmd.extend(['-c:a', 'copy', '-movflags', '+faststart', self.output_path])
             else:
-                pre_fps_v = last_v
+                optional_filters_enabled = has_optional_video_filters(self.settings)
+                self.log(f"Optional codec-tab filters: {'ON' if optional_filters_enabled else 'OFF'}")
+                self.log("Compositor path: decode -> software filter graph -> NVENC encode")
 
-            filter_complex.append(f"{pre_fps_v}fps={timeline_fps}[out_v]")
-            map_v = "[out_v]"
+                cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
+                use_gpu_decode = self.settings.get('use_gpu_decode', False)
 
-            # Mix Audio
-            if audio_inputs:
-                inputs_str = "".join(audio_inputs)
-                filter_complex.append(f"{inputs_str}amix=inputs={len(audio_inputs)}:duration=longest:dropout_transition=0[out_a]")
-                map_a = "[out_a]"
-            else:
-                # Generate silent audio track if completely muted
-                filter_complex.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={timeline_duration}[out_a]")
-                map_a = "[out_a]"
+                # 1. ADD INPUTS
+                for clip in sorted_clips:
+                    codec = self._get_video_codec(clip.file_path)
+                    cmd.extend(build_hw_decode_input_args(clip.file_path, codec, use_gpu_decode))
 
-            # Append graph to command
-            cmd.extend(['-filter_complex', ';'.join(filter_complex)])
-            cmd.extend(['-map', map_v, '-map', map_a])
+                # 2. BUILD THE COMPOSITING GRAPH
+                filter_complex = []
 
-            # 3. ENCODER SETTINGS
-            codec = self.settings.get('video_codec', 'hevc_nvenc')
-            cmd.extend(['-c:v', codec])
-            if 'nvenc' in codec:
-                cmd.extend(build_nvenc_cbr_args(self.settings, timeline_fps))
+                # Create the master blank canvas at exact output specs
+                filter_complex.append(f"color=c=black:s={export_width}x{export_height}:r={timeline_fps}:d={timeline_duration}[bg0]")
 
-            # Set audio encode and explicitly clamp total duration
-            cmd.extend([
-                '-c:a', 'aac', '-b:a', '320k',
-                '-movflags', '+faststart',
-                '-t', f"{timeline_duration:.6f}",
-                self.output_path
-            ])
+                audio_inputs = []
+
+                for i, clip in enumerate(sorted_clips):
+                    # --- VIDEO GRAPH ---
+                    v_in = f"[{i}:v]"
+                    v_trimmed = f"[v{i}_trim]"
+                    v_scaled = f"[v{i}_scale]"
+
+                    st = clip.start_time
+                    filter_complex.append(
+                        f"{v_in}trim=start={clip.in_point}:end={clip.out_point},"
+                        f"setpts=PTS-STARTPTS+{st:.6f}/TB{v_trimmed}"
+                    )
+
+                    scale_str = f"scale={export_width}:{export_height}:force_original_aspect_ratio=decrease,pad={export_width}:{export_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+                    filter_complex.append(f"{v_trimmed}{scale_str}{v_scaled}")
+
+                    # Overlay the scaled clip onto the running background canvas
+                    bg_in = f"[bg{i}]"
+                    bg_out = f"[bg{i+1}]"
+                    end_time = clip.start_time + clip.get_trimmed_duration()
+                    filter_complex.append(f"{bg_in}{v_scaled}overlay=enable='between(t,{clip.start_time},{end_time})':eof_action=pass{bg_out}")
+
+                    # --- AUDIO GRAPH ---
+                    n_streams = clip.audio_streams
+                    for a_idx in range(n_streams):
+                        a_in = f"[{i}:a:{a_idx}]"
+                        a_trimmed = f"[a{i}_{a_idx}_trim]"
+
+                        filter_complex.append(f"{a_in}atrim=start={clip.in_point}:end={clip.out_point},asetpts=PTS-STARTPTS{a_trimmed}")
+
+                        # Compute delay: Base timeline placement + Track sync offset
+                        base_delay_ms = int(clip.start_time * 1000)
+                        sync_offset = clip.sync_offset if hasattr(clip, 'sync_offset') else 0
+
+                        if n_streams > 1 and sync_offset != 0:
+                            if sync_offset > 0 and a_idx == 0:
+                                base_delay_ms += sync_offset
+                            elif sync_offset < 0 and a_idx == 1:
+                                base_delay_ms += abs(sync_offset)
+
+                        vol_db = clip.volumes[a_idx] if a_idx < len(clip.volumes) else 0.0
+                        norm = clip.normalization[a_idx] if a_idx < len(clip.normalization) else False
+
+                        a_ready = f"[a{i}_{a_idx}_ready]"
+
+                        chain = ""
+                        # Apply delay if it exists
+                        if base_delay_ms > 0:
+                            chain += f"adelay={base_delay_ms}|{base_delay_ms},"
+
+                        chain += f"volume={vol_db}dB"
+
+                        if norm:
+                            chain += ",loudnorm"
+
+                        filter_complex.append(f"{a_trimmed}{chain}{a_ready}")
+                        audio_inputs.append(a_ready)
+
+                # --- FINAL OUTPUT MAPPING ---
+                last_v = f"[bg{len(sorted_clips)}]"
+
+                user_filters = self._build_video_filters()
+                if user_filters:
+                    filter_complex.append(f"{last_v}{','.join(user_filters)}[v_filtered]")
+                    pre_fps_v = "[v_filtered]"
+                else:
+                    pre_fps_v = last_v
+
+                filter_complex.append(f"{pre_fps_v}fps={timeline_fps}[out_v]")
+                map_v = "[out_v]"
+
+                # Mix Audio
+                if audio_inputs:
+                    inputs_str = "".join(audio_inputs)
+                    filter_complex.append(f"{inputs_str}amix=inputs={len(audio_inputs)}:duration=longest:dropout_transition=0[out_a]")
+                    map_a = "[out_a]"
+                else:
+                    # Generate silent audio track if completely muted
+                    filter_complex.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={timeline_duration}[out_a]")
+                    map_a = "[out_a]"
+
+                cmd.extend(['-filter_complex', ';'.join(filter_complex)])
+                cmd.extend(['-map', map_v, '-map', map_a])
+
+                # 3. ENCODER SETTINGS
+                if getattr(self, 'is_cache_render', False):
+                    # For cache render, use visually lossless fast NVENC
+                    codec = 'hevc_nvenc'
+                    cmd.extend(['-c:v', codec, '-preset', 'p6', '-tune', 'hq', '-cq', '15', '-b:v', '0'])
+                    cmd.extend(['-c:a', 'aac', '-b:a', '320k', '-movflags', '+faststart', '-y', self.output_path])
+                else:
+                    codec = self.settings.get('video_codec', 'hevc_nvenc')
+                    cmd.extend(['-c:v', codec])
+                    if 'nvenc' in codec:
+                        cmd.extend(build_nvenc_cbr_args(self.settings, timeline_fps))
+                    cmd.extend([
+                        '-c:a', 'aac', '-b:a', '320k',
+                        '-movflags', '+faststart',
+                        '-t', f"{timeline_duration:.6f}",
+                        self.output_path
+                    ])
 
             self.log(f"Compositing execution started...")
 
             start_time = time.time()
             self.encoder_process = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
 
             # 4. MONITOR PROGRESS
@@ -1390,7 +1487,7 @@ class EncodingThread(QThread):
             cmd = self.build_ffmpeg_command()
             self.log_message.emit(f"Command: {' '.join(cmd)}")
             self.status.emit("Starting encode...")
-            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1)
+            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             duration = self.get_duration()
             for line in iter(self.process.stderr.readline, ''):
                 if self.should_stop:
@@ -1476,16 +1573,22 @@ class EncodingThread(QThread):
 
         if filter_complex: cmd.extend(['-vf', ','.join(filter_complex)])
         codec = self.settings['video_codec']
-        cmd.extend(['-c:v', codec])
-        if codec == 'prores_ks':
-            profile = self.settings['prores_profile']
-            target_bitrate_mbps = self.settings.get('bitrate_mbps', 500)
-            qscale = 9 if target_bitrate_mbps >= 500 else 11 if target_bitrate_mbps >= 300 else 13 if target_bitrate_mbps >= 150 else 15
-            cmd.extend(['-profile:v', str(profile), '-vendor', 'apl0', '-qscale:v', str(qscale)])
-        elif 'nvenc' in codec:
-            if self.settings['use_gpu']:
-                cmd.extend(build_nvenc_cbr_args(self.settings, 30))
-            else: cmd.extend(['-preset', 'medium'])
+        
+        # New Remux Support
+        if codec == 'copy':
+            cmd.extend(['-c:v', 'copy'])
+        else:
+            cmd.extend(['-c:v', codec])
+            if codec == 'prores_ks':
+                profile = self.settings['prores_profile']
+                target_bitrate_mbps = self.settings.get('bitrate_mbps', 500)
+                qscale = 9 if target_bitrate_mbps >= 500 else 11 if target_bitrate_mbps >= 300 else 13 if target_bitrate_mbps >= 150 else 15
+                cmd.extend(['-profile:v', str(profile), '-vendor', 'apl0', '-qscale:v', str(qscale)])
+            elif 'nvenc' in codec:
+                if self.settings['use_gpu']:
+                    cmd.extend(build_nvenc_cbr_args(self.settings, 30))
+                else: cmd.extend(['-preset', 'medium'])
+                
         cmd.extend(['-c:a', self.settings['audio_codec']])
         if self.settings['audio_codec'] == 'aac': cmd.extend(['-b:a', '320k'])
         if self.settings['threads'] > 0: cmd.extend(['-threads', str(self.settings['threads'])])
@@ -1494,7 +1597,7 @@ class EncodingThread(QThread):
 
     def get_duration(self):
         try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.input_file], capture_output=True, text=True, )
+            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.input_file], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             return float(result.stdout.strip())
         except:
             return 0
@@ -1510,7 +1613,6 @@ class FastEncodeProApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"FastEncode Pro v{__version__} - Accessible Video Editor")
-        # Fit inside the work area (excludes Win11 taskbar) so the timeline is not covered.
         screen = QApplication.primaryScreen()
         if screen is not None:
             ag = screen.availableGeometry()
@@ -1534,7 +1636,6 @@ class FastEncodeProApp(QMainWindow):
 
         self.timeline_duration = 0
         self.is_timeline_mode = False
-        # True after ruler/empty-timeline click: Play runs full EDL. False after a clip is selected for preview.
         self._play_uses_timeline_edl = False
 
         self.dwell_filter = DwellClickFilter(self)
@@ -1542,6 +1643,11 @@ class FastEncodeProApp(QMainWindow):
 
         self.app_settings = QSettings("FastEncodePro", "App")
         self.output_folder = self.app_settings.value("output_folder", "")
+        
+        self.cache_status_label = QLabel("Cache: Inactive")
+        self.cache_status_label.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 14px;")
+        self.cache_manager = TimelineCacheManager(self)
+        self.cache_manager.status_changed.connect(self.cache_status_label.setText)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1661,6 +1767,10 @@ class FastEncodeProApp(QMainWindow):
         load_proj_btn.setMinimumHeight(40)
         load_proj_btn.clicked.connect(self.load_project)
         project_controls.addWidget(load_proj_btn)
+        
+        project_controls.addStretch()
+        project_controls.addWidget(self.cache_status_label)
+        
         layout.addLayout(project_controls)
 
         top_section = QWidget()
@@ -1893,8 +2003,9 @@ class FastEncodeProApp(QMainWindow):
         codec_row = QHBoxLayout()
         codec_row.addWidget(QLabel("Codec:"))
         self.codec_combo = QComboBox()
-        self.codec_combo.addItems(["ProRes", "H.264 (NVENC)", "H.265/HEVC (NVENC)"])
-        self.codec_combo.setCurrentIndex(0)
+        # ADDED REMUX (COPY) OPTION HERE
+        self.codec_combo.addItems(["ProRes", "H.264 (NVENC)", "H.265/HEVC (NVENC)", "Remux (Copy Stream)"])
+        self.codec_combo.setCurrentIndex(2)
         self.codec_combo.setStyleSheet(self.combo_style())
         self.codec_combo.currentIndexChanged.connect(self.on_codec_changed)
         codec_row.addWidget(self.codec_combo)
@@ -2239,19 +2350,41 @@ class FastEncodeProApp(QMainWindow):
 
     def _on_position_changed(self, position_ms):
         """Handle video position updates"""
-        if self.video_widget and self.video_widget.duration() > 0:
-            slider_value = int((position_ms / self.video_widget.duration()) * 1000)
-            self.preview_slider.setValue(slider_value)
+        if self.video_widget:
+            dur = self.video_widget.duration()
+            if dur <= 0 and self.is_timeline_mode and self._play_uses_timeline_edl:
+                dur = int(self.timeline.get_timeline_duration() * 1000)
+            if dur > 0:
+                slider_value = int((position_ms / dur) * 1000)
+                self.preview_slider.setValue(slider_value)
 
+        dur_display = 0
+        if self.video_widget:
+            dur_display = self.video_widget.duration()
+            if dur_display <= 0 and self.is_timeline_mode and self._play_uses_timeline_edl:
+                dur_display = int(self.timeline.get_timeline_duration() * 1000)
         current_tc = self.format_timecode(position_ms)
-        total_tc = self.format_timecode(self.video_widget.duration() if self.video_widget else 0)
+        total_tc = self.format_timecode(dur_display)
         self.timecode_label.setText(f"{current_tc} / {total_tc}")
 
+        # Update Timeline Playhead automatically
+        if not self.timeline.dragging_playhead:
+            if self.is_timeline_mode and self._play_uses_timeline_edl:
+                self.timeline.set_playhead_position(position_ms / 1000.0, auto_scroll=True, emit_signal=False)
+            elif self.is_timeline_mode and self.current_media is None and getattr(self.timeline, 'selected_clip', None):
+                clip = self.timeline.selected_clip
+                file_sec = position_ms / 1000.0
+                tl_time = clip.start_time + (file_sec - clip.in_point)
+                self.timeline.set_playhead_position(tl_time, auto_scroll=True, emit_signal=False)
+
     def _on_duration_changed(self, duration_ms):
-        """Handle video duration updates"""
-        # Don't read position() here - it's 0 during file load before seek completes.
-        # Use _position_ms directly from the widget which is set correctly by seek.
-        current_ms = self.video_widget._position_ms if self.video_widget else 0
+        if duration_ms <= 0 and self.is_timeline_mode and self._play_uses_timeline_edl:
+            duration_ms = int(self.timeline.get_timeline_duration() * 1000)
+        if self.video_widget:
+            pending = self.video_widget._pending_seek_ms
+            current_ms = pending if pending is not None else self.video_widget._position_ms
+        else:
+            current_ms = 0
         current_tc = self.format_timecode(current_ms)
         total_tc = self.format_timecode(duration_ms)
         self.timecode_label.setText(f"{current_tc} / {total_tc}")
@@ -2286,6 +2419,48 @@ class FastEncodeProApp(QMainWindow):
         self.is_timeline_mode = True
         self._play_uses_timeline_edl = True
         self.trim_info.setText("Timeline Mode Active - Click Play to Preview Sequence")
+        self.load_timeline_sequence(play=False)
+
+    def load_timeline_sequence(self, play=False):
+        if not self.timeline.clips:
+            if self.video_widget:
+                self.video_widget.stop()
+            return
+
+        sorted_clips = sorted(self.timeline.clips, key=lambda c: c.start_time)
+        edl_content = "# mpv EDL v0\n"
+        for clip in sorted_clips:
+            length = clip.get_trimmed_duration()
+            fp = clip.file_path.replace('\\', '/')
+            fp_bytes = fp.encode('utf-8')
+            edl_content += f"%{len(fp_bytes)}%{fp},{clip.in_point},{length}\n"
+
+        try:
+            fd, path = tempfile.mkstemp(suffix='.edl')
+            os.close(fd)
+            with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(edl_content)
+
+            self.video_widget.set_audio_complex_filter("")
+
+            edl_path = path.replace('\\', '/')
+            seek_ms = int(self.timeline.playhead_position * 1000)
+            
+            if self.video_widget.load_file(edl_path, seek_ms=seek_ms):
+                # Set timeline-derived duration immediately as fallback
+                # so scrubber/timecode work before MPV's async observer fires
+                timeline_dur_ms = int(self.timeline.get_timeline_duration() * 1000)
+                if self.video_widget._duration_ms <= 0:
+                    self.video_widget._duration_ms = timeline_dur_ms
+                    self.video_widget.durationChanged.emit(timeline_dur_ms)
+                if play:
+                    self.video_widget.play()
+                    self.play_btn.setText("⏸️ Pause")
+                else:
+                    self.video_widget.pause()
+                    self.play_btn.setText("▶️ Play")
+        except Exception as e:
+            pass
 
     def on_timeline_clip_selected(self, clip):
         self.is_timeline_mode = True
@@ -2493,37 +2668,33 @@ class FastEncodeProApp(QMainWindow):
             self.append_log(f"❌ Auto-sync failed: {e}")
 
     def on_timeline_playhead_moved(self, time):
-        """Timeline scrubber dragged - seek the player to match."""
         if not self.video_widget:
             return
-        seek_ms = int(time * 1000)
-        if self._play_uses_timeline_edl:
-            # Playing full timeline EDL - seek within it
-            if self.video_widget.duration() > 0:
-                self.video_widget.seek(seek_ms)
+        if getattr(self, '_play_uses_timeline_edl', False):
+            self.video_widget.seek(int(time * 1000))
         else:
-            # Single clip selected - seek within the clip, accounting for in_point
-            clip = self.timeline.selected_clip
-            if clip and self.video_widget.duration() > 0:
-                # Convert timeline time to position within the clip
-                clip_time = time - clip.start_time + clip.in_point
+            clip = getattr(self.timeline, 'selected_clip', None)
+            if clip:
+                clip_time = clip.in_point + (time - clip.start_time)
                 clip_time = max(clip.in_point, min(clip.out_point, clip_time))
                 self.video_widget.seek(int(clip_time * 1000))
 
     def toggle_play(self):
         if not self.video_widget:
             return
-
-        # With a clip selected we are previewing that file in MPV — Play must not swap to EDL playback
-        # unless the user chose whole-timeline mode (ruler / empty track click).
-        play_full_timeline_edl = (
-            self.is_timeline_mode
-            and self.video_widget.is_paused()
-            and self._play_uses_timeline_edl
-        )
-        if play_full_timeline_edl:
-            self.play_timeline_sequence()
-        elif self.video_widget.is_paused():
+        if self.is_timeline_mode and self._play_uses_timeline_edl:
+            if not self.video_widget.current_file:
+                self.load_timeline_sequence(play=True)
+                return
+            if not self.video_widget.is_paused():
+                self.video_widget.pause()
+                self.play_btn.setText("▶️ Play")
+            else:
+                self.video_widget.play()
+                self.play_btn.setText("⏸️ Pause")
+            return
+            
+        if self.video_widget.is_paused():
             self.video_widget.play()
             self.play_btn.setText("⏸️ Pause")
         else:
@@ -2531,33 +2702,7 @@ class FastEncodeProApp(QMainWindow):
             self.play_btn.setText("▶️ Play")
 
     def play_timeline_sequence(self):
-        if not self.timeline.clips:
-            return
-
-        edl_content = "# mpv EDL v0\n"
-        sorted_clips = sorted(self.timeline.clips, key=lambda c: c.start_time)
-
-        for clip in sorted_clips:
-            length = clip.get_trimmed_duration()
-            # MPV EDL is picky about Windows backslashes; use forward slashes in entries.
-            fp = os.path.normpath(clip.file_path).replace('\\', '/')
-            edl_content += f"{fp},{clip.in_point},{length}\n"
-
-        try:
-            fd, path = tempfile.mkstemp(suffix='.edl', text=True)
-            with os.fdopen(fd, 'w') as f:
-                f.write(edl_content)
-
-            # EDL switches files; lavfi from one clip breaks after the first segment — use native audio.
-            self.video_widget.set_audio_complex_filter("")
-
-            edl_path = os.path.normpath(path).replace('\\', '/')
-            seek_ms = int(self.timeline.playhead_position * 1000)
-            if self.video_widget.load_file(edl_path, seek_ms=seek_ms):
-                self.video_widget.play()
-                self.play_btn.setText("⏸️ Pause")
-        except Exception as e:
-            pass
+        self.load_timeline_sequence(play=True)
 
     def update_play_button(self):
         if self.video_widget:
@@ -2567,9 +2712,16 @@ class FastEncodeProApp(QMainWindow):
                 self.play_btn.setText("▶️ Play")
 
     def seek_preview(self, value):
-        if self.video_widget and self.video_widget.duration() > 0:
-            position_ms = int((value / 1000.0) * self.video_widget.duration())
+        if not self.video_widget:
+            return
+        dur = self.video_widget.duration()
+        if dur <= 0 and self.is_timeline_mode and self._play_uses_timeline_edl:
+            dur = int(self.timeline.get_timeline_duration() * 1000)
+        if dur > 0:
+            position_ms = int((value / 1000.0) * dur)
             self.video_widget.seek(position_ms)
+            if self.is_timeline_mode and getattr(self, '_play_uses_timeline_edl', False):
+                self.timeline.set_playhead_position(position_ms / 1000.0, auto_scroll=True, emit_signal=False)
 
     def format_timecode(self, ms):
         s = ms // 1000
@@ -2631,6 +2783,10 @@ class FastEncodeProApp(QMainWindow):
         else:
             self.timeline_duration = 0
         self.update_estimated_size()
+        
+        # Keep EDL synced if we are currently looking at the full timeline
+        if getattr(self, 'is_timeline_mode', False) and getattr(self, '_play_uses_timeline_edl', False):
+            self.load_timeline_sequence(play=False)
 
     def zoom_in_timeline(self):
         self.timeline.zoom_in()
@@ -2671,6 +2827,8 @@ class FastEncodeProApp(QMainWindow):
         if codec_idx == 0:
             profile_names = ["Proxy", "LT", "Standard", "HQ", "4444", "4444 XQ"]
             self.gpu_info.setText(f"✅ ProRes {profile_names[self.prores_combo.currentIndex()]} (~{value} Mbps CBR) | {decode_status}")
+        elif codec_idx == 3:
+            self.gpu_info.setText("✅ Remux (Copy Stream) | No encoding processing")
         else:
             target_idx = self.export_target_combo.currentIndex()
             target_name = get_export_target_labels()[target_idx]
@@ -3224,7 +3382,7 @@ class FastEncodeProApp(QMainWindow):
         self.save_settings()
 
     def get_settings(self):
-        codec_map = {0: "prores_ks", 1: "h264_nvenc", 2: "hevc_nvenc"}
+        codec_map = {0: "prores_ks", 1: "h264_nvenc", 2: "hevc_nvenc", 3: "copy"}
         audio_map = {0: "pcm_s24le", 1: "pcm_s16le", 2: "aac", 3: "copy"}
 
         fps_values = [23.976, 24, 25, 29.97, 30, 50, 60, 120]

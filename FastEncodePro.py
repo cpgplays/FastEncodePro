@@ -82,15 +82,86 @@ from PyQt6.QtGui import QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor
 __version__ = "0.9.0"
 __author__ = "cpgplays"
 
+# --- SHARED CONSTANTS ---
+
+SUBPROCESS_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+
+TIMELINE_FPS_VALUES = [23.976, 24, 25, 29.97, 30, 50, 60, 120]
+TIMELINE_FPS_LABELS = ["23.976", "24", "25", "29.97", "30", "50", "60", "120"]
+
+# Index 0 means "Source" (keep the resolution of the first clip).
+EXPORT_RESOLUTIONS = [None, (1920, 1080), (2560, 1440), (3840, 2160), (5120, 2880), (7680, 4320)]
+EXPORT_RESOLUTION_LABELS = ["Source"] + [f"{w}x{h}" for w, h in EXPORT_RESOLUTIONS[1:]]
+
+PRORES_PROFILE_NAMES = ["Proxy", "LT", "Standard", "HQ", "4444", "4444 XQ"]
+SCALE_ALGOS = ['bilinear', 'bicubic', 'lanczos', 'spline']
+SCALE_ALGO_LABELS = ["Bilinear", "Bicubic", "Lanczos", "Spline"]
+
+DENOISE_FILTERS = ['', 'hqdn3d=1.5:1.5:6:6', 'hqdn3d=2:2:8:8', 'hqdn3d=3:3:10:10',
+                   'hqdn3d=4:4:12:12', 'hqdn3d=6:6:15:15', 'hqdn3d=8:8:18:18']
+DEFLICKER_FILTERS = ['', 'deflicker=mode=pm:size=5', 'deflicker=mode=pm:size=10',
+                     'deflicker=mode=pm:size=15', 'deflicker=mode=am:size=20', 'deflicker=mode=am:size=30']
+EXPOSURE_FILTERS = {
+    1: 'eq=brightness=0.05:saturation=1.1',   2: 'eq=brightness=0.1:saturation=1.15',
+    3: 'eq=brightness=0.15:saturation=1.2',   4: 'eq=brightness=0.2:saturation=1.25',
+    5: 'eq=brightness=0.3:saturation=1.3',    6: 'eq=brightness=0.4:saturation=1.35',
+    7: 'eq=brightness=-0.05:saturation=0.95', 8: 'eq=brightness=-0.1:saturation=0.9',
+    9: 'eq=brightness=-0.15:saturation=0.85', 10: 'eq=brightness=-0.2:saturation=0.8',
+    11: 'eq=brightness=-0.3:saturation=0.75', 12: 'eq=brightness=-0.4:saturation=0.7',
+}
+TEMPORAL_FILTERS = ['', 'tmix=frames=3:weights="1 1 1"', 'tmix=frames=5:weights="1 1 2 1 1"',
+                    'tmix=frames=7:weights="1 1 2 2 2 1 1"', 'tmix=frames=9:weights="1 1 2 3 3 3 2 1 1"',
+                    'tmix=frames=11:weights="1 2 2 3 4 4 4 3 2 2 1"']
+SHARPNESS_FILTERS = ['', 'unsharp=3:3:0.3:3:3:0', 'unsharp=5:5:0.5:5:5:0', 'unsharp=5:5:0.8:5:5:0.4',
+                     'unsharp=5:5:1.2:5:5:0.6', 'unsharp=7:7:1.5:7:7:0.8', 'unsharp=7:7:2.0:7:7:1.0']
+
+FFMPEG_BASE_ARGS = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
+
+# --- SUBPROCESS / FFPROBE HELPERS ---
+
+def run_process(cmd, timeout=None, text=True, check=False):
+    """Run ``cmd`` capturing output, without spawning a console window on Windows."""
+    return subprocess.run(cmd, capture_output=True, text=text, timeout=timeout,
+                          check=check, creationflags=SUBPROCESS_NO_WINDOW)
+
+
+def start_streaming_process(cmd, bufsize=-1):
+    """Start ``cmd`` with a line-readable stderr pipe used for FFmpeg progress parsing."""
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            universal_newlines=True, bufsize=bufsize,
+                            creationflags=SUBPROCESS_NO_WINDOW)
+
+
+def probe_media_duration(file_path, default=0.0):
+    try:
+        result = run_process(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                              '-of', 'default=noprint_wrappers=1:nokey=1', file_path])
+        return float(result.stdout.strip())
+    except Exception:
+        return default
+
+
+def probe_video_stream(file_path, entries):
+    """Return the first video stream as a dict of the requested ``entries``."""
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+           '-show_entries', f'stream={entries}', '-of', 'json', file_path]
+    result = run_process(cmd, timeout=5)
+    return json.loads(result.stdout)['streams'][0]
+
+
+def probe_audio_stream_indices(file_path):
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index',
+           '-of', 'csv=p=0', file_path]
+    result = run_process(cmd, timeout=5, check=True)
+    return [int(x) for x in result.stdout.strip().splitlines() if x.strip()]
+
+
 # --- HELPER FUNCTIONS ---
 
 def get_audio_stream_count_static(filepath):
     try:
-        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', filepath]
-        out = subprocess.check_output(cmd, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).decode().strip()
-        if not out: return 0
-        return len(out.splitlines())
-    except:
+        return len(probe_audio_stream_indices(filepath))
+    except Exception:
         return 1
 
 
@@ -153,6 +224,25 @@ def has_optional_video_filters(settings):
     )
 
 
+def build_video_filter_chain(settings):
+    """Optional codec-tab filters, in the order they are applied to the video."""
+    filters = []
+    for key, table in (('denoise_level', DENOISE_FILTERS),
+                       ('deflicker_level', DEFLICKER_FILTERS),
+                       ('exposure_level', EXPOSURE_FILTERS),
+                       ('temporal_level', TEMPORAL_FILTERS),
+                       ('sharpness_level', SHARPNESS_FILTERS)):
+        level = settings.get(key, 0)
+        if level <= 0:
+            continue
+        if isinstance(table, dict):
+            if level in table:
+                filters.append(table[level])
+        elif level < len(table):
+            filters.append(table[level])
+    return filters
+
+
 def detect_hardware_capabilities():
     caps = {
         'nvidia_smi': False,
@@ -165,10 +255,7 @@ def detect_hardware_capabilities():
     try:
         if shutil.which('nvidia-smi'):
             caps['nvidia_smi'] = True
-            smi = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=2, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
+            smi = run_process(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], timeout=2)
             name = (smi.stdout or '').strip().splitlines()
             if name and name[0]:
                 caps['gpu_name'] = name[0]
@@ -176,7 +263,7 @@ def detect_hardware_capabilities():
         pass
 
     try:
-        enc = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        enc = run_process(['ffmpeg', '-hide_banner', '-encoders'], timeout=3)
         enc_text = (enc.stdout or '') + (enc.stderr or '')
         caps['nvenc_h264'] = 'h264_nvenc' in enc_text
         caps['nvenc_hevc'] = 'hevc_nvenc' in enc_text
@@ -184,7 +271,7 @@ def detect_hardware_capabilities():
         pass
 
     try:
-        dec = subprocess.run(['ffmpeg', '-hide_banner', '-decoders'], capture_output=True, text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        dec = run_process(['ffmpeg', '-hide_banner', '-decoders'], timeout=3)
         dec_text = (dec.stdout or '') + (dec.stderr or '')
         caps['nvdec'] = ('h264_cuvid' in dec_text) or ('hevc_cuvid' in dec_text) or ('av1_cuvid' in dec_text)
     except Exception:
@@ -213,7 +300,8 @@ class WaveformWorker(QThread):
                 temp_png
             ]
 
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=SUBPROCESS_NO_WINDOW)
 
             if os.path.exists(temp_png):
                 image = QImage(temp_png)
@@ -575,11 +663,7 @@ class TimelineClip:
             self.out_point = self.full_duration
 
     def get_video_duration(self):
-        try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.file_path], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            return float(result.stdout.strip())
-        except:
-            return 60.0
+        return probe_media_duration(self.file_path, default=60.0)
 
     def get_trimmed_duration(self):
         return self.out_point - self.in_point
@@ -889,11 +973,7 @@ class MediaLibraryItem:
         self.out_point = self.duration
 
     def get_video_duration(self):
-        try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.file_path], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            return float(result.stdout.strip())
-        except:
-            return 60.0
+        return probe_media_duration(self.file_path, default=60.0)
 
     def get_trimmed_duration(self):
         return self.out_point - self.in_point
@@ -912,28 +992,43 @@ def _parse_ffmpeg_time(line):
         pass
     return None
 
-def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress_callback=None):
-    import subprocess
-    import tempfile
-    import os
 
+def iter_ffmpeg_progress(process, duration):
+    """Yield ``(line, seconds, percent)`` per stderr line; ``percent`` is None until FFmpeg reports a time."""
+    for line in iter(process.stderr.readline, ''):
+        seconds = _parse_ffmpeg_time(line)
+        percent = None
+        if seconds is not None and duration > 0:
+            percent = min(99, int((seconds / duration) * 100))
+        yield line, seconds, percent
+
+
+def extract_audio_track_pcm(video_file, track, output_path, sample_duration, sample_rate):
+    """Decode one audio track to raw mono 16-bit PCM for correlation analysis."""
+    cmd = [
+        'ffmpeg', '-y', '-v', 'error',
+        '-i', video_file,
+        '-map', f'0:a:{track}',
+        '-t', str(sample_duration),
+        '-ac', '1',
+        '-ar', str(sample_rate),
+        '-f', 's16le',
+        output_path
+    ]
+    result = run_process(cmd, timeout=60, text=False)
+    if result.returncode != 0:
+        raise Exception(f"Failed to extract track {track}: {result.stderr.decode()}")
+
+
+def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress_callback=None):
     def log(msg):
         if progress_callback:
             progress_callback(msg)
 
     log("Extracting audio tracks...")
 
-    probe_cmd = [
-        'ffprobe', '-v', 'error',
-        '-select_streams', 'a',
-        '-show_entries', 'stream=index',
-        '-of', 'csv=p=0',
-        video_file
-    ]
-
     try:
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        audio_tracks = [int(x) for x in result.stdout.strip().split('\n') if x]
+        audio_tracks = probe_audio_stream_indices(video_file)
 
         if track1 >= len(audio_tracks) or track2 >= len(audio_tracks):
             raise Exception(f"File has {len(audio_tracks)} audio tracks, cannot access track {max(track1, track2)}")
@@ -954,36 +1049,10 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
         sample_rate = 16000
 
         log(f"Extracting track {track1} (reference)...")
-        extract1_cmd = [
-            'ffmpeg', '-y', '-v', 'error',
-            '-i', video_file,
-            '-map', f'0:a:{track1}',
-            '-t', str(sample_duration),
-            '-ac', '1',
-            '-ar', str(sample_rate),
-            '-f', 's16le',
-            tmp1_path
-        ]
-
-        result = subprocess.run(extract1_cmd, capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        if result.returncode != 0:
-            raise Exception(f"Failed to extract track {track1}: {result.stderr.decode()}")
+        extract_audio_track_pcm(video_file, track1, tmp1_path, sample_duration, sample_rate)
 
         log(f"Extracting track {track2} (to sync)...")
-        extract2_cmd = [
-            'ffmpeg', '-y', '-v', 'error',
-            '-i', video_file,
-            '-map', f'0:a:{track2}',
-            '-t', str(sample_duration),
-            '-ac', '1',
-            '-ar', str(sample_rate),
-            '-f', 's16le',
-            tmp2_path
-        ]
-
-        result = subprocess.run(extract2_cmd, capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        if result.returncode != 0:
-            raise Exception(f"Failed to extract track {track2}: {result.stderr.decode()}")
+        extract_audio_track_pcm(video_file, track2, tmp2_path, sample_duration, sample_rate)
 
         size1 = os.path.getsize(tmp1_path)
         size2 = os.path.getsize(tmp2_path)
@@ -1184,60 +1253,16 @@ class TimelineRenderingEngine:
 
     def get_video_metadata(self, file_path):
         try:
-            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                   '-show_entries', 'stream=width,height,codec_name', '-of', 'json', file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            data = json.loads(result.stdout)
-            stream = data['streams'][0]
+            stream = probe_video_stream(file_path, 'width,height,codec_name')
             return stream['width'], stream['height']
-        except:
+        except Exception:
             return 1920, 1080
 
     def _get_video_codec(self, file_path):
         try:
-            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                   '-show_entries', 'stream=codec_name', '-of', 'json', file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            data = json.loads(result.stdout)
-            return data['streams'][0]['codec_name']
-        except:
+            return probe_video_stream(file_path, 'codec_name')['codec_name']
+        except Exception:
             return 'unknown'
-
-    def _build_video_filters(self):
-        filters = []
-        denoise = self.settings.get('denoise_level', 0)
-        if denoise > 0:
-            vals = ['', 'hqdn3d=1.5:1.5:6:6', 'hqdn3d=2:2:8:8', 'hqdn3d=3:3:10:10',
-                    'hqdn3d=4:4:12:12', 'hqdn3d=6:6:15:15', 'hqdn3d=8:8:18:18']
-            if denoise < len(vals): filters.append(vals[denoise])
-        deflicker = self.settings.get('deflicker_level', 0)
-        if deflicker > 0:
-            vals = ['', 'deflicker=mode=pm:size=5', 'deflicker=mode=pm:size=10',
-                    'deflicker=mode=pm:size=15', 'deflicker=mode=am:size=20', 'deflicker=mode=am:size=30']
-            if deflicker < len(vals): filters.append(vals[deflicker])
-        exposure = self.settings.get('exposure_level', 0)
-        if exposure > 0:
-            exp_map = {
-                1: 'eq=brightness=0.05:saturation=1.1',   2: 'eq=brightness=0.1:saturation=1.15',
-                3: 'eq=brightness=0.15:saturation=1.2',   4: 'eq=brightness=0.2:saturation=1.25',
-                5: 'eq=brightness=0.3:saturation=1.3',    6: 'eq=brightness=0.4:saturation=1.35',
-                7: 'eq=brightness=-0.05:saturation=0.95', 8: 'eq=brightness=-0.1:saturation=0.9',
-                9: 'eq=brightness=-0.15:saturation=0.85', 10: 'eq=brightness=-0.2:saturation=0.8',
-                11: 'eq=brightness=-0.3:saturation=0.75', 12: 'eq=brightness=-0.4:saturation=0.7',
-            }
-            if exposure in exp_map: filters.append(exp_map[exposure])
-        temporal = self.settings.get('temporal_level', 0)
-        if temporal > 0:
-            vals = ['', 'tmix=frames=3:weights="1 1 1"', 'tmix=frames=5:weights="1 1 2 1 1"',
-                    'tmix=frames=7:weights="1 1 2 2 2 1 1"', 'tmix=frames=9:weights="1 1 2 3 3 3 2 1 1"',
-                    'tmix=frames=11:weights="1 2 2 3 4 4 4 3 2 2 1"']
-            if temporal < len(vals): filters.append(vals[temporal])
-        sharpness = self.settings.get('sharpness_level', 0)
-        if sharpness > 0:
-            vals = ['', 'unsharp=3:3:0.3:3:3:0', 'unsharp=5:5:0.5:5:5:0', 'unsharp=5:5:0.8:5:5:0.4',
-                    'unsharp=5:5:1.2:5:5:0.6', 'unsharp=7:7:1.5:7:7:0.8', 'unsharp=7:7:2.0:7:7:1.0']
-            if sharpness < len(vals): filters.append(vals[sharpness])
-        return filters
 
     def render(self):
         try:
@@ -1253,11 +1278,11 @@ class TimelineRenderingEngine:
 
             source_width, source_height = self.get_video_metadata(sorted_clips[0].file_path)
             export_res_index = self.settings.get('export_res_index', 0)
-            if export_res_index == 0:
+            export_resolution = EXPORT_RESOLUTIONS[export_res_index]
+            if export_resolution is None:
                 export_width, export_height = source_width, source_height
             else:
-                res_map = {1: (1920, 1080), 2: (2560, 1440), 3: (3840, 2160), 4: (5120, 2880), 5: (7680, 4320)}
-                export_width, export_height = res_map[export_res_index]
+                export_width, export_height = export_resolution
 
             # ENSURE EVEN DIMENSIONS (Prevents NVENC padding crash)
             if export_width % 2 != 0: export_width -= 1
@@ -1268,7 +1293,7 @@ class TimelineRenderingEngine:
             
             if not getattr(self, 'is_cache_render', False) and getattr(self, 'valid_cache_path', None) and os.path.exists(self.valid_cache_path):
                 self.log("💎 Found valid background render cache! Bypassing CPU filters for maximum speed...")
-                cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
+                cmd = list(FFMPEG_BASE_ARGS)
                 cmd.extend(['-hwaccel', 'auto', '-i', self.valid_cache_path])
                 
                 codec = self.settings.get('video_codec', 'hevc_nvenc')
@@ -1282,7 +1307,7 @@ class TimelineRenderingEngine:
                 self.log(f"Optional codec-tab filters: {'ON' if optional_filters_enabled else 'OFF'}")
                 self.log("Compositor path: decode -> software filter graph -> NVENC encode")
 
-                cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
+                cmd = list(FFMPEG_BASE_ARGS)
                 use_gpu_decode = self.settings.get('use_gpu_decode', False)
 
                 # 1. ADD INPUTS
@@ -1358,7 +1383,7 @@ class TimelineRenderingEngine:
                 # --- FINAL OUTPUT MAPPING ---
                 last_v = f"[bg{len(sorted_clips)}]"
 
-                user_filters = self._build_video_filters()
+                user_filters = build_video_filter_chain(self.settings)
                 if user_filters:
                     filter_complex.append(f"{last_v}{','.join(user_filters)}[v_filtered]")
                     pre_fps_v = "[v_filtered]"
@@ -1402,19 +1427,15 @@ class TimelineRenderingEngine:
             self.log(f"Compositing execution started...")
 
             start_time = time.time()
-            self.encoder_process = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
+            self.encoder_process = start_streaming_process(cmd)
 
             # 4. MONITOR PROGRESS
-            for line in iter(self.encoder_process.stderr.readline, ''):
+            for _line, t, pct in iter_ffmpeg_progress(self.encoder_process, timeline_duration):
                 if self.should_stop:
                     self.encoder_process.kill()
                     return False, "Render cancelled by user"
 
-                t = _parse_ffmpeg_time(line)
-                if t is not None and timeline_duration > 0:
-                    pct = min(99, int((t / timeline_duration) * 100))
+                if pct is not None:
                     self.progress(pct)
                     elapsed = time.time() - start_time
                     fps_actual = (t * timeline_fps) / elapsed if elapsed > 0 else 0
@@ -1487,20 +1508,17 @@ class EncodingThread(QThread):
             cmd = self.build_ffmpeg_command()
             self.log_message.emit(f"Command: {' '.join(cmd)}")
             self.status.emit("Starting encode...")
-            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            self.process = start_streaming_process(cmd, bufsize=1)
             duration = self.get_duration()
-            for line in iter(self.process.stderr.readline, ''):
+            for line, _seconds, pct in iter_ffmpeg_progress(self.process, duration):
                 if self.should_stop:
                     self.process.kill()
                     self.finished.emit(False, "Stopped")
                     return
                 self.log_message.emit(line.strip())
-                if duration > 0:
-                    current = _parse_ffmpeg_time(line)
-                    if current is not None:
-                        pct = int((current / duration) * 100)
-                        self.progress.emit(min(pct, 99))
-                        self.status.emit(f"Encoding: {pct}%")
+                if pct is not None:
+                    self.progress.emit(pct)
+                    self.status.emit(f"Encoding: {pct}%")
             self.process.wait()
             if self.process.returncode == 0:
                 self.progress.emit(100)
@@ -1512,7 +1530,7 @@ class EncodingThread(QThread):
             self.finished.emit(False, str(e))
 
     def build_ffmpeg_command(self):
-        cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
+        cmd = list(FFMPEG_BASE_ARGS)
         use_gpu_decode = self.settings.get('use_gpu_decode', False)
         codec_name = None
         try:
@@ -1520,58 +1538,9 @@ class EncodingThread(QThread):
         except Exception:
             codec_name = None
         cmd.extend(build_hw_decode_input_args(self.input_file, codec_name, use_gpu_decode))
-        filter_complex = []
 
-        denoise = self.settings.get('denoise_level', 0)
-        if denoise > 0:
-            denoise_values = ['', 'hqdn3d=1.5:1.5:6:6', 'hqdn3d=2:2:8:8', 'hqdn3d=3:3:10:10', 'hqdn3d=4:4:12:12', 'hqdn3d=6:6:15:15', 'hqdn3d=8:8:18:18']
-            if denoise < len(denoise_values): filter_complex.append(denoise_values[denoise])
-
-        deflicker = self.settings.get('deflicker_level', 0)
-        if deflicker > 0:
-            deflicker_values = ['', 'deflicker=mode=pm:size=5', 'deflicker=mode=pm:size=10', 'deflicker=mode=pm:size=15', 'deflicker=mode=am:size=20', 'deflicker=mode=am:size=30']
-            if deflicker < len(deflicker_values): filter_complex.append(deflicker_values[deflicker])
-
-        exposure = self.settings.get('exposure_level', 0)
-        if exposure > 0:
-            exposure_values = {
-                1: 'eq=brightness=0.05:saturation=1.1',
-                2: 'eq=brightness=0.1:saturation=1.15',
-                3: 'eq=brightness=0.15:saturation=1.2',
-                4: 'eq=brightness=0.2:saturation=1.25',
-                5: 'eq=brightness=0.3:saturation=1.3',
-                6: 'eq=brightness=0.4:saturation=1.35',
-                7: 'eq=brightness=-0.05:saturation=0.95',
-                8: 'eq=brightness=-0.1:saturation=0.9',
-                9: 'eq=brightness=-0.15:saturation=0.85',
-                10: 'eq=brightness=-0.2:saturation=0.8',
-                11: 'eq=brightness=-0.3:saturation=0.75',
-                12: 'eq=brightness=-0.4:saturation=0.7',
-            }
-            if exposure in exposure_values: filter_complex.append(exposure_values[exposure])
-
-        temporal = self.settings.get('temporal_level', 0)
-        if temporal > 0:
-            temporal_values = ['',
-                               'tmix=frames=3:weights="1 1 1"',
-                               'tmix=frames=5:weights="1 1 2 1 1"',
-                               'tmix=frames=7:weights="1 1 2 2 2 1 1"',
-                               'tmix=frames=9:weights="1 1 2 3 3 3 2 1 1"',
-                               'tmix=frames=11:weights="1 2 2 3 4 4 4 3 2 2 1"']
-            if temporal < len(temporal_values): filter_complex.append(temporal_values[temporal])
-
-        sharpness = self.settings.get('sharpness_level', 0)
-        if sharpness > 0:
-            sharpness_values = ['',
-                                'unsharp=3:3:0.3:3:3:0',
-                                'unsharp=5:5:0.5:5:5:0',
-                                'unsharp=5:5:0.8:5:5:0.4',
-                                'unsharp=5:5:1.2:5:5:0.6',
-                                'unsharp=7:7:1.5:7:7:0.8',
-                                'unsharp=7:7:2.0:7:7:1.0']
-            if sharpness < len(sharpness_values): filter_complex.append(sharpness_values[sharpness])
-
-        if filter_complex: cmd.extend(['-vf', ','.join(filter_complex)])
+        video_filters = build_video_filter_chain(self.settings)
+        if video_filters: cmd.extend(['-vf', ','.join(video_filters)])
         codec = self.settings['video_codec']
         
         # New Remux Support
@@ -1596,11 +1565,7 @@ class EncodingThread(QThread):
         return cmd
 
     def get_duration(self):
-        try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.input_file], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            return float(result.stdout.strip())
-        except:
-            return 0
+        return probe_media_duration(self.input_file)
 
     def stop(self):
         self.should_stop = True
@@ -1688,6 +1653,80 @@ class FastEncodeProApp(QMainWindow):
         if update_status:
             self.status_label.setText("Applied automatic hardware settings")
 
+    # --- WIDGET FACTORIES ---
+
+    def make_button(self, text, color, height=None, size=None, on_click=None, tooltip=None, enabled=True):
+        button = QPushButton(text)
+        button.setStyleSheet(self.button_style(color))
+        if size is not None:
+            button.setFixedSize(*size)
+        if height is not None:
+            button.setMinimumHeight(height)
+        if tooltip:
+            button.setToolTip(tooltip)
+        if not enabled:
+            button.setEnabled(False)
+        if on_click is not None:
+            button.clicked.connect(on_click)
+        return button
+
+    def add_combo_row(self, layout, label_text, items, current_index=None, on_change=None):
+        """Append a ``label + combo box`` row to ``layout`` and return both widgets."""
+        row = QHBoxLayout()
+        label = QLabel(label_text)
+        row.addWidget(label)
+        combo = QComboBox()
+        combo.addItems(items)
+        if current_index is not None:
+            combo.setCurrentIndex(current_index)
+        combo.setStyleSheet(self.combo_style())
+        if on_change is not None:
+            combo.currentIndexChanged.connect(on_change)
+        row.addWidget(combo)
+        layout.addLayout(row)
+        return label, combo
+
+    def add_spinbox_row(self, layout, label_text, spinbox, minimum, maximum, value, step=None, on_change=None):
+        row = QHBoxLayout()
+        row.addWidget(QLabel(label_text))
+        spinbox.setRange(minimum, maximum)
+        spinbox.setValue(value)
+        if step is not None:
+            spinbox.setSingleStep(step)
+        spinbox.setStyleSheet(self.spinbox_style())
+        if on_change is not None:
+            spinbox.valueChanged.connect(on_change)
+        row.addWidget(spinbox)
+        layout.addLayout(row)
+        return spinbox
+
+    def add_audio_track_row(self, layout, label_text):
+        """Append the ``normalize`` + ``volume slider`` controls for one audio track."""
+        header = QHBoxLayout()
+        header.addWidget(QLabel(label_text))
+        norm_check = QCheckBox("Normalize")
+        norm_check.setStyleSheet("color: #4ade80;")
+        norm_check.stateChanged.connect(self.update_clip_volume)
+        header.addWidget(norm_check)
+        layout.addLayout(header)
+
+        slider_row = QHBoxLayout()
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-60, 30)
+        slider.setValue(0)
+        slider.setStyleSheet(self.slider_style())
+        slider.valueChanged.connect(self.update_clip_volume)
+        slider_row.addWidget(slider)
+        value_label = QLabel("0 dB")
+        slider_row.addWidget(value_label)
+        layout.addLayout(slider_row)
+        return norm_check, slider, value_label
+
+    def confirm(self, title, question):
+        reply = QMessageBox.question(self, title, question,
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        return reply == QMessageBox.StandardButton.Yes
+
     def create_accessibility_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1707,26 +1746,12 @@ class FastEncodeProApp(QMainWindow):
         self.dwell_check.stateChanged.connect(self.toggle_dwell)
         dwell_layout.addWidget(self.dwell_check)
 
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("Dwell Time (seconds):"))
-        self.dwell_time_spin = QDoubleSpinBox()
-        self.dwell_time_spin.setRange(0.2, 5.0)
-        self.dwell_time_spin.setValue(1.2)
-        self.dwell_time_spin.setSingleStep(0.1)
-        self.dwell_time_spin.setStyleSheet(self.spinbox_style())
-        self.dwell_time_spin.valueChanged.connect(self.update_dwell_params)
-        time_row.addWidget(self.dwell_time_spin)
-        dwell_layout.addLayout(time_row)
-
-        thresh_row = QHBoxLayout()
-        thresh_row.addWidget(QLabel("Movement Threshold (Sensitivity):"))
-        self.dwell_thresh_spin = QSpinBox()
-        self.dwell_thresh_spin.setRange(5, 50)
-        self.dwell_thresh_spin.setValue(15)
-        self.dwell_thresh_spin.setStyleSheet(self.spinbox_style())
-        self.dwell_thresh_spin.valueChanged.connect(self.update_dwell_params)
-        thresh_row.addWidget(self.dwell_thresh_spin)
-        dwell_layout.addLayout(thresh_row)
+        self.dwell_time_spin = self.add_spinbox_row(
+            dwell_layout, "Dwell Time (seconds):", QDoubleSpinBox(), 0.2, 5.0, 1.2,
+            step=0.1, on_change=self.update_dwell_params)
+        self.dwell_thresh_spin = self.add_spinbox_row(
+            dwell_layout, "Movement Threshold (Sensitivity):", QSpinBox(), 5, 50, 15,
+            on_change=self.update_dwell_params)
 
         dwell_group.setLayout(dwell_layout)
         layout.addWidget(dwell_group)
@@ -1756,16 +1781,10 @@ class FastEncodeProApp(QMainWindow):
         layout.setSpacing(10)
 
         project_controls = QHBoxLayout()
-        save_proj_btn = QPushButton("💾 Save Project")
-        save_proj_btn.setStyleSheet(self.button_style("#3b82f6"))
-        save_proj_btn.setMinimumHeight(40)
-        save_proj_btn.clicked.connect(self.save_project)
+        save_proj_btn = self.make_button("💾 Save Project", "#3b82f6", height=40, on_click=self.save_project)
         project_controls.addWidget(save_proj_btn)
 
-        load_proj_btn = QPushButton("📂 Load Project")
-        load_proj_btn.setStyleSheet(self.button_style("#f59e0b"))
-        load_proj_btn.setMinimumHeight(40)
-        load_proj_btn.clicked.connect(self.load_project)
+        load_proj_btn = self.make_button("📂 Load Project", "#f59e0b", height=40, on_click=self.load_project)
         project_controls.addWidget(load_proj_btn)
         
         project_controls.addStretch()
@@ -1787,15 +1806,9 @@ class FastEncodeProApp(QMainWindow):
         self.media_list.itemClicked.connect(self.on_media_selected)
         library_layout.addWidget(self.media_list)
         lib_buttons = QHBoxLayout()
-        add_media_btn = QPushButton("➕ Add Media")
-        add_media_btn.setStyleSheet(self.button_style("#4ade80"))
-        add_media_btn.setMinimumHeight(50)
-        add_media_btn.clicked.connect(self.add_media_to_library)
+        add_media_btn = self.make_button("➕ Add Media", "#4ade80", height=50, on_click=self.add_media_to_library)
         lib_buttons.addWidget(add_media_btn)
-        remove_media_btn = QPushButton("➖ Remove")
-        remove_media_btn.setStyleSheet(self.button_style("#ef4444"))
-        remove_media_btn.setMinimumHeight(50)
-        remove_media_btn.clicked.connect(self.remove_from_library)
+        remove_media_btn = self.make_button("➖ Remove", "#ef4444", height=50, on_click=self.remove_from_library)
         lib_buttons.addWidget(remove_media_btn)
         library_layout.addLayout(lib_buttons)
         top_layout.addWidget(library_panel, stretch=1)
@@ -1831,15 +1844,9 @@ class FastEncodeProApp(QMainWindow):
         self.timecode_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview_layout.addWidget(self.timecode_label)
         controls_row = QHBoxLayout()
-        self.play_btn = QPushButton("▶️ Play")
-        self.play_btn.setStyleSheet(self.button_style("#3b82f6"))
-        self.play_btn.setMinimumHeight(50)
-        self.play_btn.clicked.connect(self.toggle_play)
+        self.play_btn = self.make_button("▶️ Play", "#3b82f6", height=50, on_click=self.toggle_play)
         controls_row.addWidget(self.play_btn)
-        self.fullscreen_btn = QPushButton("⛶ Fullscreen")
-        self.fullscreen_btn.setStyleSheet(self.button_style("#8b5cf6"))
-        self.fullscreen_btn.setMinimumHeight(50)
-        self.fullscreen_btn.clicked.connect(self.enter_fullscreen)
+        self.fullscreen_btn = self.make_button("⛶ Fullscreen", "#8b5cf6", height=50, on_click=self.enter_fullscreen)
         controls_row.addWidget(self.fullscreen_btn)
         preview_layout.addLayout(controls_row)
 
@@ -1851,15 +1858,9 @@ class FastEncodeProApp(QMainWindow):
         trim_box.setStyleSheet(self.groupbox_style())
         trim_box_layout = QVBoxLayout(trim_box)
         trim_buttons = QHBoxLayout()
-        set_in_btn = QPushButton("[ Set IN")
-        set_in_btn.setStyleSheet(self.button_style("#10b981"))
-        set_in_btn.setMinimumHeight(35)
-        set_in_btn.clicked.connect(self.set_media_in_point)
+        set_in_btn = self.make_button("[ Set IN", "#10b981", height=35, on_click=self.set_media_in_point)
         trim_buttons.addWidget(set_in_btn)
-        set_out_btn = QPushButton("Set OUT ]")
-        set_out_btn.setStyleSheet(self.button_style("#10b981"))
-        set_out_btn.setMinimumHeight(35)
-        set_out_btn.clicked.connect(self.set_media_out_point)
+        set_out_btn = self.make_button("Set OUT ]", "#10b981", height=35, on_click=self.set_media_out_point)
         trim_buttons.addWidget(set_out_btn)
         trim_box_layout.addLayout(trim_buttons)
         self.trim_info = QLabel("In: 00:00:00 | Out: 00:00:00 | Duration: 00:00:00")
@@ -1872,50 +1873,13 @@ class FastEncodeProApp(QMainWindow):
         mixer_box.setStyleSheet(self.groupbox_style())
         mixer_box_layout = QVBoxLayout(mixer_box)
 
-        t1_layout = QHBoxLayout()
-        t1_layout.addWidget(QLabel("Audio Track 1"))
-        self.track1_norm = QCheckBox("Normalize")
-        self.track1_norm.setStyleSheet("color: #4ade80;")
-        self.track1_norm.stateChanged.connect(self.update_clip_volume)
-        t1_layout.addWidget(self.track1_norm)
-        mixer_box_layout.addLayout(t1_layout)
-
-        t1_slider_layout = QHBoxLayout()
-        self.track1_slider = QSlider(Qt.Orientation.Horizontal)
-        self.track1_slider.setRange(-60, 30)
-        self.track1_slider.setValue(0)
-        self.track1_slider.setStyleSheet(self.slider_style())
-        self.track1_slider.valueChanged.connect(self.update_clip_volume)
-        t1_slider_layout.addWidget(self.track1_slider)
-        self.t1_val = QLabel("0 dB")
-        t1_slider_layout.addWidget(self.t1_val)
-        mixer_box_layout.addLayout(t1_slider_layout)
-
-        t2_layout = QHBoxLayout()
-        t2_layout.addWidget(QLabel("Audio Track 2"))
-        self.track2_norm = QCheckBox("Normalize")
-        self.track2_norm.setStyleSheet("color: #4ade80;")
-        self.track2_norm.stateChanged.connect(self.update_clip_volume)
-        t2_layout.addWidget(self.track2_norm)
-        mixer_box_layout.addLayout(t2_layout)
-
-        t2_slider_layout = QHBoxLayout()
-        self.track2_slider = QSlider(Qt.Orientation.Horizontal)
-        self.track2_slider.setRange(-60, 30)
-        self.track2_slider.setValue(0)
-        self.track2_slider.setStyleSheet(self.slider_style())
-        self.track2_slider.valueChanged.connect(self.update_clip_volume)
-        t2_slider_layout.addWidget(self.track2_slider)
-        self.t2_val = QLabel("0 dB")
-        t2_slider_layout.addWidget(self.t2_val)
-        mixer_box_layout.addLayout(t2_slider_layout)
+        self.track1_norm, self.track1_slider, self.t1_val = self.add_audio_track_row(mixer_box_layout, "Audio Track 1")
+        self.track2_norm, self.track2_slider, self.t2_val = self.add_audio_track_row(mixer_box_layout, "Audio Track 2")
 
         sync_layout = QHBoxLayout()
-        self.auto_sync_btn = QPushButton("🎯 Auto-Sync Audio")
-        self.auto_sync_btn.setStyleSheet(self.button_style("#8b5cf6"))
-        self.auto_sync_btn.setMinimumHeight(35)
-        self.auto_sync_btn.clicked.connect(self.auto_sync_audio_tracks)
-        self.auto_sync_btn.setToolTip("Automatically detect and fix audio sync offset between tracks")
+        self.auto_sync_btn = self.make_button(
+            "🎯 Auto-Sync Audio", "#8b5cf6", height=35, on_click=self.auto_sync_audio_tracks,
+            tooltip="Automatically detect and fix audio sync offset between tracks")
         sync_layout.addWidget(self.auto_sync_btn)
 
         self.sync_status_label = QLabel("")
@@ -1937,15 +1901,9 @@ class FastEncodeProApp(QMainWindow):
         timeline_title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #f59e0b; padding: 5px;")
         timeline_header.addWidget(timeline_title)
         timeline_header.addStretch()
-        zoom_in_btn = QPushButton("🔍+")
-        zoom_in_btn.setStyleSheet(self.button_style("#6366f1"))
-        zoom_in_btn.setFixedSize(60, 40)
-        zoom_in_btn.clicked.connect(self.zoom_in_timeline)
+        zoom_in_btn = self.make_button("🔍+", "#6366f1", size=(60, 40), on_click=self.zoom_in_timeline)
         timeline_header.addWidget(zoom_in_btn)
-        zoom_out_btn = QPushButton("🔍−")
-        zoom_out_btn.setStyleSheet(self.button_style("#6366f1"))
-        zoom_out_btn.setFixedSize(60, 40)
-        zoom_out_btn.clicked.connect(self.zoom_out_timeline)
+        zoom_out_btn = self.make_button("🔍−", "#6366f1", size=(60, 40), on_click=self.zoom_out_timeline)
         timeline_header.addWidget(zoom_out_btn)
         timeline_layout.addLayout(timeline_header)
         self.timeline = TimelineWidget()
@@ -1955,31 +1913,13 @@ class FastEncodeProApp(QMainWindow):
         self.timeline.timeline_clicked.connect(self.activate_timeline_mode)
         timeline_layout.addWidget(self.timeline, stretch=1)
         timeline_controls = QHBoxLayout()
-        add_to_timeline_btn = QPushButton("➕ Add to Timeline")
-        add_to_timeline_btn.setStyleSheet(self.button_style("#4ade80"))
-        add_to_timeline_btn.setMinimumHeight(50)
-        add_to_timeline_btn.clicked.connect(self.add_to_timeline)
-        timeline_controls.addWidget(add_to_timeline_btn)
-        remove_from_timeline_btn = QPushButton("➖ Remove Clip")
-        remove_from_timeline_btn.setStyleSheet(self.button_style("#ef4444"))
-        remove_from_timeline_btn.setMinimumHeight(50)
-        remove_from_timeline_btn.clicked.connect(self.remove_from_timeline)
-        timeline_controls.addWidget(remove_from_timeline_btn)
-        clear_timeline_btn = QPushButton("🗑️ Clear All")
-        clear_timeline_btn.setStyleSheet(self.button_style("#dc2626"))
-        clear_timeline_btn.setMinimumHeight(50)
-        clear_timeline_btn.clicked.connect(self.clear_timeline)
-        timeline_controls.addWidget(clear_timeline_btn)
-        self.export_timeline_btn = QPushButton("💾 EXPORT TIMELINE")
-        self.export_timeline_btn.setStyleSheet(self.button_style("#8b5cf6"))
-        self.export_timeline_btn.setMinimumHeight(50)
-        self.export_timeline_btn.clicked.connect(self.export_timeline)
+        timeline_controls.addWidget(self.make_button("➕ Add to Timeline", "#4ade80", height=50, on_click=self.add_to_timeline))
+        timeline_controls.addWidget(self.make_button("➖ Remove Clip", "#ef4444", height=50, on_click=self.remove_from_timeline))
+        timeline_controls.addWidget(self.make_button("🗑️ Clear All", "#dc2626", height=50, on_click=self.clear_timeline))
+        self.export_timeline_btn = self.make_button("💾 EXPORT TIMELINE", "#8b5cf6", height=50, on_click=self.export_timeline)
         timeline_controls.addWidget(self.export_timeline_btn)
-        self.stop_export_btn = QPushButton("⏹️ STOP RENDER")
-        self.stop_export_btn.setStyleSheet(self.button_style("#ef4444"))
-        self.stop_export_btn.setMinimumHeight(50)
-        self.stop_export_btn.setEnabled(False)
-        self.stop_export_btn.clicked.connect(self.stop_timeline_export)
+        self.stop_export_btn = self.make_button("⏹️ STOP RENDER", "#ef4444", height=50,
+                                                on_click=self.stop_timeline_export, enabled=False)
         timeline_controls.addWidget(self.stop_export_btn)
         timeline_layout.addLayout(timeline_controls)
         layout.addWidget(timeline_section, stretch=2)
@@ -2000,50 +1940,19 @@ class FastEncodeProApp(QMainWindow):
         codec_group = QGroupBox("🎥 Video Codec")
         codec_group.setStyleSheet(self.groupbox_style())
         codec_layout = QVBoxLayout()
-        codec_row = QHBoxLayout()
-        codec_row.addWidget(QLabel("Codec:"))
-        self.codec_combo = QComboBox()
         # ADDED REMUX (COPY) OPTION HERE
-        self.codec_combo.addItems(["ProRes", "H.264 (NVENC)", "H.265/HEVC (NVENC)", "Remux (Copy Stream)"])
-        self.codec_combo.setCurrentIndex(2)
-        self.codec_combo.setStyleSheet(self.combo_style())
-        self.codec_combo.currentIndexChanged.connect(self.on_codec_changed)
-        codec_row.addWidget(self.codec_combo)
-        codec_layout.addLayout(codec_row)
-
-        prores_row = QHBoxLayout()
-        self.prores_label = QLabel("ProRes Profile:")
-        prores_row.addWidget(self.prores_label)
-        self.prores_combo = QComboBox()
-        self.prores_combo.addItems(["Proxy", "LT", "Standard", "HQ", "4444", "4444 XQ"])
-        self.prores_combo.setCurrentIndex(5)
-        self.prores_combo.setStyleSheet(self.combo_style())
-        self.prores_combo.currentIndexChanged.connect(self.update_estimated_size)
-        prores_row.addWidget(self.prores_combo)
-        codec_layout.addLayout(prores_row)
-
-        nvenc_row = QHBoxLayout()
-        self.nvenc_label = QLabel("Pixel Format:")
-        nvenc_row.addWidget(self.nvenc_label)
-        self.pixel_combo = QComboBox()
-        self.pixel_combo.addItems(["8-bit (yuv420p)", "10-bit (p010le)"])
-        self.pixel_combo.setCurrentIndex(1)
-        self.pixel_combo.setStyleSheet(self.combo_style())
-        nvenc_row.addWidget(self.pixel_combo)
-        codec_layout.addLayout(nvenc_row)
-
-        export_target_row = QHBoxLayout()
-        self.export_target_label = QLabel("Export target:")
-        export_target_row.addWidget(self.export_target_label)
-        self.export_target_combo = QComboBox()
-        self.export_target_combo.addItems(get_export_target_labels())
-        self.export_target_combo.setCurrentIndex(0)
-        self.export_target_combo.setStyleSheet(self.combo_style())
-        self.export_target_combo.currentIndexChanged.connect(
-            lambda _: self.update_quality_label(self.quality_slider.value())
-        )
-        export_target_row.addWidget(self.export_target_combo)
-        codec_layout.addLayout(export_target_row)
+        _, self.codec_combo = self.add_combo_row(
+            codec_layout, "Codec:",
+            ["ProRes", "H.264 (NVENC)", "H.265/HEVC (NVENC)", "Remux (Copy Stream)"],
+            current_index=2, on_change=self.on_codec_changed)
+        self.prores_label, self.prores_combo = self.add_combo_row(
+            codec_layout, "ProRes Profile:", PRORES_PROFILE_NAMES,
+            current_index=5, on_change=self.update_estimated_size)
+        self.nvenc_label, self.pixel_combo = self.add_combo_row(
+            codec_layout, "Pixel Format:", ["8-bit (yuv420p)", "10-bit (p010le)"], current_index=1)
+        self.export_target_label, self.export_target_combo = self.add_combo_row(
+            codec_layout, "Export target:", get_export_target_labels(), current_index=0,
+            on_change=lambda _: self.update_quality_label(self.quality_slider.value()))
 
         codec_group.setLayout(codec_layout)
         scroll_layout.addWidget(codec_group)
@@ -2052,32 +1961,12 @@ class FastEncodeProApp(QMainWindow):
         timeline_group.setStyleSheet(self.groupbox_style())
         timeline_layout = QVBoxLayout()
 
-        fps_row = QHBoxLayout()
-        fps_row.addWidget(QLabel("Timeline FPS:"))
-        self.timeline_fps_combo = QComboBox()
-        self.timeline_fps_combo.addItems(["23.976", "24", "25", "29.97", "30", "50", "60", "120"])
-        self.timeline_fps_combo.setCurrentIndex(6)
-        self.timeline_fps_combo.setStyleSheet(self.combo_style())
-        fps_row.addWidget(self.timeline_fps_combo)
-        timeline_layout.addLayout(fps_row)
-
-        res_row = QHBoxLayout()
-        res_row.addWidget(QLabel("Export Resolution:"))
-        self.export_res_combo = QComboBox()
-        self.export_res_combo.addItems(["Source", "1920x1080", "2560x1440", "3840x2160", "5120x2880", "7680x4320"])
-        self.export_res_combo.setCurrentIndex(0)
-        self.export_res_combo.setStyleSheet(self.combo_style())
-        res_row.addWidget(self.export_res_combo)
-        timeline_layout.addLayout(res_row)
-
-        scale_row = QHBoxLayout()
-        scale_row.addWidget(QLabel("Upscale Quality:"))
-        self.scale_algo_combo = QComboBox()
-        self.scale_algo_combo.addItems(["Bilinear", "Bicubic", "Lanczos", "Spline"])
-        self.scale_algo_combo.setCurrentIndex(2)
-        self.scale_algo_combo.setStyleSheet(self.combo_style())
-        scale_row.addWidget(self.scale_algo_combo)
-        timeline_layout.addLayout(scale_row)
+        _, self.timeline_fps_combo = self.add_combo_row(
+            timeline_layout, "Timeline FPS:", TIMELINE_FPS_LABELS, current_index=6)
+        _, self.export_res_combo = self.add_combo_row(
+            timeline_layout, "Export Resolution:", EXPORT_RESOLUTION_LABELS, current_index=0)
+        _, self.scale_algo_combo = self.add_combo_row(
+            timeline_layout, "Upscale Quality:", SCALE_ALGO_LABELS, current_index=2)
 
         timeline_group.setLayout(timeline_layout)
         scroll_layout.addWidget(timeline_group)
@@ -2119,13 +2008,8 @@ class FastEncodeProApp(QMainWindow):
         audio_group = QGroupBox("🔊 Audio")
         audio_group.setStyleSheet(self.groupbox_style())
         audio_layout = QVBoxLayout()
-        audio_row = QHBoxLayout()
-        audio_row.addWidget(QLabel("Audio Codec:"))
-        self.audio_combo = QComboBox()
-        self.audio_combo.addItems(["PCM 24-bit", "PCM 16-bit", "AAC 320kbps", "Copy Stream"])
-        self.audio_combo.setStyleSheet(self.combo_style())
-        audio_row.addWidget(self.audio_combo)
-        audio_layout.addLayout(audio_row)
+        _, self.audio_combo = self.add_combo_row(
+            audio_layout, "Audio Codec:", ["PCM 24-bit", "PCM 16-bit", "AAC 320kbps", "Copy Stream"])
         audio_group.setLayout(audio_layout)
         scroll_layout.addWidget(audio_group)
 
@@ -2133,46 +2017,20 @@ class FastEncodeProApp(QMainWindow):
         filters_group.setStyleSheet(self.groupbox_style())
         filters_layout = QVBoxLayout()
 
-        denoise_row = QHBoxLayout()
-        denoise_row.addWidget(QLabel("Denoise:"))
-        self.denoise_combo = QComboBox()
-        self.denoise_combo.addItems(["Off", "Light", "Medium", "Heavy", "Very Heavy", "Nuclear", "Ultra Nuclear"])
-        self.denoise_combo.setStyleSheet(self.combo_style())
-        denoise_row.addWidget(self.denoise_combo)
-        filters_layout.addLayout(denoise_row)
-
-        deflicker_row = QHBoxLayout()
-        deflicker_row.addWidget(QLabel("Deflicker:"))
-        self.deflicker_combo = QComboBox()
-        self.deflicker_combo.addItems(["Off", "Light", "Medium", "Strong", "Very Strong", "Maximum"])
-        self.deflicker_combo.setStyleSheet(self.combo_style())
-        deflicker_row.addWidget(self.deflicker_combo)
-        filters_layout.addLayout(deflicker_row)
-
-        exposure_row = QHBoxLayout()
-        exposure_row.addWidget(QLabel("Exposure:"))
-        self.exposure_combo = QComboBox()
-        self.exposure_combo.addItems(["Off", "+0.25 EV", "+0.5 EV", "+0.75 EV", "+1.0 EV", "+1.5 EV", "+2.0 EV",
-                                       "-0.25 EV", "-0.5 EV", "-0.75 EV", "-1.0 EV", "-1.5 EV", "-2.0 EV"])
-        self.exposure_combo.setStyleSheet(self.combo_style())
-        exposure_row.addWidget(self.exposure_combo)
-        filters_layout.addLayout(exposure_row)
-
-        temporal_row = QHBoxLayout()
-        temporal_row.addWidget(QLabel("Temporal Smoothing:"))
-        self.temporal_combo = QComboBox()
-        self.temporal_combo.addItems(["Off", "Light", "Medium", "Strong", "Very Strong", "Maximum"])
-        self.temporal_combo.setStyleSheet(self.combo_style())
-        temporal_row.addWidget(self.temporal_combo)
-        filters_layout.addLayout(temporal_row)
-
-        sharpness_row = QHBoxLayout()
-        sharpness_row.addWidget(QLabel("Sharpness:"))
-        self.sharpness_combo = QComboBox()
-        self.sharpness_combo.addItems(["Off", "Subtle", "Light", "Medium", "Strong", "Very Strong", "Ultra Sharp"])
-        self.sharpness_combo.setStyleSheet(self.combo_style())
-        sharpness_row.addWidget(self.sharpness_combo)
-        filters_layout.addLayout(sharpness_row)
+        _, self.denoise_combo = self.add_combo_row(
+            filters_layout, "Denoise:",
+            ["Off", "Light", "Medium", "Heavy", "Very Heavy", "Nuclear", "Ultra Nuclear"])
+        _, self.deflicker_combo = self.add_combo_row(
+            filters_layout, "Deflicker:", ["Off", "Light", "Medium", "Strong", "Very Strong", "Maximum"])
+        _, self.exposure_combo = self.add_combo_row(
+            filters_layout, "Exposure:",
+            ["Off", "+0.25 EV", "+0.5 EV", "+0.75 EV", "+1.0 EV", "+1.5 EV", "+2.0 EV",
+             "-0.25 EV", "-0.5 EV", "-0.75 EV", "-1.0 EV", "-1.5 EV", "-2.0 EV"])
+        _, self.temporal_combo = self.add_combo_row(
+            filters_layout, "Temporal Smoothing:", ["Off", "Light", "Medium", "Strong", "Very Strong", "Maximum"])
+        _, self.sharpness_combo = self.add_combo_row(
+            filters_layout, "Sharpness:",
+            ["Off", "Subtle", "Light", "Medium", "Strong", "Very Strong", "Ultra Sharp"])
 
         filters_group.setLayout(filters_layout)
         scroll_layout.addWidget(filters_group)
@@ -2191,10 +2049,8 @@ class FastEncodeProApp(QMainWindow):
         self.gpu_decode_check.stateChanged.connect(lambda: self.update_quality_label(self.quality_slider.value()))
         perf_layout.addWidget(self.gpu_decode_check)
 
-        auto_hw_btn = QPushButton("🔍 Auto Detect Hardware")
-        auto_hw_btn.setStyleSheet(self.button_style("#3b82f6"))
-        auto_hw_btn.setMinimumHeight(36)
-        auto_hw_btn.clicked.connect(lambda: self.apply_auto_hardware_settings(update_status=True))
+        auto_hw_btn = self.make_button("🔍 Auto Detect Hardware", "#3b82f6", height=36,
+                                       on_click=lambda: self.apply_auto_hardware_settings(update_status=True))
         perf_layout.addWidget(auto_hw_btn)
 
         self.hw_detect_label = QLabel("Auto hardware detect: pending")
@@ -2211,25 +2067,14 @@ class FastEncodeProApp(QMainWindow):
         gpu_decode_info.setWordWrap(True)
         perf_layout.addWidget(gpu_decode_info)
 
-        threads_row = QHBoxLayout()
-        threads_row.addWidget(QLabel("CPU Threads (0=auto):"))
-        self.threads_spin = QSpinBox()
-        self.threads_spin.setRange(0, 64)
-        self.threads_spin.setValue(0)
-        self.threads_spin.setStyleSheet(self.spinbox_style())
-        threads_row.addWidget(self.threads_spin)
-        perf_layout.addLayout(threads_row)
+        self.threads_spin = self.add_spinbox_row(perf_layout, "CPU Threads (0=auto):", QSpinBox(), 0, 64, 0)
         self.gpu_info = QLabel("✅ ProRes 4444 XQ (~500 Mbps)")
         self.gpu_info.setStyleSheet("font-size: 10pt; color: #4ade80; font-weight: bold; padding: 5px;")
         perf_layout.addWidget(self.gpu_info)
         perf_group.setLayout(perf_layout)
         scroll_layout.addWidget(perf_group)
 
-        reset_btn = QPushButton("🔄 Reset All Settings")
-        reset_btn.setStyleSheet(self.button_style("#ef4444"))
-        reset_btn.setMinimumHeight(50)
-        reset_btn.clicked.connect(self.reset_all)
-        scroll_layout.addWidget(reset_btn)
+        scroll_layout.addWidget(self.make_button("🔄 Reset All Settings", "#ef4444", height=50, on_click=self.reset_all))
 
         scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -2251,20 +2096,9 @@ class FastEncodeProApp(QMainWindow):
         self.file_list.setStyleSheet(self.list_style())
         files_layout.addWidget(self.file_list)
         file_buttons = QHBoxLayout()
-        add_btn = QPushButton("➕ Add Files")
-        add_btn.setStyleSheet(self.button_style("#4ade80"))
-        add_btn.setMinimumHeight(50)
-        add_btn.clicked.connect(self.add_files)
-        file_buttons.addWidget(add_btn)
-        remove_btn = QPushButton("➖ Remove")
-        remove_btn.setStyleSheet(self.button_style("#ef4444"))
-        remove_btn.setMinimumHeight(50)
-        remove_btn.clicked.connect(self.remove_selected)
-        file_buttons.addWidget(remove_btn)
-        clear_btn = QPushButton("🗑️ Clear All")
-        clear_btn.setStyleSheet(self.button_style("#dc2626"))
-        clear_btn.setMinimumHeight(50)
-        clear_btn.clicked.connect(self.clear_files)
+        file_buttons.addWidget(self.make_button("➕ Add Files", "#4ade80", height=50, on_click=self.add_files))
+        file_buttons.addWidget(self.make_button("➖ Remove", "#ef4444", height=50, on_click=self.remove_selected))
+        clear_btn = self.make_button("🗑️ Clear All", "#dc2626", height=50, on_click=self.clear_files)
         file_buttons.addWidget(clear_btn)
         files_layout.addLayout(file_buttons)
         files_group.setLayout(files_layout)
@@ -2277,10 +2111,7 @@ class FastEncodeProApp(QMainWindow):
         self.output_label = QLabel(self.output_folder if self.output_folder else "Not selected")
         self.output_label.setStyleSheet("color: #9ca3af; padding: 5px;")
         output_row.addWidget(self.output_label, stretch=1)
-        browse_btn = QPushButton("📂 Browse")
-        browse_btn.setStyleSheet(self.button_style("#3b82f6"))
-        browse_btn.setMinimumHeight(40)
-        browse_btn.clicked.connect(self.select_output)
+        browse_btn = self.make_button("📂 Browse", "#3b82f6", height=40, on_click=self.select_output)
         output_row.addWidget(browse_btn)
         output_layout.addLayout(output_row)
         output_group.setLayout(output_layout)
@@ -2316,16 +2147,10 @@ class FastEncodeProApp(QMainWindow):
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
         control_buttons = QHBoxLayout()
-        self.start_btn = QPushButton("▶️ START ENCODING")
-        self.start_btn.setStyleSheet(self.button_style("#4ade80"))
-        self.start_btn.setMinimumHeight(60)
-        self.start_btn.clicked.connect(self.start_encoding)
+        self.start_btn = self.make_button("▶️ START ENCODING", "#4ade80", height=60, on_click=self.start_encoding)
         control_buttons.addWidget(self.start_btn)
-        self.stop_btn = QPushButton("⏹️ STOP")
-        self.stop_btn.setStyleSheet(self.button_style("#ef4444"))
-        self.stop_btn.setMinimumHeight(60)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop_encoding)
+        self.stop_btn = self.make_button("⏹️ STOP", "#ef4444", height=60,
+                                         on_click=self.stop_encoding, enabled=False)
         control_buttons.addWidget(self.stop_btn)
         layout.addLayout(control_buttons)
         return tab
@@ -2348,23 +2173,24 @@ class FastEncodeProApp(QMainWindow):
                 if self.video_widget:
                     self.video_widget.stop()
 
+    def preview_duration_ms(self):
+        """Player duration, falling back to the timeline length while previewing an EDL."""
+        if not self.video_widget:
+            return 0
+        duration = self.video_widget.duration()
+        if duration <= 0 and self.is_timeline_mode and self._play_uses_timeline_edl:
+            duration = int(self.timeline.get_timeline_duration() * 1000)
+        return duration
+
     def _on_position_changed(self, position_ms):
         """Handle video position updates"""
-        if self.video_widget:
-            dur = self.video_widget.duration()
-            if dur <= 0 and self.is_timeline_mode and self._play_uses_timeline_edl:
-                dur = int(self.timeline.get_timeline_duration() * 1000)
-            if dur > 0:
-                slider_value = int((position_ms / dur) * 1000)
-                self.preview_slider.setValue(slider_value)
+        dur = self.preview_duration_ms()
+        if dur > 0:
+            slider_value = int((position_ms / dur) * 1000)
+            self.preview_slider.setValue(slider_value)
 
-        dur_display = 0
-        if self.video_widget:
-            dur_display = self.video_widget.duration()
-            if dur_display <= 0 and self.is_timeline_mode and self._play_uses_timeline_edl:
-                dur_display = int(self.timeline.get_timeline_duration() * 1000)
         current_tc = self.format_timecode(position_ms)
-        total_tc = self.format_timecode(dur_display)
+        total_tc = self.format_timecode(dur)
         self.timecode_label.setText(f"{current_tc} / {total_tc}")
 
         # Update Timeline Playhead automatically
@@ -2400,18 +2226,8 @@ class FastEncodeProApp(QMainWindow):
             if self.video_widget and self.video_widget.load_file(file_path):
                 self.video_widget.pause()
 
-                n_streams = get_audio_stream_count_static(file_path)
-                if n_streams > 1:
-                    filter_parts = []
-                    inputs = []
-                    for i in range(n_streams):
-                        vol_db = 0.0
-                        filter_parts.append(f"[aid{i+1}]volume={vol_db}dB[a{i}]")
-                        inputs.append(f"[a{i}]")
-
-                    input_tags = "".join(inputs)
-                    filter_str = f"{';'.join(filter_parts)};{input_tags}amix=inputs={n_streams}:duration=first:dropout_transition=0[ao]"
-                    self.video_widget.set_audio_complex_filter(filter_str)
+                if get_audio_stream_count_static(file_path) > 1:
+                    self.apply_audio_mix_preview(file_path, [])
 
             self.update_trim_info()
 
@@ -2559,19 +2375,15 @@ class FastEncodeProApp(QMainWindow):
             )
             return
 
-        reply = QMessageBox.question(
-            self,
+        if not self.confirm(
             "Auto-Sync Audio",
             f"Analyze audio sync for: {clip.name}\n\n"
             "This will analyze the first 30 seconds to detect\n"
             "the sync offset between audio tracks.\n\n"
             "Track 0 (desktop) will be used as reference.\n"
             "Track 1 (mic) will be synchronized.\n\n"
-            "Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-
-        if reply != QMessageBox.StandardButton.Yes:
+            "Continue?"
+        ):
             return
 
         # FIX: Use QProgressDialog instead of QMessageBox to prevent Wayland ghost-window freeze
@@ -2597,9 +2409,7 @@ class FastEncodeProApp(QMainWindow):
             )
 
             # FIX: Force destroy the progress dialog so the window manager gives focus to the results
-            progress.hide()
-            progress.deleteLater()
-            QApplication.processEvents()
+            self._destroy_progress_dialog(progress)
             time.sleep(0.1) # Yield to Wayland compositor to map out window
             QApplication.processEvents()
 
@@ -2655,9 +2465,7 @@ class FastEncodeProApp(QMainWindow):
                 self.append_log(f"Audio sync detected ({offset_ms:+d}ms) but not applied")
 
         except Exception as e:
-            progress.hide()
-            progress.deleteLater()
-            QApplication.processEvents()
+            self._destroy_progress_dialog(progress)
             QMessageBox.critical(
                 self,
                 "Auto-Sync Failed",
@@ -2666,6 +2474,11 @@ class FastEncodeProApp(QMainWindow):
                 "and that FFmpeg is installed."
             )
             self.append_log(f"❌ Auto-sync failed: {e}")
+
+    def _destroy_progress_dialog(self, progress):
+        progress.hide()
+        progress.deleteLater()
+        QApplication.processEvents()
 
     def on_timeline_playhead_moved(self, time):
         if not self.video_widget:
@@ -2714,9 +2527,7 @@ class FastEncodeProApp(QMainWindow):
     def seek_preview(self, value):
         if not self.video_widget:
             return
-        dur = self.video_widget.duration()
-        if dur <= 0 and self.is_timeline_mode and self._play_uses_timeline_edl:
-            dur = int(self.timeline.get_timeline_duration() * 1000)
+        dur = self.preview_duration_ms()
         if dur > 0:
             position_ms = int((value / 1000.0) * dur)
             self.video_widget.seek(position_ms)
@@ -2772,8 +2583,7 @@ class FastEncodeProApp(QMainWindow):
             self.update_timeline_duration()
 
     def clear_timeline(self):
-        reply = QMessageBox.question(self, "Clear Timeline", "Remove all clips from timeline?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        if self.confirm("Clear Timeline", "Remove all clips from timeline?"):
             self.timeline.clear_timeline()
             self.update_timeline_duration()
 
@@ -2825,8 +2635,7 @@ class FastEncodeProApp(QMainWindow):
         codec_idx = self.codec_combo.currentIndex()
         decode_status = "HW Decode ON" if self.gpu_decode_check.isChecked() else "SW Decode"
         if codec_idx == 0:
-            profile_names = ["Proxy", "LT", "Standard", "HQ", "4444", "4444 XQ"]
-            self.gpu_info.setText(f"✅ ProRes {profile_names[self.prores_combo.currentIndex()]} (~{value} Mbps CBR) | {decode_status}")
+            self.gpu_info.setText(f"✅ ProRes {PRORES_PROFILE_NAMES[self.prores_combo.currentIndex()]} (~{value} Mbps CBR) | {decode_status}")
         elif codec_idx == 3:
             self.gpu_info.setText("✅ Remux (Copy Stream) | No encoding processing")
         else:
@@ -2875,8 +2684,7 @@ class FastEncodeProApp(QMainWindow):
         bitrate = self.quality_slider.value()
         export_target = get_export_target_labels()[self.export_target_combo.currentIndex()]
         filters_state = "ON" if settings.get('has_optional_filters') else "OFF"
-        reply = QMessageBox.question(self, "Export Timeline", f"Export {len(self.timeline.clips)} clips?\n\nCodec: {settings['video_codec'].upper()}\nExport target: {export_target}\nOptional filters: {filters_state}\nBitrate: {bitrate} Mbps (CBR - Constant)\nContainer: MOV\n\n✅ This will maintain consistent quality throughout!", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
+        if not self.confirm("Export Timeline", f"Export {len(self.timeline.clips)} clips?\n\nCodec: {settings['video_codec'].upper()}\nExport target: {export_target}\nOptional filters: {filters_state}\nBitrate: {bitrate} Mbps (CBR - Constant)\nContainer: MOV\n\n✅ This will maintain consistent quality throughout!"):
             return
         self.export_timeline_btn.setEnabled(False)
         self.stop_export_btn.setEnabled(True)
@@ -3385,13 +3193,9 @@ class FastEncodeProApp(QMainWindow):
         codec_map = {0: "prores_ks", 1: "h264_nvenc", 2: "hevc_nvenc", 3: "copy"}
         audio_map = {0: "pcm_s24le", 1: "pcm_s16le", 2: "aac", 3: "copy"}
 
-        fps_values = [23.976, 24, 25, 29.97, 30, 50, 60, 120]
-        timeline_fps = fps_values[self.timeline_fps_combo.currentIndex()]
-
+        timeline_fps = TIMELINE_FPS_VALUES[self.timeline_fps_combo.currentIndex()]
         export_res_index = self.export_res_combo.currentIndex()
-
-        scale_algos = ['bilinear', 'bicubic', 'lanczos', 'spline']
-        scale_algo = scale_algos[self.scale_algo_combo.currentIndex()]
+        scale_algo = SCALE_ALGOS[self.scale_algo_combo.currentIndex()]
 
         settings = {
             'video_codec': codec_map[self.codec_combo.currentIndex()],
@@ -3542,15 +3346,13 @@ class FastEncodeProApp(QMainWindow):
                 pass
 
         if self.encoding_thread and self.encoding_thread.isRunning():
-            reply = QMessageBox.question(self, "Active", "Stop and quit?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.No:
+            if not self.confirm("Active", "Stop and quit?"):
                 event.ignore()
                 return
             self.encoding_thread.stop()
             self.encoding_thread.wait()
         if self.timeline_export_thread and self.timeline_export_thread.isRunning():
-            reply = QMessageBox.question(self, "Export Active", "Stop export and quit?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.No:
+            if not self.confirm("Export Active", "Stop export and quit?"):
                 event.ignore()
                 return
             self.timeline_export_thread.stop()

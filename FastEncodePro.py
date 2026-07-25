@@ -28,10 +28,54 @@ import sys
 import shutil
 import subprocess
 import tempfile
+import collections
 import json
+import logging
 import time
 import math
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s [%(name)s] %(message)s')
+logger = logging.getLogger('FastEncodePro')
+
+NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+
+def log_exception(context, exc):
+    """Record a non-fatal exception instead of discarding it."""
+    logger.warning("%s: %s", context, exc)
+    logger.debug("%s - traceback", context, exc_info=exc)
+
+
+def run_probe(cmd, timeout=10):
+    """Run an ffmpeg/ffprobe helper command, raising RuntimeError with its stderr on failure."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                creationflags=NO_WINDOW_FLAGS)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"{cmd[0]} not found on PATH") from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"{cmd[0]} timed out after {timeout}s") from e
+    if result.returncode != 0:
+        detail = (result.stderr or '').strip() or f"exit code {result.returncode}"
+        raise RuntimeError(f"{cmd[0]} failed: {detail}")
+    return result.stdout
+
+
+def probe_media_duration(file_path, default):
+    """Duration in seconds, falling back to ``default`` (logged) when ffprobe cannot report one."""
+    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+           '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
+    try:
+        return float(run_probe(cmd).strip())
+    except (RuntimeError, ValueError) as e:
+        log_exception(f"Could not probe duration of {file_path}, using {default}s", e)
+        return default
+
+
+def find_missing_tools():
+    """Names of the required external binaries that are not on PATH."""
+    return [tool for tool in ('ffmpeg', 'ffprobe') if shutil.which(tool) is None]
 
 
 def _bootstrap_mpv_runtime_path():
@@ -85,13 +129,15 @@ __author__ = "cpgplays"
 # --- HELPER FUNCTIONS ---
 
 def get_audio_stream_count_static(filepath):
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', filepath]
     try:
-        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', filepath]
-        out = subprocess.check_output(cmd, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).decode().strip()
-        if not out: return 0
-        return len(out.splitlines())
-    except:
+        out = run_probe(cmd).strip()
+    except RuntimeError as e:
+        log_exception(f"Could not count audio streams of {filepath}, assuming 1", e)
         return 1
+    if not out:
+        return 0
+    return len(out.splitlines())
 
 
 def get_export_target_labels():
@@ -172,23 +218,23 @@ def detect_hardware_capabilities():
             name = (smi.stdout or '').strip().splitlines()
             if name and name[0]:
                 caps['gpu_name'] = name[0]
-    except Exception:
-        pass
+    except Exception as e:
+        log_exception("nvidia-smi GPU probe failed", e)
 
     try:
         enc = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         enc_text = (enc.stdout or '') + (enc.stderr or '')
         caps['nvenc_h264'] = 'h264_nvenc' in enc_text
         caps['nvenc_hevc'] = 'hevc_nvenc' in enc_text
-    except Exception:
-        pass
+    except Exception as e:
+        log_exception("Could not list ffmpeg encoders; assuming no NVENC", e)
 
     try:
         dec = subprocess.run(['ffmpeg', '-hide_banner', '-decoders'], capture_output=True, text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         dec_text = (dec.stdout or '') + (dec.stderr or '')
         caps['nvdec'] = ('h264_cuvid' in dec_text) or ('hevc_cuvid' in dec_text) or ('av1_cuvid' in dec_text)
-    except Exception:
-        pass
+    except Exception as e:
+        log_exception("Could not list ffmpeg decoders; assuming no NVDEC", e)
 
     return caps
 
@@ -196,34 +242,41 @@ def detect_hardware_capabilities():
 
 class WaveformWorker(QThread):
     finished = pyqtSignal(str, object)
+    failed = pyqtSignal(str, str)
 
     def __init__(self, file_path):
         super().__init__()
         self.file_path = file_path
 
     def run(self):
+        temp_png = os.path.join(tempfile.gettempdir(), f"wave_{hash(self.file_path)}.png")
+
+        cmd = [
+            'ffmpeg', '-y', '-v', 'error',
+            '-i', self.file_path,
+            '-filter_complex', 'aformat=channel_layouts=mono,showwavespic=s=2000x100:colors=white|0x4ade80',
+            '-frames:v', '1',
+            temp_png
+        ]
+
         try:
-            temp_png = os.path.join(tempfile.gettempdir(), f"wave_{hash(self.file_path)}.png")
+            run_probe(cmd, timeout=120)
+            if not os.path.exists(temp_png):
+                raise RuntimeError("ffmpeg produced no waveform image")
+            image = QImage(temp_png)
+            if image.isNull():
+                raise RuntimeError("waveform image could not be decoded")
+        except RuntimeError as e:
+            log_exception(f"Waveform generation failed for {self.file_path}", e)
+            self.failed.emit(self.file_path, str(e))
+            return
+        finally:
+            try:
+                os.remove(temp_png)
+            except OSError as e:
+                log_exception(f"Could not remove temp waveform {temp_png}", e)
 
-            cmd = [
-                'ffmpeg', '-y', '-v', 'error',
-                '-i', self.file_path,
-                '-filter_complex', 'aformat=channel_layouts=mono,showwavespic=s=2000x100:colors=white|0x4ade80',
-                '-frames:v', '1',
-                temp_png
-            ]
-
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-
-            if os.path.exists(temp_png):
-                image = QImage(temp_png)
-                self.finished.emit(self.file_path, image)
-                try:
-                    os.remove(temp_png)
-                except:
-                    pass
-        except Exception as e:
-            print(f"Waveform gen error: {e}")
+        self.finished.emit(self.file_path, image)
 
 # --- ACCESSIBILITY CLASSES ---
 
@@ -399,15 +452,15 @@ class MPVVideoWidget(QWidget):
             if self._pending_audio_filter is not None:
                 try:
                     self.mpv.lavfi_complex = self._pending_audio_filter
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_exception("MPV: could not apply pending audio filter", e)
                 self._pending_audio_filter = None
             if self._pending_seek_ms is not None:
                 try:
                     self.mpv.seek(self._pending_seek_ms / 1000.0, reference='absolute')
                     self._position_ms = self._pending_seek_ms
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_exception("MPV: could not apply pending seek", e)
                 self._pending_seek_ms = None
         finally:
             self._file_loading = False
@@ -457,7 +510,8 @@ class MPVVideoWidget(QWidget):
             def file_loaded_handler(event):
                 QTimer.singleShot(0, self._mpv_apply_file_loaded_pending)
 
-        except Exception:
+        except Exception as e:
+            log_exception("MPV: player initialisation failed, preview disabled", e)
             self.mpv = None
 
     def load_file(self, file_path, seek_ms=None):
@@ -473,7 +527,8 @@ class MPVVideoWidget(QWidget):
             self.mpv.pause = True
             self._is_paused = True
             return True
-        except Exception:
+        except Exception as e:
+            log_exception(f"MPV: could not load {file_path}", e)
             self._file_loading = False
             self._pending_seek_ms = None
             return False
@@ -485,8 +540,8 @@ class MPVVideoWidget(QWidget):
             self.mpv.pause = False
             self._is_paused = False
             self.position_timer.start()
-        except Exception:
-            pass
+        except Exception as e:
+            log_exception("MPV: play failed", e)
 
     def pause(self):
         if not self.mpv:
@@ -495,8 +550,8 @@ class MPVVideoWidget(QWidget):
             self.mpv.pause = True
             self._is_paused = True
             self.position_timer.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            log_exception("MPV: pause failed", e)
 
     def is_paused(self):
         return self._is_paused
@@ -507,8 +562,8 @@ class MPVVideoWidget(QWidget):
         try:
             self.mpv.seek(position_ms / 1000.0, reference='absolute')
             self._position_ms = position_ms
-        except Exception:
-            pass
+        except Exception as e:
+            log_exception("MPV: seek failed", e)
 
     def position(self):
         return self._position_ms
@@ -527,8 +582,8 @@ class MPVVideoWidget(QWidget):
             self._is_paused = True
             self._position_ms = 0
             self.position_timer.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            log_exception("MPV: stop failed", e)
 
     def set_audio_complex_filter(self, filter_string):
         if not self.mpv:
@@ -539,16 +594,16 @@ class MPVVideoWidget(QWidget):
         try:
             self.mpv.lavfi_complex = filter_string
             self._pending_audio_filter = None
-        except Exception:
-            pass
+        except Exception as e:
+            log_exception("MPV: could not apply audio filter", e)
 
     def shutdown(self):
         self.position_timer.stop()
         if self.mpv:
             try:
                 self.mpv.terminate()
-            except Exception:
-                pass
+            except Exception as e:
+                log_exception("MPV: terminate failed", e)
 
 
 class TimelineClip:
@@ -575,11 +630,7 @@ class TimelineClip:
             self.out_point = self.full_duration
 
     def get_video_duration(self):
-        try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.file_path], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            return float(result.stdout.strip())
-        except:
-            return 60.0
+        return probe_media_duration(self.file_path, 60.0)
 
     def get_trimmed_duration(self):
         return self.out_point - self.in_point
@@ -842,9 +893,13 @@ class TimelineWidget(QWidget):
         self.clips.append(clip)
         worker = WaveformWorker(clip.file_path)
         worker.finished.connect(self.waveform_ready)
+        worker.failed.connect(self.waveform_failed)
         self.waveform_threads.append(worker)
         worker.start()
         self.update()
+
+    def waveform_failed(self, file_path, message):
+        logger.warning("No waveform for %s: %s", file_path, message)
 
     def waveform_ready(self, file_path, image):
         pixmap = QPixmap.fromImage(image)
@@ -889,11 +944,7 @@ class MediaLibraryItem:
         self.out_point = self.duration
 
     def get_video_duration(self):
-        try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.file_path], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            return float(result.stdout.strip())
-        except:
-            return 60.0
+        return probe_media_duration(self.file_path, 60.0)
 
     def get_trimmed_duration(self):
         return self.out_point - self.in_point
@@ -913,10 +964,6 @@ def _parse_ffmpeg_time(line):
     return None
 
 def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress_callback=None):
-    import subprocess
-    import tempfile
-    import os
-
     def log(msg):
         if progress_callback:
             progress_callback(msg)
@@ -932,17 +979,15 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
     ]
 
     try:
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        audio_tracks = [int(x) for x in result.stdout.strip().split('\n') if x]
+        audio_tracks = [int(x) for x in run_probe(probe_cmd, timeout=5).strip().split('\n') if x]
+    except (RuntimeError, ValueError) as e:
+        raise RuntimeError(f"Failed to probe audio tracks: {e}") from e
 
-        if track1 >= len(audio_tracks) or track2 >= len(audio_tracks):
-            raise Exception(f"File has {len(audio_tracks)} audio tracks, cannot access track {max(track1, track2)}")
+    if track1 >= len(audio_tracks) or track2 >= len(audio_tracks):
+        raise RuntimeError(f"File has {len(audio_tracks)} audio tracks, cannot access track {max(track1, track2)}")
 
-        if len(audio_tracks) < 2:
-            raise Exception(f"File only has {len(audio_tracks)} audio track(s), need at least 2 for sync")
-
-    except Exception as e:
-        raise Exception(f"Failed to probe audio tracks: {e}")
+    if len(audio_tracks) < 2:
+        raise RuntimeError(f"File only has {len(audio_tracks)} audio track(s), need at least 2 for sync")
 
     with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp1, \
          tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp2:
@@ -965,9 +1010,10 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
             tmp1_path
         ]
 
-        result = subprocess.run(extract1_cmd, capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        if result.returncode != 0:
-            raise Exception(f"Failed to extract track {track1}: {result.stderr.decode()}")
+        try:
+            run_probe(extract1_cmd, timeout=60)
+        except RuntimeError as e:
+            raise RuntimeError(f"Failed to extract track {track1}: {e}") from e
 
         log(f"Extracting track {track2} (to sync)...")
         extract2_cmd = [
@@ -981,15 +1027,16 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
             tmp2_path
         ]
 
-        result = subprocess.run(extract2_cmd, capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        if result.returncode != 0:
-            raise Exception(f"Failed to extract track {track2}: {result.stderr.decode()}")
+        try:
+            run_probe(extract2_cmd, timeout=60)
+        except RuntimeError as e:
+            raise RuntimeError(f"Failed to extract track {track2}: {e}") from e
 
         size1 = os.path.getsize(tmp1_path)
         size2 = os.path.getsize(tmp2_path)
 
         if size1 < 1000 or size2 < 1000:
-            raise Exception("Extracted audio too short, check file has audio on both tracks")
+            raise RuntimeError("Extracted audio too short, check file has audio on both tracks")
 
         log("Analyzing correlation...")
         import numpy as np
@@ -1027,10 +1074,11 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
         return offset_ms, confidence
 
     finally:
-        try: os.unlink(tmp1_path)
-        except: pass
-        try: os.unlink(tmp2_path)
-        except: pass
+        for tmp_path in (tmp1_path, tmp2_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError as e:
+                log_exception(f"Could not remove temp audio file {tmp_path}", e)
 
 import hashlib
 
@@ -1064,11 +1112,15 @@ class BackgroundCacheThread(QThread):
         self.engine = None
 
     def run(self):
-        self.engine = TimelineRenderingEngine(self.timeline, self.settings, self.cache_path,
-            log_callback=lambda m: None, progress_callback=self.progress.emit,
-            status_callback=self.status.emit, playhead_callback=lambda t: None,
-            is_cache_render=True)
-        success, message = self.engine.render()
+        try:
+            self.engine = TimelineRenderingEngine(self.timeline, self.settings, self.cache_path,
+                log_callback=lambda m: logger.debug("cache render: %s", m), progress_callback=self.progress.emit,
+                status_callback=self.status.emit, playhead_callback=lambda t: None,
+                is_cache_render=True)
+            success, message = self.engine.render()
+        except Exception as e:
+            log_exception("Background cache render crashed", e)
+            success, message = False, str(e)
         self.finished.emit(success, message, self.current_hash)
 
     def stop(self):
@@ -1138,7 +1190,9 @@ class TimelineCacheManager(QObject):
             self.ready_hash = finished_hash
             self.status_changed.emit("Cache: Ready ⚡")
         elif not success and finished_hash == self.last_hash:
-            self.status_changed.emit("Cache: Error")
+            logger.warning("Background cache render failed: %s", msg)
+            summary = msg.strip().splitlines()[0][:80] if msg.strip() else "unknown error"
+            self.status_changed.emit(f"Cache: Error ({summary})")
             
     def get_valid_cache_path(self):
         settings = self.app.get_settings()
@@ -1174,8 +1228,8 @@ class TimelineRenderingEngine:
         if self.encoder_process:
             try:
                 self.encoder_process.kill()
-            except:
-                pass
+            except OSError as e:
+                log_exception("Could not kill encoder process", e)
 
     def get_timeline_duration(self):
         if not self.timeline.clips:
@@ -1183,24 +1237,23 @@ class TimelineRenderingEngine:
         return max(clip.get_end_time() for clip in self.timeline.clips)
 
     def get_video_metadata(self, file_path):
+        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+               '-show_entries', 'stream=width,height,codec_name', '-of', 'json', file_path]
         try:
-            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                   '-show_entries', 'stream=width,height,codec_name', '-of', 'json', file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            data = json.loads(result.stdout)
-            stream = data['streams'][0]
+            stream = json.loads(run_probe(cmd, timeout=5))['streams'][0]
             return stream['width'], stream['height']
-        except:
+        except (RuntimeError, ValueError, KeyError, IndexError) as e:
+            log_exception(f"Could not probe resolution of {file_path}, assuming 1920x1080", e)
+            self.log(f"⚠️  Could not read resolution of {os.path.basename(file_path)}: {e}. Assuming 1920x1080.")
             return 1920, 1080
 
     def _get_video_codec(self, file_path):
+        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+               '-show_entries', 'stream=codec_name', '-of', 'json', file_path]
         try:
-            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                   '-show_entries', 'stream=codec_name', '-of', 'json', file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            data = json.loads(result.stdout)
-            return data['streams'][0]['codec_name']
-        except:
+            return json.loads(run_probe(cmd, timeout=5))['streams'][0]['codec_name']
+        except (RuntimeError, ValueError, KeyError, IndexError) as e:
+            log_exception(f"Could not probe codec of {file_path}", e)
             return 'unknown'
 
     def _build_video_filters(self):
@@ -1257,6 +1310,8 @@ class TimelineRenderingEngine:
                 export_width, export_height = source_width, source_height
             else:
                 res_map = {1: (1920, 1080), 2: (2560, 1440), 3: (3840, 2160), 4: (5120, 2880), 5: (7680, 4320)}
+                if export_res_index not in res_map:
+                    return False, f"Unknown export resolution index {export_res_index}"
                 export_width, export_height = res_map[export_res_index]
 
             # ENSURE EVEN DIMENSIONS (Prevents NVENC padding crash)
@@ -1402,17 +1457,27 @@ class TimelineRenderingEngine:
             self.log(f"Compositing execution started...")
 
             start_time = time.time()
-            self.encoder_process = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
+            try:
+                self.encoder_process = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, creationflags=NO_WINDOW_FLAGS
+                )
+            except FileNotFoundError as e:
+                log_exception("ffmpeg could not be started", e)
+                return False, "ffmpeg not found on PATH - install FFmpeg to export"
 
             # 4. MONITOR PROGRESS
+            stderr_tail = collections.deque(maxlen=20)
             for line in iter(self.encoder_process.stderr.readline, ''):
                 if self.should_stop:
                     self.encoder_process.kill()
                     return False, "Render cancelled by user"
 
                 t = _parse_ffmpeg_time(line)
+                if t is None:
+                    stripped = line.strip()
+                    if stripped:
+                        stderr_tail.append(stripped)
+                        self.log(stripped)
                 if t is not None and timeline_duration > 0:
                     pct = min(99, int((t / timeline_duration) * 100))
                     self.progress(pct)
@@ -1425,7 +1490,9 @@ class TimelineRenderingEngine:
             self.encoder_process.wait()
 
             if self.encoder_process.returncode != 0:
-                return False, f"Export failed with code {self.encoder_process.returncode}"
+                detail = "\n".join(stderr_tail).strip()
+                message = f"Export failed with code {self.encoder_process.returncode}"
+                return False, f"{message}:\n{detail}" if detail else message
 
             elapsed = time.time() - start_time
             self.progress(100)
@@ -1487,38 +1554,45 @@ class EncodingThread(QThread):
             cmd = self.build_ffmpeg_command()
             self.log_message.emit(f"Command: {' '.join(cmd)}")
             self.status.emit("Starting encode...")
-            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            try:
+                self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, creationflags=NO_WINDOW_FLAGS)
+            except FileNotFoundError as e:
+                log_exception("ffmpeg could not be started", e)
+                self.finished.emit(False, "ffmpeg not found on PATH - install FFmpeg to encode")
+                return
             duration = self.get_duration()
+            stderr_tail = collections.deque(maxlen=20)
             for line in iter(self.process.stderr.readline, ''):
                 if self.should_stop:
                     self.process.kill()
                     self.finished.emit(False, "Stopped")
                     return
                 self.log_message.emit(line.strip())
-                if duration > 0:
-                    current = _parse_ffmpeg_time(line)
-                    if current is not None:
-                        pct = int((current / duration) * 100)
-                        self.progress.emit(min(pct, 99))
-                        self.status.emit(f"Encoding: {pct}%")
+                current = _parse_ffmpeg_time(line)
+                if current is None:
+                    if line.strip():
+                        stderr_tail.append(line.strip())
+                elif duration > 0:
+                    pct = int((current / duration) * 100)
+                    self.progress.emit(min(pct, 99))
+                    self.status.emit(f"Encoding: {pct}%")
             self.process.wait()
             if self.process.returncode == 0:
                 self.progress.emit(100)
                 self.status.emit("Done!")
                 self.finished.emit(True, "Success")
             else:
-                self.finished.emit(False, "Encode failed")
+                detail = "\n".join(stderr_tail).strip()
+                message = f"Encode failed with code {self.process.returncode}"
+                self.finished.emit(False, f"{message}:\n{detail}" if detail else message)
         except Exception as e:
+            log_exception(f"Encoding {self.input_file} failed", e)
             self.finished.emit(False, str(e))
 
     def build_ffmpeg_command(self):
         cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
         use_gpu_decode = self.settings.get('use_gpu_decode', False)
-        codec_name = None
-        try:
-            codec_name = self.settings.get('input_codec_name')
-        except Exception:
-            codec_name = None
+        codec_name = self.settings.get('input_codec_name')
         cmd.extend(build_hw_decode_input_args(self.input_file, codec_name, use_gpu_decode))
         filter_complex = []
 
@@ -1596,17 +1670,15 @@ class EncodingThread(QThread):
         return cmd
 
     def get_duration(self):
-        try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', self.input_file], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            return float(result.stdout.strip())
-        except:
-            return 0
+        return probe_media_duration(self.input_file, 0)
 
     def stop(self):
         self.should_stop = True
         if self.process:
-            try: self.process.kill()
-            except: pass
+            try:
+                self.process.kill()
+            except OSError as e:
+                log_exception("Could not kill encoder process", e)
 
 
 class FastEncodeProApp(QMainWindow):
@@ -1670,6 +1742,21 @@ class FastEncodeProApp(QMainWindow):
 
         self.apply_theme()
         self.load_settings()
+        self.warn_about_missing_tools()
+
+    def warn_about_missing_tools(self):
+        missing = find_missing_tools()
+        if not missing:
+            return
+        names = ", ".join(missing)
+        logger.error("Required tool(s) not found on PATH: %s", names)
+        self.status_label.setText(f"Missing: {names}")
+        QMessageBox.critical(
+            self,
+            "FFmpeg Not Found",
+            f"Required tool(s) not found on PATH: {names}.\n\n"
+            "Encoding, export and preview will fail until FFmpeg is installed."
+        )
 
     def apply_auto_hardware_settings(self, update_status=False):
         nvenc_available = self.hw_caps.get('nvenc_h264', False) or self.hw_caps.get('nvenc_hevc', False)
@@ -2446,21 +2533,27 @@ class FastEncodeProApp(QMainWindow):
             edl_path = path.replace('\\', '/')
             seek_ms = int(self.timeline.playhead_position * 1000)
             
-            if self.video_widget.load_file(edl_path, seek_ms=seek_ms):
-                # Set timeline-derived duration immediately as fallback
-                # so scrubber/timecode work before MPV's async observer fires
-                timeline_dur_ms = int(self.timeline.get_timeline_duration() * 1000)
-                if self.video_widget._duration_ms <= 0:
-                    self.video_widget._duration_ms = timeline_dur_ms
-                    self.video_widget.durationChanged.emit(timeline_dur_ms)
-                if play:
-                    self.video_widget.play()
-                    self.play_btn.setText("⏸️ Pause")
-                else:
-                    self.video_widget.pause()
-                    self.play_btn.setText("▶️ Play")
-        except Exception as e:
-            pass
+            if not self.video_widget.load_file(edl_path, seek_ms=seek_ms):
+                self.append_log("⚠️  Preview could not load the timeline sequence (see log for details)")
+                self.status_label.setText("Preview unavailable")
+                return
+
+            # Set timeline-derived duration immediately as fallback
+            # so scrubber/timecode work before MPV's async observer fires
+            timeline_dur_ms = int(self.timeline.get_timeline_duration() * 1000)
+            if self.video_widget._duration_ms <= 0:
+                self.video_widget._duration_ms = timeline_dur_ms
+                self.video_widget.durationChanged.emit(timeline_dur_ms)
+            if play:
+                self.video_widget.play()
+                self.play_btn.setText("⏸️ Pause")
+            else:
+                self.video_widget.pause()
+                self.play_btn.setText("▶️ Play")
+        except OSError as e:
+            log_exception("Could not write timeline EDL for preview", e)
+            self.append_log(f"⚠️  Preview unavailable: {e}")
+            self.status_label.setText("Preview unavailable")
 
     def on_timeline_clip_selected(self, clip):
         self.is_timeline_mode = True
@@ -2486,6 +2579,8 @@ class FastEncodeProApp(QMainWindow):
         if self.video_widget.load_file(clip.file_path, seek_ms=seek_ms):
             self.video_widget.pause()
             self.apply_audio_mix_preview(clip.file_path, clip.volumes, clip.normalization)
+        else:
+            self.append_log(f"⚠️  Preview could not load {clip.name}")
 
         in_tc = self.format_timecode(int(clip.in_point * 1000))
         out_tc = self.format_timecode(int(clip.out_point * 1000))
@@ -3538,8 +3633,8 @@ class FastEncodeProApp(QMainWindow):
         if self.video_widget:
             try:
                 self.video_widget.shutdown()
-            except:
-                pass
+            except Exception as e:
+                log_exception("Video preview shutdown failed", e)
 
         if self.encoding_thread and self.encoding_thread.isRunning():
             reply = QMessageBox.question(self, "Active", "Stop and quit?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)

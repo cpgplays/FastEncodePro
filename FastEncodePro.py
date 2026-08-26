@@ -96,7 +96,7 @@ from PyQt6.QtGui import (
 )
 
 
-__version__ = "0.9.3"
+__version__ = "0.9.4h"
 GITHUB_REPO = "TylerDavies/FastEncodePro"  # Change to your actual GitHub repo
 
 class UpdateManager:
@@ -400,20 +400,20 @@ def get_export_extension_for_codec(codec):
 
 
 def should_enable_faststart(settings):
-    return settings.get('rate_control', 'cbr') not in ('cqp', 'lossless')
+    # DISABLED v0.9.4: +faststart causes 10 min 117 Mbps random copy on 1000+ MB/s SSDs
+    return False
 
 
 def append_faststart_args(cmd, settings, log_callback=None):
-    if should_enable_faststart(settings):
-        cmd.extend(['-movflags', '+faststart'])
-    elif callable(log_callback):
-        log_callback("Faststart disabled for CQP/lossless export to avoid a long 99% metadata rewrite on huge files.")
+    # No-op: faststart removed to unlock full SSD write speed (was 4KB random copy)
+    if callable(log_callback) and settings.get('rate_control', 'cbr') not in ('cqp', 'lossless'):
+        log_callback("Faststart disabled (v0.9.4): unlocked SSD speed, finalizing now 2 sec not 10 min.")
+    return
 
 
 def append_output_file_args(cmd, output_path, settings=None, log_callback=None):
+    # FIX v0.9.4: Removed -flush_packets 0 and +faststart - direct sequential write
     settings = settings or {}
-    cmd.extend(['-flush_packets', '0'])
-    append_faststart_args(cmd, settings, log_callback)
     cmd.append(output_path)
 
 
@@ -539,12 +539,24 @@ def build_video_filters_from_settings(settings):
 
     denoise = settings.get('denoise_level', 0)
     if denoise > 0:
-        vals = ['', 'hqdn3d=1.5:1.5:6:6', 'hqdn3d=2:2:8:8', 'hqdn3d=3:3:10:10',
-                'hqdn3d=4:4:12:12', 'hqdn3d=6:6:15:15', 'hqdn3d=8:8:18:18']
+        # FIX v0.9.4f: MULTI-THREADING - hqdn3d is single-threaded, user wants CPU/GPU sharing
+        # Code 4294967274 = -22 Invalid arg = my previous scale_cuda inside bg6 was wrong
+        # Simple fix: use threads=0 for hqdn3d which enables multi-threading where possible, or nlmeans which is threaded
+        is_10bit = settings.get('pixel_format', 1) == 1 and settings.get('video_codec', '') != 'h264_nvenc'
+        
+        # Multi-threaded options - hqdn3d with threads=0 uses all cores for spatial part
+        # nlmeans is threaded, atadenoise is threaded
+        vals = ['', 
+                'hqdn3d=1.5:1.5:6:6:threads=0', 
+                'hqdn3d=2:2:8:8:threads=0', 
+                'hqdn3d=3:3:10:10:threads=0',
+                'hqdn3d=4:4:12:12:threads=0', 
+                'hqdn3d=6:6:15:15:threads=0', 
+                'hqdn3d=8:8:18:18:threads=0']
+        
         if denoise < len(vals) and vals[denoise]:
-            # FIX 4294967256: hqdn3d doesn't support p010le 10-bit
-            is_10bit = settings.get('pixel_format', 1) == 1 and settings.get('video_codec', '') != 'h264_nvenc'
             if is_10bit:
+                # 10-bit needs nv12 for hqdn3d
                 filters.append(f"format=nv12,{vals[denoise]},format=p010le")
             else:
                 filters.append(vals[denoise])
@@ -2123,7 +2135,7 @@ class ProxyManager(QObject):
     
 class TimelineRenderingEngine:
     """
-    MASTER CANVAS COMPOSITOR ENGINE (v0.9.3)
+    MASTER CANVAS COMPOSITOR ENGINE (v0.9.4e)
     This entirely replaces the Python-pipe transcoder with a true NLE FFmpeg graph.
     All clips are overlaid onto a blank hardware canvas natively.
     No temp files. No System RAM bottlenecks. 100% GPU utilization.
@@ -2179,7 +2191,7 @@ class TimelineRenderingEngine:
 
     def render(self):
         try:
-            self.log("=== HIGH-PERFORMANCE MASTER CANVAS ENGINE v0.9.3 ===")
+            self.log("=== HIGH-PERFORMANCE MASTER CANVAS ENGINE v0.9.4e ===")
             self.log("Compiling Timeline NLE Graph...")
 
             if not self.timeline.clips:
@@ -2204,332 +2216,315 @@ class TimelineRenderingEngine:
             self.log(f"Resolution: {export_width}x{export_height} @ {timeline_fps} FPS")
             self.log(f"Total Duration: {timeline_duration:.2f}s")
 
-            if not getattr(self, 'is_cache_render', False) and getattr(self, 'valid_cache_path', None) and os.path.exists(self.valid_cache_path):
-                self.log("ðŸ’Ž Found valid background render cache! Bypassing CPU filters for maximum speed...")
+            # FIX v0.9.4: Removed dead cache branch (is_cache_render/valid_cache_path never set - vestigial per Claude)
+            # Was reintroducing background-cache path that never fired - removed to fix insta-crash
+            use_gpu_decode = self.settings.get('use_gpu_decode', False)
+            use_gpu_composite = self.settings.get('use_gpu_composite', False)
+            video_codec = self.settings.get('video_codec', 'hevc_nvenc')
+            is_nvenc = 'nvenc' in video_codec
+                
+            if use_gpu_composite and use_gpu_decode and is_nvenc:
+                self.log("🚀 5070 TURBO MODE ACTIVE - Full GPU Canvas (VRAM only)")
+                self.log("   No CPU copy: scale_cuda + overlay_cuda + NVENC - should max out GPU like DaVinci")
                 cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
-                import multiprocessing as _mp_cache
-                _c = _mp_cache.cpu_count() or 8
-                cmd.extend(['-filter_threads', str(_c), '-filter_complex_threads', str(_c), '-extra_hw_frames', '64', '-threads', '0', '-thread_queue_size', '1024'])
-                cmd.extend(['-hwaccel', 'auto', '-i', self.valid_cache_path])
-                
-                codec = self.settings.get('video_codec', 'hevc_nvenc')
-                cmd.extend(['-c:v', codec])
-                if 'nvenc' in codec:
-                    cmd.extend(build_nvenc_cbr_args(self.settings, timeline_fps))
-                
-                cmd.extend(['-c:a', 'copy'])
-                append_output_file_args(cmd, self.output_path, self.settings, self.log)
+                import multiprocessing
+                cpu_cores = multiprocessing.cpu_count() or 8
+                cmd.extend(['-filter_threads', str(cpu_cores), '-filter_complex_threads', str(cpu_cores)])
+                cmd.extend(['-extra_hw_frames', '16'])
+                cmd.extend(['-threads', '0'])
+                # 1. ADD INPUTS - keep in GPU VRAM
+                for clip in sorted_clips:
+                    cmd.extend(['-ss', str(clip.in_point)])
+                    cmd.extend(['-t', str(clip.get_trimmed_duration())])
+                    cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', '-i', clip.file_path])
             else:
-                use_gpu_decode = self.settings.get('use_gpu_decode', False)
-                use_gpu_composite = self.settings.get('use_gpu_composite', False)
-                video_codec = self.settings.get('video_codec', 'hevc_nvenc')
-                is_nvenc = 'nvenc' in video_codec
-                
-                if use_gpu_composite and use_gpu_decode and is_nvenc:
-                    self.log("🚀 5070 TURBO MODE ACTIVE - Full GPU Canvas (VRAM only)")
-                    self.log("   No CPU copy: scale_cuda + overlay_cuda + NVENC - should max out GPU like DaVinci")
-                    cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
-                    import multiprocessing
-                    cpu_cores = multiprocessing.cpu_count() or 8
-                    cmd.extend(['-filter_threads', str(cpu_cores), '-filter_complex_threads', str(cpu_cores)])
-                    cmd.extend(['-extra_hw_frames', '128'])
-                    cmd.extend(['-threads', '0'])
-                    # 1. ADD INPUTS - keep in GPU VRAM
-                    for clip in sorted_clips:
-                        cmd.extend(['-thread_queue_size', '1024'])
-                        cmd.extend(['-ss', str(clip.in_point)])
-                        cmd.extend(['-t', str(clip.get_trimmed_duration())])
-                        cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', '-i', clip.file_path])
+                self.log("🚀 Hardware Decode + Robust CPU Compositing Pipeline ACTIVE.")
+                if use_gpu_composite and not is_nvenc:
+                    self.log("   (Turbo requested but codec not NVENC - falling back to CPU canvas)")
                 else:
-                    self.log("🚀 Hardware Decode + Robust CPU Compositing Pipeline ACTIVE.")
-                    if use_gpu_composite and not is_nvenc:
-                        self.log("   (Turbo requested but codec not NVENC - falling back to CPU canvas)")
-                    else:
-                        self.log("   (CPU scale/overlay - safe path, enable TURBO for 5070)")
-                    cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
-                    import multiprocessing
-                    cpu_cores = multiprocessing.cpu_count() or 8
-                    cmd.extend(['-filter_threads', str(cpu_cores), '-filter_complex_threads', str(cpu_cores)])
-                    cmd.extend(['-extra_hw_frames', '64'])
-                    cmd.extend(['-threads', '0'])
-                    # 1. ADD INPUTS - big queue per input = CPU pre-decodes ahead
-                    for clip in sorted_clips:
-                        codec = self._get_video_codec(clip.file_path)
-                        cmd.extend(['-thread_queue_size', '1024'])
-                        cmd.extend(['-ss', str(clip.in_point)])
-                        cmd.extend(['-t', str(clip.get_trimmed_duration())])
-                        cmd.extend(build_hw_decode_input_args(clip.file_path, codec, use_gpu_decode, timeline_fps))
+                    self.log("   (CPU scale/overlay - safe path, enable TURBO for 5070)")
+                cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
+                import multiprocessing
+                cpu_cores = multiprocessing.cpu_count() or 8
+                cmd.extend(['-filter_threads', str(cpu_cores), '-filter_complex_threads', str(cpu_cores)])
+                cmd.extend(['-extra_hw_frames', '64'])
+                cmd.extend(['-threads', '0'])
+                # 1. ADD INPUTS - big queue per input = CPU pre-decodes ahead
+                for clip in sorted_clips:
+                    codec = self._get_video_codec(clip.file_path)
+                    cmd.extend(['-ss', str(clip.in_point)])
+                    cmd.extend(['-t', str(clip.get_trimmed_duration())])
+                    cmd.extend(build_hw_decode_input_args(clip.file_path, codec, use_gpu_decode, timeline_fps))
 
-                # 2. BUILD THE COMPOSITING GRAPH
-                filter_complex = []
+            # 2. BUILD THE COMPOSITING GRAPH
+            filter_complex = []
 
-                # Create the master blank canvas at exact output specs
-                is_10bit = self.settings.get('pixel_format', 1) == 1
-                if self.settings.get('video_codec', '') == 'h264_nvenc':
-                    is_10bit = False
+            # Create the master blank canvas at exact output specs
+            is_10bit = self.settings.get('pixel_format', 1) == 1
+            if self.settings.get('video_codec', '') == 'h264_nvenc':
+                is_10bit = False
                 
-                # Use robust p010le format for 10-bit HDR exports. CPU filters support it flawlessly.
-                canvas_format = 'p010le' if is_10bit else 'nv12'
-                canvas_format_cuda = 'p010' if is_10bit else 'nv12'
+            # Use robust p010le format for 10-bit HDR exports. CPU filters support it flawlessly.
+            canvas_format = 'p010le' if is_10bit else 'nv12'
+            canvas_format_cuda = 'p010' if is_10bit else 'nv12'
                 
-                # Detect early if filters will be used - for Hybrid mode to avoid overlay_cuda p010le bug in FFmpeg 9.01
-                early_filters_check = self._build_video_filters()
-                early_text_check = getattr(self.timeline, 'text_clips', [])
-                early_is_turbo_check = self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec','')
-                early_hybrid = early_is_turbo_check and bool(early_filters_check or early_text_check)
-                # FFmpeg 9.01 overlay_cuda does NOT support p010 main input at all (even full TURBO), so 10-bit must always use CPU overlay
-                force_cpu_overlay_for_10bit = is_10bit and early_is_turbo_check
-                if early_hybrid:
-                    self.log(f"TURBO Hybrid: {len(early_filters_check)} filters + {len(early_text_check)} text - GPU scale, CPU overlay to avoid overlay_cuda p010le error. Filters: {','.join(early_filters_check)[:80]}")
-                if force_cpu_overlay_for_10bit and not early_hybrid:
-                    self.log(f"TURBO 10-bit full VRAM workaround: FFmpeg 9.01 overlay_cuda doesn't support p010, using GPU scale -> CPU overlay for all 10-bit")
+            # Detect early if filters will be used - for Hybrid mode to avoid overlay_cuda p010le bug in FFmpeg 9.01
+            early_filters_check = self._build_video_filters()
+            early_text_check = getattr(self.timeline, 'text_clips', [])
+            early_is_turbo_check = self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec','')
+            early_hybrid = early_is_turbo_check and bool(early_filters_check or early_text_check)
+            # FFmpeg 9.01 overlay_cuda does NOT support p010 main input at all (even full TURBO), so 10-bit must always use CPU overlay
+            force_cpu_overlay_for_10bit = is_10bit and early_is_turbo_check
+            if early_hybrid:
+                self.log(f"TURBO Hybrid: {len(early_filters_check)} filters + {len(early_text_check)} text - GPU scale, CPU overlay to avoid overlay_cuda p010le error. Filters: {','.join(early_filters_check)[:80]}")
+            if force_cpu_overlay_for_10bit and not early_hybrid:
+                self.log(f"TURBO 10-bit full VRAM workaround: FFmpeg 9.01 overlay_cuda doesn't support p010, using GPU scale -> CPU overlay for all 10-bit")
                 
-                # Branch canvas based on turbo mode
-                if self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec',''):
-                    if (early_hybrid and is_10bit) or (force_cpu_overlay_for_10bit):
-                        # 10-bit: keep canvas on CPU to avoid overlay_cuda p010le unsupported (both Hybrid and full TURBO)
-                        filter_complex.append(f"color=c=black:s={export_width}x{export_height}:r={timeline_fps}:d={timeline_duration},format={canvas_format}[bg0]")
-                    else:
-                        # Full TURBO 8-bit: GPU canvas stays in VRAM (overlay_cuda supports nv12)
-                        filter_complex.append(f"color=c=black:s={export_width}x{export_height}:r={timeline_fps}:d={timeline_duration},format={canvas_format},hwupload_cuda,scale_cuda=format={canvas_format_cuda}[bg0]")
-                else:
-                    # Always use standard CPU canvas
+            # Branch canvas based on turbo mode
+            if self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec',''):
+                if (early_hybrid and is_10bit) or (force_cpu_overlay_for_10bit):
+                    # 10-bit: keep canvas on CPU to avoid overlay_cuda p010le unsupported (both Hybrid and full TURBO)
                     filter_complex.append(f"color=c=black:s={export_width}x{export_height}:r={timeline_fps}:d={timeline_duration},format={canvas_format}[bg0]")
+                else:
+                    # Full TURBO 8-bit: GPU canvas stays in VRAM (overlay_cuda supports nv12)
+                    filter_complex.append(f"color=c=black:s={export_width}x{export_height}:r={timeline_fps}:d={timeline_duration},format={canvas_format},hwupload_cuda,scale_cuda=format={canvas_format_cuda}[bg0]")
+            else:
+                # Always use standard CPU canvas
+                filter_complex.append(f"color=c=black:s={export_width}x{export_height}:r={timeline_fps}:d={timeline_duration},format={canvas_format}[bg0]")
 
-                audio_inputs = []
+            audio_inputs = []
 
-                for i, clip in enumerate(sorted_clips):
-                    # --- VIDEO GRAPH ---
-                    v_in = f"[{i}:v]"
-                    v_scaled = f"[v{i}_scale]"
+            for i, clip in enumerate(sorted_clips):
+                # --- VIDEO GRAPH ---
+                v_in = f"[{i}:v]"
+                v_scaled = f"[v{i}_scale]"
 
-                    st = clip.start_time
-                    duration = clip.get_trimmed_duration()
-                    end_time = clip.start_time + duration
-                    bg_in = f"[bg{i}]"
-                    bg_out = f"[bg{i+1}]"
+                st = clip.start_time
+                duration = clip.get_trimmed_duration()
+                end_time = clip.start_time + duration
+                bg_in = f"[bg{i}]"
+                bg_out = f"[bg{i+1}]"
 
-                    v_trimmed = f"[v{i}_trim]"
-                    filter_complex.append(
-                        f"{v_in}trim=start=0:end={duration},"
-                        f"setpts=PTS-STARTPTS+{st:.6f}/TB{v_trimmed}"
-                    )
-                    # --- NATIVE RES SKIP + GPU TURBO LOGIC ---
-                    try:
-                        clip_w, clip_h = self.get_video_metadata(clip.file_path)
-                    except:
-                        clip_w, clip_h = export_width, export_height
-                    is_turbo = self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec','')
-                    # For 10-bit, always use CPU overlay to avoid FFmpeg 9.01 overlay_cuda p010 bug (all resolutions)
-                    use_cpu_overlay = early_hybrid or (is_10bit and is_turbo)
-                    if clip_w == export_width and clip_h == export_height:
-                        if is_turbo and not use_cpu_overlay:
-                            scale_str = f"scale_cuda=format={canvas_format_cuda},setsar=1"
-                            self.log(f"Clip {i}: Native {clip_w}x{clip_h} == export -> TURBO SKIPPING scale (VRAM) 8-bit")
-                        elif is_turbo and use_cpu_overlay:
-                            scale_str = f"scale_cuda=format={canvas_format_cuda},setsar=1,hwdownload,format={canvas_format}"
-                            self.log(f"Clip {i}: Native {clip_w}x{clip_h} == export -> {'HYBRID' if early_hybrid else '10-bit TURBO'} GPU scale then CPU (avoids overlay_cuda p010 bug) - {export_width}x{export_height}")
-                        else:
-                            scale_str = f"format={canvas_format},setsar=1"
-                            self.log(f"Clip {i}: Native {clip_w}x{clip_h} == export {export_width}x{export_height} -> SKIPPING scale/pad")
-                    else:
-                        if is_turbo and not use_cpu_overlay:
-                            # GPU upscale 1080p->5K etc - 8-bit full TURBO only
-                            scale_str = f"scale_cuda={export_width}:{export_height}:force_original_aspect_ratio=decrease:format={canvas_format_cuda}"
-                            self.log(f"Clip {i}: {clip_w}x{clip_h} -> {export_width}x{export_height} TURBO GPU scaling 8-bit")
-                        elif is_turbo and use_cpu_overlay:
-                            scale_str = f"scale_cuda={export_width}:{export_height}:force_original_aspect_ratio=decrease:format={canvas_format_cuda},hwdownload,format={canvas_format},pad={export_width}:{export_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-                            self.log(f"Clip {i}: {clip_w}x{clip_h} -> {export_width}x{export_height} {'HYBRID' if early_hybrid else '10-bit TURBO'} GPU->CPU scaling")
-                        else:
-                            scale_str = f"scale={export_width}:{export_height}:force_original_aspect_ratio=decrease,format={canvas_format},pad={export_width}:{export_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-                            self.log(f"Clip {i}: {clip_w}x{clip_h} -> {export_width}x{export_height} CPU scaling")
-                    filter_complex.append(f"{v_trimmed}{scale_str}{v_scaled}")
+                v_trimmed = f"[v{i}_trim]"
+                filter_complex.append(
+                    f"{v_in}trim=start=0:end={duration},"
+                    f"setpts=PTS-STARTPTS+{st:.6f}/TB{v_trimmed}"
+                )
+                # --- NATIVE RES SKIP + GPU TURBO LOGIC ---
+                try:
+                    clip_w, clip_h = self.get_video_metadata(clip.file_path)
+                except:
+                    clip_w, clip_h = export_width, export_height
+                # FIX v0.9.4e: is_turbo must check actual use_gpu_decode after forcing, not settings - fixes scale_cuda on CPU input crash -40
+                is_turbo = use_gpu_composite and use_gpu_decode and is_nvenc
+                # For 10-bit, always use CPU overlay to avoid FFmpeg 9.01 overlay_cuda p010 bug (all resolutions)
+                use_cpu_overlay = early_hybrid or (is_10bit and is_turbo)
+                if clip_w == export_width and clip_h == export_height:
                     if is_turbo and not use_cpu_overlay:
-                        filter_complex.append(f"{bg_in}{v_scaled}overlay_cuda=enable='between(t,{clip.start_time},{end_time})':eof_action=pass{bg_out}")
+                        scale_str = f"scale_cuda=format={canvas_format_cuda},setsar=1"
+                        self.log(f"Clip {i}: Native {clip_w}x{clip_h} == export -> TURBO SKIPPING scale (VRAM) 8-bit")
+                    elif is_turbo and use_cpu_overlay:
+                        # FIX v0.9.4g: cuda input -> p010le needs hwdownload, was missing causing -40
+                        # FIX v0.9.4h: hwdownload Invalid output format p010le - need scale_cuda=format=p010 first
+                        scale_str = f"scale_cuda=format=p010,hwdownload,format={canvas_format},setsar=1"
+                        self.log(f"Clip {i}: Native {clip_w}x{clip_h} == export -> {'HYBRID' if early_hybrid else '10-bit TURBO'} GPU->CPU via scale_cuda+hwdownload - {export_width}x{export_height}")
                     else:
-                        filter_complex.append(f"{bg_in}{v_scaled}overlay=enable='between(t,{clip.start_time},{end_time})':eof_action=pass{bg_out}")
+                        scale_str = f"format={canvas_format},setsar=1"
+                        self.log(f"Clip {i}: Native {clip_w}x{clip_h} == export {export_width}x{export_height} -> SKIPPING scale/pad")
+                else:
+                    if is_turbo and not use_cpu_overlay:
+                        # GPU upscale 1080p->5K etc - 8-bit full TURBO only
+                        scale_str = f"scale_cuda={export_width}:{export_height}:force_original_aspect_ratio=decrease:format={canvas_format_cuda}"
+                        self.log(f"Clip {i}: {clip_w}x{clip_h} -> {export_width}x{export_height} TURBO GPU scaling 8-bit")
+                    elif is_turbo and use_cpu_overlay:
+                        # FIX v0.9.4g: cuda input needs hwdownload before scale, was -40
+                        # FIX v0.9.4h: Need scale_cuda before hwdownload for p010le
+                        scale_str = f"scale_cuda={export_width}:{export_height}:force_original_aspect_ratio=decrease:format=p010,hwdownload,format={canvas_format},pad={export_width}:{export_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+                        self.log(f"Clip {i}: {clip_w}x{clip_h} -> {export_width}x{export_height} {'HYBRID' if early_hybrid else '10-bit TURBO'} GPU->CPU scaling via scale_cuda+hwdownload")
+                    else:
+                        scale_str = f"scale={export_width}:{export_height}:force_original_aspect_ratio=decrease,format={canvas_format},pad={export_width}:{export_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+                        self.log(f"Clip {i}: {clip_w}x{clip_h} -> {export_width}x{export_height} CPU scaling")
+                filter_complex.append(f"{v_trimmed}{scale_str}{v_scaled}")
+                if is_turbo and not use_cpu_overlay:
+                    filter_complex.append(f"{bg_in}{v_scaled}overlay_cuda=enable='between(t,{clip.start_time},{end_time})':eof_action=pass{bg_out}")
+                else:
+                    filter_complex.append(f"{bg_in}{v_scaled}overlay=enable='between(t,{clip.start_time},{end_time})':eof_action=pass{bg_out}")
 
-                    # --- AUDIO GRAPH --- (Fix :a:1 matches no streams)
-                    is_turbo_audio = self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec','')
-                    if is_turbo_audio:
-                        # TURBO: use only first audio stream to avoid 4294967274 error
-                        a_in = f"[{i}:a:0]"
-                        a_trimmed = f"[a{i}_0_trim]"
+                # --- AUDIO GRAPH --- (Fix :a:1 matches no streams)
+                is_turbo_audio = use_gpu_composite and use_gpu_decode and is_nvenc
+                if is_turbo_audio:
+                    # TURBO: use only first audio stream to avoid 4294967274 error
+                    a_in = f"[{i}:a:0]"
+                    a_trimmed = f"[a{i}_0_trim]"
+                    duration = clip.get_trimmed_duration()
+                    filter_complex.append(f"{a_in}atrim=start=0:end={duration},asetpts=PTS-STARTPTS{a_trimmed}")
+                    base_delay_ms = int(clip.start_time * 1000)
+                    a_ready = f"[a{i}_0_ready]"
+                    chain = ""
+                    if base_delay_ms > 0:
+                        chain += f"adelay={base_delay_ms}|{base_delay_ms},"
+                    vol_db = clip.volumes[0] if clip.volumes else 0.0
+                    chain += f"volume={vol_db}dB"
+                    filter_complex.append(f"{a_trimmed}{chain}{a_ready}")
+                    audio_inputs.append(a_ready)
+                else:
+                    n_streams = clip.audio_streams
+                    if n_streams > 2:
+                        n_streams = 1
+                    for a_idx in range(n_streams):
+                        a_in = f"[{i}:a:{a_idx}]"
+                        a_trimmed = f"[a{i}_{a_idx}_trim]"
                         duration = clip.get_trimmed_duration()
                         filter_complex.append(f"{a_in}atrim=start=0:end={duration},asetpts=PTS-STARTPTS{a_trimmed}")
                         base_delay_ms = int(clip.start_time * 1000)
-                        a_ready = f"[a{i}_0_ready]"
+                        sync_offset = clip.sync_offset if hasattr(clip, 'sync_offset') else 0
+                        if n_streams > 1 and sync_offset != 0:
+                            if sync_offset > 0 and a_idx == 0:
+                                base_delay_ms += sync_offset
+                            elif sync_offset < 0 and a_idx == 1:
+                                base_delay_ms += abs(sync_offset)
+                        vol_db = clip.volumes[a_idx] if a_idx < len(clip.volumes) else 0.0
+                        norm = clip.normalization[a_idx] if a_idx < len(clip.normalization) else False
+                        a_ready = f"[a{i}_{a_idx}_ready]"
                         chain = ""
                         if base_delay_ms > 0:
                             chain += f"adelay={base_delay_ms}|{base_delay_ms},"
-                        vol_db = clip.volumes[0] if clip.volumes else 0.0
                         chain += f"volume={vol_db}dB"
+                        if norm:
+                            chain += ",loudnorm"
                         filter_complex.append(f"{a_trimmed}{chain}{a_ready}")
                         audio_inputs.append(a_ready)
-                    else:
-                        n_streams = clip.audio_streams
-                        if n_streams > 2:
-                            n_streams = 1
-                        for a_idx in range(n_streams):
-                            a_in = f"[{i}:a:{a_idx}]"
-                            a_trimmed = f"[a{i}_{a_idx}_trim]"
-                            duration = clip.get_trimmed_duration()
-                            filter_complex.append(f"{a_in}atrim=start=0:end={duration},asetpts=PTS-STARTPTS{a_trimmed}")
-                            base_delay_ms = int(clip.start_time * 1000)
-                            sync_offset = clip.sync_offset if hasattr(clip, 'sync_offset') else 0
-                            if n_streams > 1 and sync_offset != 0:
-                                if sync_offset > 0 and a_idx == 0:
-                                    base_delay_ms += sync_offset
-                                elif sync_offset < 0 and a_idx == 1:
-                                    base_delay_ms += abs(sync_offset)
-                            vol_db = clip.volumes[a_idx] if a_idx < len(clip.volumes) else 0.0
-                            norm = clip.normalization[a_idx] if a_idx < len(clip.normalization) else False
-                            a_ready = f"[a{i}_{a_idx}_ready]"
-                            chain = ""
-                            if base_delay_ms > 0:
-                                chain += f"adelay={base_delay_ms}|{base_delay_ms},"
-                            chain += f"volume={vol_db}dB"
-                            if norm:
-                                chain += ",loudnorm"
-                            filter_complex.append(f"{a_trimmed}{chain}{a_ready}")
-                            audio_inputs.append(a_ready)
 
-                # --- FINAL OUTPUT MAPPING ---
-                last_v = f"[bg{len(sorted_clips)}]"
+            # --- FINAL OUTPUT MAPPING ---
+            last_v = f"[bg{len(sorted_clips)}]"
 
-                user_filters = self._build_video_filters()
-                text_clips = getattr(self.timeline, 'text_clips', [])
-                is_turbo_final = self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec','')
-                cpu_bottleneck_active = bool(user_filters or text_clips)
+            user_filters = self._build_video_filters()
+            text_clips = getattr(self.timeline, 'text_clips', [])
+            is_turbo_final = self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec','')
+            cpu_bottleneck_active = bool(user_filters or text_clips)
                 
-                # Option 2: TURBO + any filter (denoise, color grading, transitions, text) -> Hybrid mode
-                # GPU does scale_cuda + overlay_cuda (heavy 5K work), then download to CPU for filters
-                # This avoids hwupload_cuda -> auto_scale crash with -pix_fmt p010le
-                if cpu_bottleneck_active:
-                    if is_turbo_final:
-                        # If already in Hybrid (early_hybrid), last_v is already CPU from overlay fix, don't hwdownload again
-                        try:
-                            already_cpu = early_hybrid
-                        except NameError:
-                            already_cpu = False
-                        if already_cpu:
-                            self.log(f"HYBRID: last_v already CPU (overlay fix), skipping extra hwdownload")
-                        else:
-                            filter_desc = ", ".join(user_filters)[:120] if user_filters else "text overlay"
-                            self.log(f"TURBO: CPU filters detected ({filter_desc}) - switching to HYBRID mode: GPU scale/overlay (5070 maxed) + CPU filters + CPU encode. This only happens when filters are applied. Without filters, stays full VRAM.")
-                            filter_complex.append(f"{last_v}hwdownload,format={canvas_format}[bg_downloaded]")
-                            last_v = "[bg_downloaded]"
-                    elif use_gpu_decode:
-                        filter_complex.append(f"{last_v}format={canvas_format}[bg_downloaded]")
+            # Option 2: TURBO + any filter (denoise, color grading, transitions, text) -> Hybrid mode
+            # GPU does scale_cuda + overlay_cuda (heavy 5K work), then download to CPU for filters
+            # This avoids hwupload_cuda -> auto_scale crash with -pix_fmt p010le
+            if cpu_bottleneck_active:
+                if is_turbo_final:
+                    # If already in Hybrid (early_hybrid), last_v is already CPU from overlay fix, don't hwdownload again
+                    try:
+                        already_cpu = early_hybrid
+                    except NameError:
+                        already_cpu = False
+                    if already_cpu:
+                        self.log(f"HYBRID: last_v already CPU (overlay fix), skipping extra hwdownload")
+                    else:
+                        filter_desc = ", ".join(user_filters)[:120] if user_filters else "text overlay"
+                        self.log(f"TURBO: CPU filters detected ({filter_desc}) - switching to HYBRID mode: GPU scale/overlay (5070 maxed) + CPU filters + CPU encode. This only happens when filters are applied. Without filters, stays full VRAM.")
+                        filter_complex.append(f"{last_v}hwdownload,format={canvas_format}[bg_downloaded]")
                         last_v = "[bg_downloaded]"
+                elif use_gpu_decode:
+                    filter_complex.append(f"{last_v}format={canvas_format}[bg_downloaded]")
+                    last_v = "[bg_downloaded]"
 
-                if user_filters:
-                    if is_10bit and any('hqdn3d' in f for f in user_filters):
-                        filter_complex.append(f"{last_v}format=nv12,{','.join(user_filters)},format={canvas_format}[v_filtered]")
-                    else:
-                        filter_complex.append(f"{last_v}{','.join(user_filters)}[v_filtered]")
-                    # In Hybrid mode (turbo+filters), stay on CPU after filters - don't re-upload
-                    # This prevents: hwupload_cuda -> auto_scale -> -40 crash with -pix_fmt p010le
-                    if is_turbo_final:
-                        self.log("HYBRID: Keeping frames on CPU after filters for encode (avoids CUDA->CPU auto_scale)")
-                        pre_fps_v = "[v_filtered]"
-                    else:
-                        pre_fps_v = "[v_filtered]"
+            if user_filters:
+                if is_10bit and any('hqdn3d' in f for f in user_filters):
+                    filter_complex.append(f"{last_v}format=nv12,{','.join(user_filters)},format={canvas_format}[v_filtered]")
                 else:
-                    pre_fps_v = last_v
+                    filter_complex.append(f"{last_v}{','.join(user_filters)}[v_filtered]")
+                # In Hybrid mode (turbo+filters), stay on CPU after filters - don't re-upload
+                # This prevents: hwupload_cuda -> auto_scale -> -40 crash with -pix_fmt p010le
+                if is_turbo_final:
+                    self.log("HYBRID: Keeping frames on CPU after filters for encode (avoids CUDA->CPU auto_scale)")
+                    pre_fps_v = "[v_filtered]"
+                else:
+                    pre_fps_v = "[v_filtered]"
+            else:
+                pre_fps_v = last_v
 
-                # --- TEXT OVERLAYS (drawtext) ---
-                text_clips = getattr(self.timeline, 'text_clips', [])
-                if text_clips:
-                    txt_input = pre_fps_v
-                    for ti, tc in enumerate(text_clips):
-                        txt_out = f"[txt{ti}]"
-                        safe_text = tc.text.replace("'", "\\\\'").replace(":", "\\\\:")
-                        dt_filter = (
-                            f"{txt_input}drawtext=text='{safe_text}'"
-                            f":fontsize={tc.font_size}:fontcolor={tc.font_color}"
-                            f":x={tc.x}:y={tc.y}"
-                            f":enable='between(t,{tc.start_time},{tc.get_end_time()})'"
-                            f"{txt_out}"
-                        )
-                        filter_complex.append(dt_filter)
-                        txt_input = txt_out
-                    pre_fps_v = txt_input
+            # --- TEXT OVERLAYS (drawtext) ---
+            text_clips = getattr(self.timeline, 'text_clips', [])
+            if text_clips:
+                txt_input = pre_fps_v
+                for ti, tc in enumerate(text_clips):
+                    txt_out = f"[txt{ti}]"
+                    safe_text = tc.text.replace("'", "\\\\'").replace(":", "\\\\:")
+                    dt_filter = (
+                        f"{txt_input}drawtext=text='{safe_text}'"
+                        f":fontsize={tc.font_size}:fontcolor={tc.font_color}"
+                        f":x={tc.x}:y={tc.y}"
+                        f":enable='between(t,{tc.start_time},{tc.get_end_time()})'"
+                        f"{txt_out}"
+                    )
+                    filter_complex.append(dt_filter)
+                    txt_input = txt_out
+                pre_fps_v = txt_input
 
-                # Hybrid mode: turbo+filters -> CPU path, needs fps filter on CPU
-                # zero_copy_video tracks if map_v stays in VRAM (full TURBO) or CPU (Hybrid/CPU)
-                # Determine if 10-bit TURBO must use CPU overlay (FFmpeg 9.01 bug)
-                is_10bit_final = self.settings.get('pixel_format', 1) == 1
-                if self.settings.get('video_codec', '') == 'h264_nvenc':
-                    is_10bit_final = False
-                force_cpu_for_10bit_final = is_10bit_final and is_turbo_final
+            # Hybrid mode: turbo+filters -> CPU path, needs fps filter on CPU
+            # zero_copy_video tracks if map_v stays in VRAM (full TURBO) or CPU (Hybrid/CPU)
+            # Determine if 10-bit TURBO must use CPU overlay (FFmpeg 9.01 bug)
+            is_10bit_final = self.settings.get('pixel_format', 1) == 1
+            if self.settings.get('video_codec', '') == 'h264_nvenc':
+                is_10bit_final = False
+            force_cpu_for_10bit_final = is_10bit_final and is_turbo_final
                 
-                if is_turbo_final and user_filters:
-                    # pre_fps_v is already CPU after hwdownload, add fps here on CPU
+            if is_turbo_final and user_filters:
+                # pre_fps_v is already CPU after hwdownload, add fps here on CPU
+                filter_complex.append(f"{pre_fps_v}fps={timeline_fps}[out_v]")
+                map_v = "[out_v]"
+                zero_copy_video = False  # Hybrid = CPU map, needs pix_fmt
+            else:
+                zero_copy_video = use_gpu_decode and not cpu_bottleneck_active
+                # For 10-bit full TURBO, we forced CPU overlay, so map is CPU, not cuda
+                if force_cpu_for_10bit_final:
+                    zero_copy_video = False
+                if zero_copy_video:
+                    map_v = pre_fps_v  # Full TURBO 8-bit = cuda map, NO pix_fmt
+                else:
                     filter_complex.append(f"{pre_fps_v}fps={timeline_fps}[out_v]")
                     map_v = "[out_v]"
-                    zero_copy_video = False  # Hybrid = CPU map, needs pix_fmt
-                else:
-                    zero_copy_video = use_gpu_decode and not cpu_bottleneck_active
-                    # For 10-bit full TURBO, we forced CPU overlay, so map is CPU, not cuda
-                    if force_cpu_for_10bit_final:
-                        zero_copy_video = False
-                    if zero_copy_video:
-                        map_v = pre_fps_v  # Full TURBO 8-bit = cuda map, NO pix_fmt
-                    else:
-                        filter_complex.append(f"{pre_fps_v}fps={timeline_fps}[out_v]")
-                        map_v = "[out_v]"
-                        zero_copy_video = False  # CPU path needs pix_fmt
+                    zero_copy_video = False  # CPU path needs pix_fmt
 
-                # --- VOICEOVER AUDIO CLIPS ---
-                vo_clips = getattr(self.timeline, 'audio_clips', [])
-                vo_input_offset = len(sorted_clips)
-                for vi, vo in enumerate(vo_clips):
-                    vo_idx = vo_input_offset + vi
-                    vo_in = f"[{vo_idx}:a]"
-                    vo_ready = f"[vo{vi}_ready]"
-                    delay_ms = int(vo.start_time * 1000)
-                    chain = ""
-                    if delay_ms > 0:
-                        chain = f"adelay={delay_ms}|{delay_ms},"
-                    chain += "volume=0dB"
-                    filter_complex.append(f"{vo_in}{chain}{vo_ready}")
-                    audio_inputs.append(vo_ready)
+            # --- VOICEOVER AUDIO CLIPS ---
+            vo_clips = getattr(self.timeline, 'audio_clips', [])
+            vo_input_offset = len(sorted_clips)
+            for vi, vo in enumerate(vo_clips):
+                vo_idx = vo_input_offset + vi
+                vo_in = f"[{vo_idx}:a]"
+                vo_ready = f"[vo{vi}_ready]"
+                delay_ms = int(vo.start_time * 1000)
+                chain = ""
+                if delay_ms > 0:
+                    chain = f"adelay={delay_ms}|{delay_ms},"
+                chain += "volume=0dB"
+                filter_complex.append(f"{vo_in}{chain}{vo_ready}")
+                audio_inputs.append(vo_ready)
 
-                # Mix Audio
-                if audio_inputs:
-                    inputs_str = "".join(audio_inputs)
-                    filter_complex.append(f"{inputs_str}amix=inputs={len(audio_inputs)}:duration=longest:dropout_transition=0[out_a]")
-                    map_a = "[out_a]"
-                else:
-                    # Generate silent audio track if completely muted
-                    filter_complex.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={timeline_duration}[out_a]")
-                    map_a = "[out_a]"
+            # Mix Audio
+            if audio_inputs:
+                inputs_str = "".join(audio_inputs)
+                filter_complex.append(f"{inputs_str}amix=inputs={len(audio_inputs)}:duration=longest:dropout_transition=0[out_a]")
+                map_a = "[out_a]"
+            else:
+                # Generate silent audio track if completely muted
+                filter_complex.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={timeline_duration}[out_a]")
+                map_a = "[out_a]"
 
-                # Add voiceover files as additional inputs BEFORE filter_complex arg
-                for vo in vo_clips:
-                    cmd.extend(['-i', vo.file_path])
+            # Add voiceover files as additional inputs BEFORE filter_complex arg
+            for vo in vo_clips:
+                cmd.extend(['-i', vo.file_path])
 
-                cmd.extend(['-filter_complex', ';'.join(filter_complex)])
-                cmd.extend(['-map', map_v, '-map', map_a])
-                # Removed redundant -r on output for zero-copy. The color canvas natively enforces perfect PTS.
+            cmd.extend(['-filter_complex', ';'.join(filter_complex)])
+            cmd.extend(['-map', map_v, '-map', map_a])
+            # Removed redundant -r on output for zero-copy. The color canvas natively enforces perfect PTS.
 
-                # 3. ENCODER SETTINGS
-                if getattr(self, 'is_cache_render', False):
-                    # For cache render, use visually lossless fast NVENC
-                    codec = 'hevc_nvenc'
-                    cmd.extend(['-c:v', codec, '-preset', 'p6', '-tune', 'hq', '-cq', '15', '-b:v', '0'])
-                    cmd.extend(['-c:a', 'aac', '-b:a', '320k'])
-                    append_output_file_args(cmd, self.output_path, {'rate_control': 'cbr'}, None)
-                else:
-                    codec = self.settings.get('video_codec', 'hevc_nvenc')
-                    cmd.extend(['-r', str(timeline_fps)])
-                    cmd.extend(['-c:v', codec])
-                    if 'nvenc' in codec:
-                        cmd.extend(build_nvenc_cbr_args(self.settings, timeline_fps, is_zero_copy=zero_copy_video))
-                    cmd.extend(['-c:a', 'aac', '-b:a', '320k'])
-                    cmd.extend(['-t', f"{timeline_duration:.6f}"])
-                    append_output_file_args(cmd, self.output_path, self.settings, self.log)
+            # 3. ENCODER SETTINGS
+            # FIX v0.9.4: Removed dead is_cache_render branch (never set, vestigial)
+            codec = self.settings.get('video_codec', 'hevc_nvenc')
+            cmd.extend(['-r', str(timeline_fps)])
+            cmd.extend(['-c:v', codec])
+            if 'nvenc' in codec:
+                cmd.extend(build_nvenc_cbr_args(self.settings, timeline_fps, is_zero_copy=zero_copy_video))
+            cmd.extend(['-c:a', 'aac', '-b:a', '320k'])
+            cmd.extend(['-t', f"{timeline_duration:.6f}"])
+            append_output_file_args(cmd, self.output_path, self.settings, self.log)
 
             self.log(f"Compositing execution started...")
 
@@ -2673,7 +2668,8 @@ class EncodingThread(QThread):
         cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
         import multiprocessing as _mp2
         _c2 = _mp2.cpu_count() or 8
-        cmd.extend(['-filter_threads', str(_c2), '-filter_complex_threads', str(_c2), '-extra_hw_frames', '64', '-threads', '0', '-thread_queue_size', '1024'])
+        # FIX v0.9.4: Removed thread_queue_size 1024 + extra_hw_frames 64
+        cmd.extend(['-filter_threads', str(_c2), '-filter_complex_threads', str(_c2), '-threads', '0'])
         
         codec = self.settings.get('video_codec', '')
         is_copy_stream = (codec == 'copy')

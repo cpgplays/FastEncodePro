@@ -264,7 +264,7 @@ from PyQt6.QtGui import (
     QMouseEvent, QImage, QPixmap, QConicalGradient, QRadialGradient, QLinearGradient,
 )
 
-__version__ = "0.97"
+__version__ = "0.97.1"
 GITHUB_REPO = "cpgplays/FastEncodePro"
 
 class UpdateManager:
@@ -820,6 +820,121 @@ def get_audio_stream_count_static(filepath):
         return len(out.splitlines())
     except:
         return 1
+
+def probe_audio_streams(filepath):
+    """Count audio streams precisely. Returns (count, [channels...]).
+
+    Raises RuntimeError with ffprobe's own error text on any failure -
+    it must NEVER silently guess, because a wrong count sends auto-sync
+    down a dead end ("only 1 track") or mistargets export mixing.
+    """
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a',
+           '-show_entries', 'stream=index,codec_name,channels',
+           '-of', 'json', filepath]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+    except FileNotFoundError:
+        raise RuntimeError("ffprobe not found - install FFmpeg and ensure it is on PATH.")
+    except Exception as e:
+        raise RuntimeError(f"Could not run ffprobe: {e}")
+    if result.returncode != 0:
+        err_lines = (result.stderr or '').strip().splitlines()
+        raise RuntimeError("ffprobe failed: " + (err_lines[-1] if err_lines else f"exit {result.returncode}"))
+    try:
+        data = json.loads(result.stdout or '{}')
+    except Exception:
+        raise RuntimeError("ffprobe returned unparseable output.")
+    streams = data.get('streams') or []
+    channels = []
+    for s in streams:
+        try:
+            channels.append(int(s.get('channels', 0) or 0))
+        except Exception:
+            channels.append(0)
+    return len(streams), channels
+
+def _correlate_full_numpy(a, b):
+    """Linear full cross-correlation via FFT (scipy-free). Same ordering as
+    scipy.signal.correlate(a, b, mode='full'): index i <-> lag i-(N-1)."""
+    import numpy as np
+    n = int(a.size)
+    size = 1
+    while size < 2 * n - 1:
+        size *= 2
+    spectrum = np.fft.rfft(a, size) * np.conj(np.fft.rfft(b, size))
+    c = np.fft.irfft(spectrum, size)
+    return np.concatenate([c[size - n + 1:], c[:n]])
+
+def _correlate_full(a, b):
+    try:
+        from scipy import signal as _sig
+        return _sig.correlate(a, b, mode='full', method='fft')
+    except ImportError:
+        return _correlate_full_numpy(a, b)
+
+def compute_sync_offset_samples(audio1, audio2, sample_rate, max_lag_seconds=5.0):
+    """Waveform sync between two mono float tracks.
+
+    Returns (offset_ms, confidence). Positive offset means track2 (mic) is
+    LATE relative to track1 (desktop): delaying track 0 by +offset aligns
+    them, which is exactly how the timeline export applies clip.sync_offset.
+
+    Method: strip DC + normalize both to unit energy (gain/DC invariant, so
+    a quiet mic still matches a loud desktop feed), FFT cross-correlation,
+    peak search restricted to +/-max_lag (kills absurd 20s false peaks from
+    room tone), parabolic sub-sample refinement. Confidence is the normalized
+    peak height in [0, 1].
+    """
+    import numpy as np
+    try:
+        sr = float(sample_rate)
+    except Exception:
+        return 0, 0.0
+    if sr <= 0:
+        return 0, 0.0
+    a = np.asarray(audio1, dtype=np.float64).ravel()
+    b = np.asarray(audio2, dtype=np.float64).ravel()
+    n = int(min(a.size, b.size))
+    if n < int(sr):
+        return 0, 0.0
+    a = a[:n] - float(np.mean(a[:n]))
+    b = b[:n] - float(np.mean(b[:n]))
+    ea = float(np.dot(a, a))
+    eb = float(np.dot(b, b))
+    if ea <= 0.0 or eb <= 0.0:
+        return 0, 0.0
+    a /= math.sqrt(ea)
+    b /= math.sqrt(eb)
+    corr = np.asarray(_correlate_full(a, b), dtype=np.float64)
+    center = n - 1
+    try:
+        max_lag = max(1, min(n - 1, int(float(max_lag_seconds) * sr)))
+    except Exception:
+        max_lag = min(n - 1, int(5.0 * sr))
+    lo = max(0, center - max_lag)
+    hi = min(corr.size - 1, center + max_lag)
+    window = corr[lo:hi + 1]
+    if window.size == 0:
+        return 0, 0.0
+    peak_rel = int(np.argmax(window))
+    peak_idx = lo + peak_rel
+    peak_val = float(corr[peak_idx])
+    # Parabolic refinement for sub-sample precision.
+    shift = 0.0
+    if 0 < peak_idx < corr.size - 1:
+        y0 = float(corr[peak_idx - 1])
+        y1 = peak_val
+        y2 = float(corr[peak_idx + 1])
+        denom = (y0 - 2.0 * y1 + y2)
+        if denom != 0.0:
+            shift = max(-0.5, min(0.5, 0.5 * (y0 - y2) / denom))
+    lag_samples = (peak_idx - center) + shift
+    # Convention check: if b[n] = a[n-D] (b delayed by D), the correlation
+    # peaks at lag k=-D, so the true delay is D = -k.
+    offset_ms = int(round(-lag_samples * 1000.0 / sr))
+    confidence = max(0.0, min(1.0, peak_val))
+    return offset_ms, confidence
 
 def get_video_fps_static(filepath):
     try:
@@ -2276,9 +2391,47 @@ class MPVVideoWidget(QWidget):
         if not self.mpv or not self.current_file:
             return
         try:
+            # Refresh from reality first: a stale cache here is what made
+            # "press play at the end" resume thin air.
+            try:
+                tp = self.mpv.time_pos
+                if tp is not None:
+                    self._position_ms = max(0, int(float(tp) * 1000))
+            except Exception:
+                pass
+            dur = 0
+            try:
+                live = self.mpv.duration
+                if live is not None and float(live) > 0:
+                    dur = int(float(live) * 1000)
+                    self._duration_ms = dur
+            except Exception:
+                dur = int(self._duration_ms or 0)
+            if dur > 2000 and int(self._position_ms or 0) >= dur - 400:
+                # Sitting on the last frame: mpv will NOT resume on unpause
+                # (end-of-file idle looks exactly like a freeze). Restart.
+                try:
+                    self.mpv.seek(0.0, reference='absolute')
+                except Exception:
+                    pass
+                self._position_ms = 0
+        except Exception:
+            pass
+        try:
             self.mpv.pause = False
+        except Exception:
+            pass
+        # Believe mpv, not our assumption: read the flag back so a failed
+        # IPC call can never desync the UI into "playing" while paused.
+        try:
+            self._is_paused = bool(self.mpv.pause)
+        except Exception:
             self._is_paused = False
-            self.position_timer.start()
+        try:
+            if self._is_paused:
+                self.position_timer.stop()
+            else:
+                self.position_timer.start()
         except Exception:
             pass
 
@@ -2287,7 +2440,13 @@ class MPVVideoWidget(QWidget):
             return
         try:
             self.mpv.pause = True
+        except Exception:
+            pass
+        try:
+            self._is_paused = bool(self.mpv.pause)
+        except Exception:
             self._is_paused = True
+        try:
             self.position_timer.stop()
         except Exception:
             pass
@@ -2295,23 +2454,149 @@ class MPVVideoWidget(QWidget):
     def is_paused(self):
         return self._is_paused
 
-    def seek(self, position_ms):
+    def seek(self, position_ms, exact=True, domain_ms=0):
+        """Seek mpv. Scrub paths pass exact=False for a fast keyframe seek;
+        precise landing still comes from the playhead/timecode, which are
+        always exact. Falls back to a plain seek on old python-mpv builds.
+
+        domain_ms optionally overrides the EOF clamp reference: pass it only
+        when the caller knows the true length (EDL timeline duration). A
+        wrong-small clamp is worse than none, so file-backed modes leave it
+        at 0 and keep the cached-duration clamp.
+        """
         if not self.mpv:
             return
+        try:
+            position_ms = int(position_ms)
+        except Exception:
+            return
+        try:
+            dur = int(self._duration_ms or 0)
+            try:
+                if int(domain_ms or 0) > 0:
+                    dur = int(domain_ms)
+            except Exception:
+                pass
+            if dur > 1000:
+                # Never seek onto (or past) the last instant: mpv jumps to
+                # EOF, shows black, and can wedge with filters engaged.
+                position_ms = max(0, min(position_ms, dur - 250))
+            elif dur > 0:
+                position_ms = max(0, min(position_ms, dur))
+        except Exception:
+            pass
+        if getattr(self, '_file_loading', False):
+            # Seeking mid-load wedges mpv: park it, applied on file-loaded.
+            self._pending_seek_ms = position_ms
+            return
+        if not exact and getattr(self, '_seek_keyframes_ok', True):
+            try:
+                self.mpv.seek(position_ms / 1000.0, reference='absolute',
+                              precision='keyframes')
+                self._position_ms = position_ms
+                return
+            except TypeError:
+                # Old python-mpv without the precision kwarg: remember it.
+                self._seek_keyframes_ok = False
+            except Exception:
+                pass
         try:
             self.mpv.seek(position_ms / 1000.0, reference='absolute')
             self._position_ms = position_ms
         except Exception:
             pass
+        # The position timer only runs while playing, so a paused scrub
+        # would otherwise leave every display frozen: poll twice so the
+        # time-pos observer's update gets emitted once it lands.
+        try:
+            QTimer.singleShot(150, self._update_position)
+            QTimer.singleShot(450, self._update_position)
+        except Exception:
+            pass
 
     def position(self):
+        # Live read: IN/OUT points captured right after a paused scrub must
+        # reflect the frame actually showing, not a stale cache.
+        try:
+            if self.mpv is not None:
+                tp = self.mpv.time_pos
+                if tp is not None:
+                    self._position_ms = max(0, int(float(tp) * 1000))
+                    return self._position_ms
+        except Exception:
+            pass
         return self._position_ms
 
     def duration(self):
+        # Live read first: the cached value goes stale across file switches
+        # (observer hasn't fired yet) and every consumer - seek clamp,
+        # scrub mapping, timecode - silently computes against the WRONG
+        # movie. Fall back to cache when mpv has nothing to report.
+        try:
+            if self.mpv is not None:
+                live = self.mpv.duration
+                if live is not None and float(live) > 0:
+                    ms = int(float(live) * 1000)
+                    self._duration_ms = ms
+                    return ms
+        except Exception:
+            pass
         return self._duration_ms
 
     def _update_position(self):
         self.positionChanged.emit(self._position_ms)
+        # EOF stickiness: mpv idles on the last frame with pause still False,
+        # so without this the UI shows "playing" forever on a dead frame and
+        # the next play press appears to do nothing (only a rewind revives
+        # it). Settle into paused - but only after several identical ticks,
+        # so slow content and buffering never false-trigger.
+        try:
+            dur = int(self._duration_ms or 0)
+            pos = int(self._position_ms or 0)
+            if (dur > 2000 and not self._is_paused and self.current_file
+                    and pos >= dur - 400):
+                last = getattr(self, '_eof_last_pos', None)
+                ticks = int(getattr(self, '_eof_stall_ticks', 0) or 0)
+                if last is not None and pos == last:
+                    ticks += 1
+                else:
+                    ticks = 0
+                self._eof_last_pos = pos
+                self._eof_stall_ticks = ticks
+                if ticks >= 3:
+                    self._is_paused = True
+                    try:
+                        self.mpv.pause = True
+                    except Exception:
+                        pass
+                    try:
+                        self.position_timer.stop()
+                    except Exception:
+                        pass
+                    self._eof_stall_ticks = 0
+            else:
+                self._eof_stall_ticks = 0
+                self._eof_last_pos = pos
+        except Exception:
+            pass
+        # EOF stickiness: mpv idles at the last frame with pause still False,
+        # so without this the UI shows "playing" forever on a dead frame and
+        # the next play press appears to do nothing. Settle into paused.
+        try:
+            dur = int(self._duration_ms or 0)
+            if (dur > 2000 and not self._is_paused and self.current_file
+                    and int(self._position_ms or 0) >= dur - 400):
+                self._is_paused = True
+                try:
+                    self.mpv.pause = True
+                except Exception:
+                    pass
+                try:
+                    self.position_timer.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def stop(self):
         if not self.mpv:
@@ -2640,14 +2925,25 @@ class FepWaveformBars(QWidget):
 
 
 class FepScrubberWidget(QWidget):
-    """Exact HTML TIMELINE SCRUBBER: dual sine SVG + 42% fill + cyan playhead + time labels."""
-    seekRequested = pyqtSignal(float)
+    """Preview scrub bar (redesigned): the widget NEVER seeks by itself.
+
+    Dragging emits scrubMoved (playhead + timecode follow, zero mpv
+    traffic); releasing emits scrubFinished exactly once, and the app
+    performs a single clamped keyframe seek. N drag events can therefore
+    never produce more than one mpv seek, which makes seek pile-ups -
+    freezes, glitches, jumps - structurally impossible.
+    """
+    scrubMoved = pyqtSignal(float)
+    scrubFinished = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.progress = 0.42
-        self.duration = 25.0
-        self.playhead = 0.42
+        self.progress = 0.0
+        self.playhead = 0.0
+        # Explicit media duration (ms) for labels AND seek mapping. Pushed by
+        # the app on every media/timeline change - never inferred, so the
+        # scrubber cannot compute against a stale movie length.
+        self.media_duration_ms = 0
         self._drag = False
         self.setMinimumHeight(64)
         self.setMaximumHeight(64)
@@ -2659,6 +2955,28 @@ class FepScrubberWidget(QWidget):
         self.playhead = self.progress
         self.update()
 
+    def set_media_duration(self, duration_ms):
+        """Set the timeline length this scrubber represents. Time labels and
+        (as fallback) seek mapping derive from this, so a scrub always spans
+        the actual clip - never a hardcoded 25 s or a stale file length."""
+        try:
+            duration_ms = max(0, int(duration_ms))
+        except Exception:
+            duration_ms = 0
+        if duration_ms != getattr(self, 'media_duration_ms', 0):
+            self.media_duration_ms = duration_ms
+            self.update()
+
+    @staticmethod
+    def _fmt_label(ms):
+        try:
+            s = max(0, int(ms) // 1000)
+        except Exception:
+            s = 0
+        if s >= 3600:
+            return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+        return f"{s // 60:02d}:{s % 60:02d}"
+
     def _pos_to_ratio(self, x):
         w = max(1, self.width())
         return max(0.0, min(1.0, x / w))
@@ -2668,16 +2986,20 @@ class FepScrubberWidget(QWidget):
             self._drag = True
             r = self._pos_to_ratio(e.position().x())
             self.set_progress(r)
-            self.seekRequested.emit(r)
+            self.scrubMoved.emit(r)
 
     def mouseMoveEvent(self, e):
         if self._drag:
             r = self._pos_to_ratio(e.position().x())
             self.set_progress(r)
-            self.seekRequested.emit(r)
+            self.scrubMoved.emit(r)
 
     def mouseReleaseEvent(self, e):
+        was_drag = self._drag
         self._drag = False
+        if was_drag and e.button() == Qt.MouseButton.LeftButton:
+            # The one and only seek of this gesture lands exactly here.
+            self.scrubFinished.emit(self.progress)
 
     def paintEvent(self, event):
         import math as _m
@@ -2735,10 +3057,11 @@ class FepScrubberWidget(QWidget):
         # right border of progress
         p.setPen(QPen(QColor(125, 249, 255, 102), 1))
         p.drawLine(int(cx), 0, int(cx), wave_h)
-        # time labels 00:00..00:25
+        # time labels across the ACTUAL media length (was hardcoded 00:25)
         p.setPen(QColor(255, 255, 255, 51))
         p.setFont(QFont("Consolas", 7))
-        labels = ["00:00", "00:05", "00:10", "00:15", "00:20", "00:25"]
+        total_ms = max(0, int(getattr(self, 'media_duration_ms', 0) or 0))
+        labels = [self._fmt_label(total_ms * i / 5) for i in range(6)]
         for i, lab in enumerate(labels):
             lx = int((i / (len(labels) - 1)) * (w - 30)) + 4
             p.drawText(lx, h - 3, lab)
@@ -3246,28 +3569,18 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
         if progress_callback:
             progress_callback(msg)
 
-    log("Extracting audio tracks...")
-
-    probe_cmd = [
-        'ffprobe', '-v', 'error',
-        '-select_streams', 'a',
-        '-show_entries', 'stream=index',
-        '-of', 'csv=p=0',
-        video_file
-    ]
+    log("Probing audio streams...")
 
     try:
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        audio_tracks = [int(x) for x in result.stdout.strip().split() if x]
+        n_tracks, _channels = probe_audio_streams(video_file)
+    except RuntimeError as e:
+        raise Exception(str(e))
 
-        if track1 >= len(audio_tracks) or track2 >= len(audio_tracks):
-            raise Exception(f"File has {len(audio_tracks)} audio tracks, cannot access track {max(track1, track2)}")
+    if track1 >= n_tracks or track2 >= n_tracks:
+        raise Exception(f"File has {n_tracks} audio track(s), cannot access track {max(track1, track2)}")
 
-        if len(audio_tracks) < 2:
-            raise Exception(f"File only has {len(audio_tracks)} audio track(s), need at least 2 for sync")
-
-    except Exception as e:
-        raise Exception(f"Failed to probe audio tracks: {e}")
+    if n_tracks < 2:
+        raise Exception(f"File only has {n_tracks} audio track(s), need at least 2 for sync")
 
     with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp1, \
          tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp2:
@@ -3316,7 +3629,7 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
         if size1 < 1000 or size2 < 1000:
             raise Exception("Extracted audio too short, check file has audio on both tracks")
 
-        log("Analyzing correlation...")
+        log("Analyzing waveform correlation...")
         import numpy as np
 
         audio1 = np.fromfile(tmp1_path, dtype=np.int16)
@@ -3325,29 +3638,10 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
         audio1 = audio1.astype(np.float32) / 32768.0
         audio2 = audio2.astype(np.float32) / 32768.0
 
-        try:
-            from scipy import signal
-            log("Using SciPy correlation (fast)...")
-            correlation = signal.correlate(audio1, audio2, mode='full', method='fft')
-        except ImportError:
-            log("Using NumPy correlation (slower)...")
-            correlation = np.correlate(audio1, audio2, mode='full')
+        offset_ms, confidence = compute_sync_offset_samples(
+            audio1, audio2, sample_rate, max_lag_seconds=5.0)
 
-        peak_index = np.argmax(correlation)
-        lag = peak_index - len(audio2) + 1
-        offset_ms = int((lag / sample_rate) * 1000)
-
-        max_corr = correlation[peak_index]
-        energy1 = np.sum(audio1 ** 2)
-        energy2 = np.sum(audio2 ** 2)
-
-        if energy1 > 0 and energy2 > 0:
-            confidence = abs(max_corr) / np.sqrt(energy1 * energy2)
-            confidence = min(1.0, confidence)
-        else:
-            confidence = 0.0
-
-        log(f"Analysis complete! Offset: {offset_ms}ms, Confidence: {confidence:.1%}")
+        log(f"Analysis complete! Offset: {offset_ms:+d}ms, Confidence: {confidence:.1%}")
 
         return offset_ms, confidence
 
@@ -6535,7 +6829,8 @@ class FastEncodeProApp(QMainWindow):
         scrub_header.addWidget(fps_pill)
         scrub_layout.addLayout(scrub_header)
         self.scrub_wave = FepScrubberWidget()
-        self.scrub_wave.seekRequested.connect(lambda r: self.seek_preview(int(r * 1000)))
+        self.scrub_wave.scrubMoved.connect(self._on_scrub_move)
+        self.scrub_wave.scrubFinished.connect(self._on_scrub_finish)
         scrub_layout.addWidget(self.scrub_wave)
         preview_layout.addWidget(scrubber_container)
 
@@ -7249,7 +7544,7 @@ class FastEncodeProApp(QMainWindow):
         self.timeline_dock.setObjectName("timeline_dock")
         self.timeline_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         self.timeline_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable | QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
-        self.timeline_dock.setMinimumHeight(180)
+        self.timeline_dock.setMinimumHeight(340)
         self.timeline_dock.setMinimumWidth(300)
         timeline_widget = QWidget()
         timeline_widget.setStyleSheet("background: #0a0a0e;")
@@ -7307,32 +7602,140 @@ class FastEncodeProApp(QMainWindow):
         timeline_layout.addWidget(timeline_header)
         self.timeline = TimelineWidget()
         self.timeline.setStyleSheet("background: #0a0a0e; border: none;")
-        self.timeline.setMinimumHeight(200)
+        self.timeline.setMinimumHeight(140)
         self.timeline.clip_selected.connect(self.on_timeline_clip_selected)
         self.timeline.playhead_moved.connect(self.on_timeline_playhead_moved)
         self.timeline.timeline_clicked.connect(self.activate_timeline_mode)
         timeline_layout.addWidget(self.timeline, stretch=1)
-        # Hidden compat controls (backend expects these attrs; kept off-screen to preserve exact HTML)
-        _hidden = QWidget()
-        _hidden.setVisible(False)
-        _hl = QHBoxLayout(_hidden)
-        self.export_timeline_btn = QPushButton("EXPORT")
+        # --- VISIBLE TIMELINE ACTION BAR (restored: Add/Remove/Clear/EXPORT/STOP) ---
+        # Previously hidden for "exact HTML" - that hid the only way to put media on the timeline.
+        timeline_controls = QWidget()
+        timeline_controls.setStyleSheet("background: #0f0f14; border-top: 1px solid rgba(255,255,255,0.06);")
+        tc_layout = QHBoxLayout(timeline_controls)
+        tc_layout.setContentsMargins(8, 8, 8, 8)
+        tc_layout.setSpacing(8)
+        add_to_timeline_btn = QPushButton("➕ Add to Timeline")
+        add_to_timeline_btn.setStyleSheet(self.button_style("#00ff88"))
+        add_to_timeline_btn.setMinimumHeight(40)
+        add_to_timeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_to_timeline_btn.setToolTip("Add selected library media to timeline at playhead end (In/Out trimmed)")
+        add_to_timeline_btn.clicked.connect(self.add_to_timeline)
+        tc_layout.addWidget(add_to_timeline_btn)
+        remove_from_timeline_btn = QPushButton("➖ Remove")
+        remove_from_timeline_btn.setStyleSheet(self.button_style("#ff5f56"))
+        remove_from_timeline_btn.setMinimumHeight(40)
+        remove_from_timeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_from_timeline_btn.setToolTip("Remove selected timeline clip")
+        remove_from_timeline_btn.clicked.connect(self.remove_from_timeline)
+        tc_layout.addWidget(remove_from_timeline_btn)
+        clear_timeline_btn = QPushButton("🗑️ Clear")
+        clear_timeline_btn.setStyleSheet(self.button_style("rgba(255,255,255,0.08)"))
+        clear_timeline_btn.setMinimumHeight(40)
+        clear_timeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_timeline_btn.setToolTip("Remove ALL clips from timeline")
+        clear_timeline_btn.clicked.connect(self.clear_timeline)
+        tc_layout.addWidget(clear_timeline_btn)
+        self.export_timeline_btn = QPushButton("💾 EXPORT")
+        self.export_timeline_btn.setStyleSheet(self.button_style("#a855f7"))
+        self.export_timeline_btn.setMinimumHeight(40)
+        self.export_timeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_timeline_btn.setToolTip("Export timeline via Export window")
         self.export_timeline_btn.clicked.connect(self.export_timeline)
-        _hl.addWidget(self.export_timeline_btn)
-        self.stop_export_btn = QPushButton("STOP")
+        tc_layout.addWidget(self.export_timeline_btn)
+        self.stop_export_btn = QPushButton("⏹️ STOP")
+        self.stop_export_btn.setStyleSheet(self.button_style("#ff5f56"))
+        self.stop_export_btn.setMinimumHeight(40)
+        self.stop_export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_export_btn.setToolTip("Stop current timeline export")
         self.stop_export_btn.setEnabled(False)
         self.stop_export_btn.clicked.connect(self.stop_timeline_export)
-        _hl.addWidget(self.stop_export_btn)
-        _add_hidden = QPushButton("Add")
-        _add_hidden.clicked.connect(self.add_to_timeline)
-        _hl.addWidget(_add_hidden)
-        _rem_hidden = QPushButton("Remove")
-        _rem_hidden.clicked.connect(self.remove_from_timeline)
-        _hl.addWidget(_rem_hidden)
-        _clr_hidden = QPushButton("Clear")
-        _clr_hidden.clicked.connect(self.clear_timeline)
-        _hl.addWidget(_clr_hidden)
-        timeline_layout.addWidget(_hidden)
+        tc_layout.addWidget(self.stop_export_btn)
+        tc_layout.addStretch()
+        timeline_layout.addWidget(timeline_controls)
+        # --- QUICK ACTIONS (screenshot row, exact) ---
+        access_widget = QWidget()
+        access_widget.setStyleSheet("background: #0a0a0e; border-top: 1px solid rgba(255,255,255,0.04);")
+        access_layout = QHBoxLayout(access_widget)
+        access_layout.setContentsMargins(8, 6, 8, 6)
+        access_layout.setSpacing(6)
+        access_label = QLabel("Quick Actions:")
+        access_label.setStyleSheet("font-weight: 700; color: #ff8a00; font-size: 10px;")
+        access_layout.addWidget(access_label)
+        for text, color, tip, func in [
+            ("✂️ Auto-Trim", "#7df9ff", "Trim 1s off edges of selected clip", self.auto_trim_selected),
+            ("🌫️ Fade All", "#a855f7", "1s fade on all clips", self.auto_fade_all),
+            ("⚫ B&W", "rgba(255,255,255,0.08)", "Toggle Black & White", self.auto_black_and_white),
+            ("🔊 Normalize", "#00ff88", "Normalize audio (all clips)", self.auto_normalize_audio),
+        ]:
+            btn = QPushButton(text)
+            btn.setStyleSheet(self.button_style(color))
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(func)
+            btn.setMinimumHeight(32)
+            access_layout.addWidget(btn)
+        access_layout.addStretch()
+        timeline_layout.addWidget(access_widget)
+        # --- MORE ACTIONS (every other real timeline capability, one click) ---
+        more_widget = QWidget()
+        more_widget.setStyleSheet("background: #0a0a0e; border-top: 1px solid rgba(255,255,255,0.04);")
+        more_layout = QHBoxLayout(more_widget)
+        more_layout.setContentsMargins(8, 6, 8, 6)
+        more_layout.setSpacing(6)
+        more_label = QLabel("More:")
+        more_label.setStyleSheet("font-weight: 700; color: rgba(255,255,255,0.4); font-size: 10px;")
+        more_layout.addWidget(more_label)
+        for text, color, tip, func in [
+            ("✨ Balance", "rgba(255,255,255,0.08)", "Auto color balance", self.apply_auto_balance),
+            ("🎯 Sync", "rgba(255,255,255,0.08)", "Auto-sync audio tracks", self.auto_sync_audio_tracks),
+            ("🔤 Text", "rgba(255,255,255,0.08)", "Add text / lower third", self.add_text_overlay),
+            ("🎙 VO", "rgba(255,255,255,0.08)", "Record voiceover at playhead", self.record_voiceover),
+            ("◀ In", "rgba(255,255,255,0.08)", "Set media In-point at preview pos", self.set_media_in_point),
+            ("Out ▶", "rgba(255,255,255,0.08)", "Set media Out-point at preview pos", self.set_media_out_point),
+            ("− Zoom", "rgba(255,255,255,0.08)", "Zoom timeline out", self.zoom_out_timeline),
+            ("+ Zoom", "rgba(255,255,255,0.08)", "Zoom timeline in", self.zoom_in_timeline),
+            ("↺ Reset", "rgba(255,255,255,0.08)", "Reset all color/FX filters", self.reset_all_filters),
+        ]:
+            btn = QPushButton(text)
+            btn.setStyleSheet(self.button_style(color))
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(func)
+            btn.setMinimumHeight(32)
+            more_layout.addWidget(btn)
+        more_layout.addStretch()
+        timeline_layout.addWidget(more_widget)
+        # --- AI ASSIST (constrained to real capabilities only) ---
+        ai_widget = QWidget()
+        ai_widget.setStyleSheet("background: #0f0f14; border-top: 1px solid rgba(125,249,255,0.12);")
+        ai_layout = QHBoxLayout(ai_widget)
+        ai_layout.setContentsMargins(8, 6, 8, 6)
+        ai_layout.setSpacing(8)
+        ai_label = QLabel("🤖 AI:")
+        ai_label.setStyleSheet("font-weight: 700; color: #7df9ff; font-size: 11px;")
+        ai_label.setToolTip("Describe what you want. Only real app actions are offered. Nothing is invented.")
+        ai_layout.addWidget(ai_label)
+        self.ai_prompt_input = QLineEdit()
+        self.ai_prompt_input.setPlaceholderText('e.g. "trim edges, fade all, make it black and white and normalize" then press Apply')
+        self.ai_prompt_input.setMinimumHeight(32)
+        self.ai_prompt_input.setStyleSheet("background: #0a0a0e; border: 1px solid rgba(125,249,255,0.25); border-radius: 8px; padding: 4px 10px; color: white; font-size: 11px;")
+        self.ai_prompt_input.returnPressed.connect(self.run_ai_assist)
+        ai_layout.addWidget(self.ai_prompt_input, stretch=1)
+        ai_apply_btn = QPushButton("Apply")
+        ai_apply_btn.setStyleSheet(self.button_style("#00ff88"))
+        ai_apply_btn.setMinimumHeight(32)
+        ai_apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ai_apply_btn.setToolTip("Parse prompt into real actions, preview, then apply")
+        ai_apply_btn.clicked.connect(self.run_ai_assist)
+        ai_layout.addWidget(ai_apply_btn)
+        ai_help_btn = QPushButton("?")
+        ai_help_btn.setFixedSize(32, 32)
+        ai_help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ai_help_btn.setStyleSheet(self.button_style("rgba(255,255,255,0.08)"))
+        ai_help_btn.setToolTip("What can the AI do?")
+        ai_help_btn.clicked.connect(self.show_ai_capabilities)
+        ai_layout.addWidget(ai_help_btn)
+        timeline_layout.addWidget(ai_widget)
         footer = QWidget()
         footer.setFixedHeight(36)
         footer.setStyleSheet("background: #0f0f14; border-top: 1px solid rgba(255,255,255,0.06);")
@@ -8639,6 +9042,17 @@ class FastEncodeProApp(QMainWindow):
                 tl_time = clip.start_time + (file_sec - clip.in_point)
                 self.timeline.set_playhead_position(tl_time, auto_scroll=True, emit_signal=False)
 
+        # Self-healing play button: paths like the EOF watcher settle into
+        # paused without going through toggle_play - reflect reality if the
+        # button drifted from it.
+        try:
+            if self.video_widget is not None:
+                paused_now = bool(self.video_widget.is_paused())
+                if paused_now != getattr(self, '_last_play_ui_paused', paused_now):
+                    self._set_play_ui(paused_now)
+        except Exception:
+            pass
+
     def _on_duration_changed(self, duration_ms):
         if duration_ms <= 0:
             if self.is_timeline_mode and self._play_uses_timeline_edl:
@@ -8656,6 +9070,11 @@ class FastEncodeProApp(QMainWindow):
             self.timecode_label.setText(f"{current_tc}:{int((current_ms % 1000) / 1000 * 60):02d}")
         except Exception:
             self.timecode_label.setText(current_tc)
+        try:
+            if hasattr(self, 'scrub_wave'):
+                self.scrub_wave.set_media_duration(duration_ms)
+        except Exception:
+            pass
 
     def on_media_selected(self, item):
         self.is_timeline_mode = False
@@ -8683,6 +9102,11 @@ class FastEncodeProApp(QMainWindow):
                     self.video_widget.set_audio_complex_filter(filter_str)
 
             self.update_trim_info()
+            try:
+                if hasattr(self, 'scrub_wave'):
+                    self.scrub_wave.set_media_duration(int(self.current_media.duration * 1000))
+            except Exception:
+                pass
 
     def activate_timeline_mode(self):
         was_active = self.is_timeline_mode and self._play_uses_timeline_edl
@@ -8756,6 +9180,11 @@ class FastEncodeProApp(QMainWindow):
                 if self.video_widget._duration_ms <= 0:
                     self.video_widget._duration_ms = timeline_dur_ms
                     self.video_widget.durationChanged.emit(timeline_dur_ms)
+                try:
+                    if hasattr(self, 'scrub_wave'):
+                        self.scrub_wave.set_media_duration(timeline_dur_ms)
+                except Exception:
+                    pass
                 if play:
                     self.video_widget.play()
                     self.play_btn.setText("â¸ï¸ Pause")
@@ -8801,6 +9230,12 @@ class FastEncodeProApp(QMainWindow):
         out_tc = self.format_timecode(int(clip.out_point * 1000))
         dur_tc = self.format_timecode(int(clip.get_trimmed_duration() * 1000))
         self.trim_info.setText(f"Selected: {clip.name} | In: {in_tc} | Out: {out_tc}")
+        try:
+            # Seek domain here is the whole proxy file, so the scrubber spans it.
+            if hasattr(self, 'scrub_wave'):
+                self.scrub_wave.set_media_duration(int(clip.full_duration * 1000))
+        except Exception:
+            pass
 
     def update_clip_volume(self):
         self.t1_val.setText(f"{self.track1_slider.value()} dB")
@@ -8858,14 +9293,36 @@ class FastEncodeProApp(QMainWindow):
 
         clip = self.timeline.selected_clip
 
-        if clip.audio_streams < 2:
+        # Re-probe the actual file right now: the cached count dates from
+        # import time and a failed probe used to masquerade as "1 track".
+        try:
+            n_tracks, channels = probe_audio_streams(clip.file_path)
+        except RuntimeError as e:
+            QMessageBox.critical(self, "Cannot Read Audio Tracks", f"ffprobe failed:\n{e}")
+            return
+        try:
+            if n_tracks > 0:
+                clip.audio_streams = n_tracks
+                while len(clip.volumes) < n_tracks:
+                    clip.volumes.append(0.0)
+                    clip.normalization.append(False)
+        except Exception:
+            pass
+
+        if n_tracks < 2:
+            detail = ""
+            try:
+                if channels and channels[0]:
+                    detail = f" (the single stream carries {channels[0]} channel(s))"
+            except Exception:
+                pass
             QMessageBox.warning(
                 self,
                 "Insufficient Audio Tracks",
-                f"This clip only has {clip.audio_streams} audio track(s)."
-                "Auto-sync requires at least 2 audio tracks:"
-                "â€¢ Track 0: Reference (usually desktop audio)"
-                "â€¢ Track 1: To sync (usually microphone)"
+                f"This clip has {n_tracks} audio stream(s){detail}."
+                "Auto-sync requires at least 2 separate audio streams:"
+                "• Track 0: Reference (usually desktop audio)"
+                "• Track 1: To sync (usually microphone)"
             )
             return
 
@@ -8922,14 +9379,14 @@ class FastEncodeProApp(QMainWindow):
             else:
                 explanation = "Tracks are already in sync!"
 
-            if confidence >= 0.7:
+            if confidence >= 0.55:
                 conf_emoji = "✅"
                 conf_text = "High"
-            elif confidence >= 0.4:
-                conf_emoji = "âš ï¸"
+            elif confidence >= 0.30:
+                conf_emoji = "⚠️"
                 conf_text = "Medium"
             else:
-                conf_emoji = "âŒ"
+                conf_emoji = "❌"
                 conf_text = "Low"
 
             result = QMessageBox(self)
@@ -8944,9 +9401,9 @@ class FastEncodeProApp(QMainWindow):
             result.setIcon(QMessageBox.Icon.Question)
             result.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
 
-            if confidence < 0.4:
+            if confidence < 0.30:
                 result.setInformativeText(
-                    "âš ï¸ Low confidence detection!"
+                    "Low confidence detection!"
                     "The audio tracks may not have enough overlap,"
                     "or the sync offset might be inaccurate."
                     "You can still apply it and adjust manually if needed."
@@ -8981,13 +9438,14 @@ class FastEncodeProApp(QMainWindow):
         if not self.video_widget:
             return
         if getattr(self, '_play_uses_timeline_edl', False):
-            self.video_widget.seek(int(time * 1000))
+            self.video_widget.seek(int(time * 1000), exact=False,
+                                   domain_ms=int(self.timeline.get_timeline_duration() * 1000))
         else:
             clip = getattr(self.timeline, 'selected_clip', None)
             if clip:
                 clip_time = clip.in_point + (time - clip.start_time)
                 clip_time = max(clip.in_point, min(clip.out_point, clip_time))
-                self.video_widget.seek(int(clip_time * 1000))
+                self.video_widget.seek(int(clip_time * 1000), exact=False)
 
     def toggle_play(self):
         if not self.video_widget:
@@ -9019,6 +9477,10 @@ class FastEncodeProApp(QMainWindow):
                 self.center_play.setText("▶" if paused else "❚❚")
         except Exception:
             pass
+        try:
+            self._last_play_ui_paused = bool(paused)
+        except Exception:
+            pass
 
     def play_timeline_sequence(self):
         self.load_timeline_sequence(play=True)
@@ -9030,8 +9492,12 @@ class FastEncodeProApp(QMainWindow):
             except Exception:
                 pass
 
-    def seek_preview(self, value):
+    def seek_preview(self, value, exact=True):
         if not self.video_widget:
+            return
+        try:
+            value = max(0, min(1000, int(value)))
+        except Exception:
             return
         dur = self.video_widget.duration()
         if dur <= 0:
@@ -9041,9 +9507,116 @@ class FastEncodeProApp(QMainWindow):
                 dur = int(getattr(self.current_media, 'duration', 0) * 1000)
         if dur > 0:
             position_ms = int((value / 1000.0) * dur)
-            self.video_widget.seek(position_ms)
+            self.video_widget.seek(position_ms, exact=exact)
             if self.is_timeline_mode and getattr(self, '_play_uses_timeline_edl', False):
                 self.timeline.set_playhead_position(position_ms / 1000.0, auto_scroll=True, emit_signal=False)
+
+    def _scrub_domain_ms(self):
+        """Single source of truth for the scrubber's seek domain: the
+        widget's explicit media duration, else the live chain."""
+        try:
+            dur = int(getattr(self.scrub_wave, 'media_duration_ms', 0) or 0)
+        except Exception:
+            dur = 0
+        if dur <= 0:
+            dur = self._scrub_duration_ms()
+        return dur
+
+    def _scrub_targets(self, ratio):
+        """Map scrub ratio -> (mpv file ms or None, timeline sec or None,
+        clamp-domain ms).
+
+        Every branch derives its domain from live app state - never from a
+        pushed or cached duration that may belong to a previous file:
+        - EDL mode: the timeline itself (what mpv is actually playing).
+          Domain is exact by construction, so it is also returned.
+        - Clip mode: the TRIMMED region (in_point..out_point), so ratio 0
+          is the clip's first frame and 1 its last - the bar always spans
+          the actual clip. No domain: file length is only probed, and a
+          wrong-small clamp is worse than the cached one.
+        - Otherwise: the selected media file, if any.
+        Returns (None, None, 0) when nothing has a usable duration.
+        """
+        try:
+            ratio = max(0.0, min(1.0, float(ratio)))
+        except Exception:
+            return None, None, 0
+        try:
+            if self.is_timeline_mode and self._play_uses_timeline_edl:
+                dur = int(self.timeline.get_timeline_duration() * 1000)
+                if dur <= 0:
+                    return None, None, 0
+                file_ms = int(ratio * dur)
+                return file_ms, file_ms / 1000.0, dur
+            clip = getattr(self.timeline, 'selected_clip', None)
+            if clip is not None and self.is_timeline_mode:
+                trimmed = clip.get_trimmed_duration()
+                if trimmed <= 0:
+                    return None, None, 0
+                tl = clip.start_time + ratio * trimmed
+                tl = max(clip.start_time, min(clip.get_end_time(), tl))
+                file_ms = int((clip.in_point + ratio * trimmed) * 1000)
+                return file_ms, tl, 0
+        except Exception:
+            return None, None, 0
+        try:
+            media = getattr(self, 'current_media', None)
+            dur = int((media.duration if media is not None else 0) * 1000)
+        except Exception:
+            dur = 0
+        if dur <= 0:
+            try:
+                dur = self._scrub_domain_ms()
+            except Exception:
+                dur = 0
+        if dur <= 0:
+            return None, None, 0
+        return int(ratio * dur), None, 0
+
+    def _on_scrub_move(self, ratio):
+        """Drag in progress: playhead + timecode follow instantly, showing
+        timeline time. Zero mpv traffic by design."""
+        file_ms, tl, _domain = self._scrub_targets(ratio)
+        if file_ms is None:
+            return
+        try:
+            if tl is not None:
+                self.timeline.set_playhead_position(tl, auto_scroll=False, emit_signal=False)
+        except Exception:
+            pass
+        try:
+            show_ms = int(tl * 1000) if tl is not None else file_ms
+            self.timecode_label.setText(self.format_timecode(show_ms))
+        except Exception:
+            pass
+
+    def _on_scrub_finish(self, ratio):
+        """Pointer released: exactly one keyframe-precise seek, then settle
+        the playhead (with scroll) exactly on the landing spot."""
+        file_ms, tl, domain = self._scrub_targets(ratio)
+        if file_ms is None:
+            return
+        try:
+            self.video_widget.seek(file_ms, exact=False, domain_ms=domain)
+        except Exception:
+            pass
+        try:
+            if tl is not None:
+                self.timeline.set_playhead_position(tl, auto_scroll=True, emit_signal=False)
+                self.timecode_label.setText(self.format_timecode(int(tl * 1000)))
+        except Exception:
+            pass
+
+    def _scrub_duration_ms(self):
+        if not self.video_widget:
+            return 0
+        dur = self.video_widget.duration()
+        if dur <= 0:
+            if self.is_timeline_mode and self._play_uses_timeline_edl:
+                dur = int(self.timeline.get_timeline_duration() * 1000)
+            elif getattr(self, 'current_media', None):
+                dur = int(getattr(self.current_media, 'duration', 0) * 1000)
+        return max(0, int(dur))
 
     def format_timecode(self, ms):
         s = ms // 1000
@@ -9109,7 +9682,12 @@ class FastEncodeProApp(QMainWindow):
             QMessageBox.warning(self, "No Clip Selected", "Please click a clip on the timeline first.")
             return
         c = self.timeline.selected_clip
-        dur = c.duration
+        dur = getattr(c, 'full_duration', 0) or 0
+        if dur <= 0:
+            try:
+                dur = float(c.out_point or 0) or 60.0
+            except Exception:
+                dur = 60.0
         c.in_point = min(dur, c.in_point + 1.0)
         c.out_point = max(0, c.out_point - 1.0)
         if c.out_point <= c.in_point:
@@ -9119,7 +9697,7 @@ class FastEncodeProApp(QMainWindow):
         self.status_label.setText("Auto-Trimmed 1s off edges.")
 
     def apply_transition_to_selected(self):
-        sel = self.timeline_widget.selected_clip
+        sel = getattr(self.timeline, 'selected_clip', None)
         if not sel:
             QMessageBox.information(self, "No Clip", "Select a clip on the timeline first.")
             return
@@ -9127,7 +9705,7 @@ class FastEncodeProApp(QMainWindow):
         dur = float(self.trans_duration_spin.value())
         sel.transition_type = None if name == "None" else name
         sel.transition_duration = dur if name != "None" else 0.0
-        self.timeline_widget.update()
+        self.timeline.update()
         self.status_label.setText(f"Transition {name} applied with {dur}s duration")
 
     def auto_fade_all(self):
@@ -9142,32 +9720,267 @@ class FastEncodeProApp(QMainWindow):
         self.update_timeline_duration()
         self.status_label.setText("Applied 1s fade to all clips.")
 
-    def auto_black_and_white(self):
-        # Toggle B&W mode: set saturation slider to minimum (-100) for full desaturation
-        if hasattr(self, 'color_saturation_slider'):
-            current = self.color_saturation_slider.value()
-            if current == -100:
-                # Already B&W, toggle it off
-                self.color_saturation_slider.setValue(0)
-                self.app_settings.setValue('color_bw_mode', False)
-                self.status_label.setText("Black & White filter removed.")
-                QMessageBox.information(self, "Color Restored", "Color has been restored to all timeline clips.")
-            else:
-                self.color_saturation_slider.setValue(-100)
-                self.app_settings.setValue('color_bw_mode', True)
-                self.status_label.setText("Applied Black & White Filter.")
-                QMessageBox.information(self, "Black & White", "Black and White filter activated across all timeline clips.")
+    def auto_black_and_white(self, force_on=None):
+        # Toggle B&W via the real export flag (hue=s=0). No modal popups so AI/batch can call it.
+        # force_on=True/False for AI prompt; None = toggle for button.
+        try:
+            current = bool(self.app_settings.value('color_bw_mode', False, type=bool))
+        except Exception:
+            current = False
+        target = (not current) if force_on is None else bool(force_on)
+        try:
+            self.app_settings.setValue('color_bw_mode', target)
+        except Exception:
+            pass
+        try:
+            self.update_live_preview_filters()
+        except Exception:
+            pass
+        self.status_label.setText("Applied Black & White Filter." if target else "Black & White filter removed.")
+        return target
 
     def auto_normalize_audio(self):
+        # Fix: normalization is List[bool] consumed as loudnorm per stream.
+        # Old code appended a filter string that export ignored -> button did nothing.
+        if not self.timeline.clips:
+            QMessageBox.warning(self, "No Clips", "Add clips to the timeline first.")
+            return
         for c in self.timeline.clips:
-            # Add dynamic normalization filter to each clip
-            if not hasattr(c, 'normalization'):
-                c.normalization = []
-            if "dynaudnorm=f=150:g=15" not in c.normalization:
-                c.normalization.append("dynaudnorm=f=150:g=15")
+            try:
+                n = max(1, len(getattr(c, 'volumes', [0.0]) or [0.0]))
+            except Exception:
+                n = 1
+            c.normalization = [True] * n
+        # Reflect on mixer checkboxes when a clip is selected
+        try:
+            if getattr(self.timeline, 'selected_clip', None):
+                if hasattr(self, 'track1_norm'):
+                    self.track1_norm.setChecked(True)
+                if hasattr(self, 'track2_norm'):
+                    self.track2_norm.setChecked(True)
+        except Exception:
+            pass
         self.timeline.update()
         self.update_timeline_duration()
-        self.status_label.setText("Audio Normalized.")
+        self.status_label.setText("Audio Normalized (loudnorm on all clips).")
+
+    # --- AI ASSIST (prompt -> real actions only, never invented) ---
+    def show_ai_capabilities(self):
+        QMessageBox.information(self, "AI Assistant - What I Can Do",
+            "I can only do what the app can actually do. Type any of these in the AI box:\n\n"
+            "• trim / trim edges (selected clip)\n"
+            "• fade all / crossfade\n"
+            "• black and white on/off\n"
+            "• normalize audio\n"
+            "• balance / auto color balance\n"
+            "• sync audio\n"
+            "• add text \"your words here\"\n"
+            "• record voiceover\n"
+            "• reset filters\n"
+            "• add to timeline / remove clip / clear timeline\n"
+            "• zoom in / zoom out\n"
+            "• mark in / mark out (media trim)\n"
+            "• export / stop\n\n"
+            "Example: 'trim edges, fade all, normalize and export'\n"
+            "You always preview before anything runs.")
+
+    def _ai_build_plan(self, prompt):
+        import re as _re
+        text = (prompt or "").strip()
+        low = text.lower()
+        if not low:
+            return []
+        # Split multi-intent prompts: "trim, fade all and normalize" -> 3 chunks
+        chunks = _re.split(r'\s+then\s+|\s+and\s+|[,;+&]+|\n+', low)
+        chunks = [c.strip() for c in chunks if c.strip()]
+        if not chunks:
+            chunks = [low]
+        plan = []
+        seen = set()
+        def _add(key, label):
+            if key not in seen:
+                seen.add(key)
+                plan.append({"key": key, "label": label})
+        # Extract quoted text for Text action: "add text \"hello\"" or text: hello
+        quoted = ""
+        try:
+            m = _re.search(r'"([^"]+)"', text)
+            if m:
+                quoted = m.group(1).strip()
+            else:
+                m2 = _re.search(r"'([^']+)'", text)
+                if m2:
+                    quoted = m2.group(1).strip()
+                else:
+                    m3 = _re.search(r'text\s*[:\-]\s*(.+)', text, flags=_re.IGNORECASE)
+                    if m3:
+                        quoted = m3.group(1).strip()[:120]
+        except Exception:
+            quoted = ""
+        for ch in chunks:
+            # Order matters: check specific/clear first so "remove bw" doesn't eat "remove clip"
+            if any(k in ch for k in ("clear timeline", "clear all", "remove all clips", "empty timeline")):
+                _add("clear", "Clear timeline (asks to confirm)")
+            elif any(k in ch for k in ("add to timeline", "add media", "add clip", "add video", "put on timeline", "put it on the timeline")):
+                _add("add", "Add selected library media to timeline")
+            elif any(k in ch for k in ("remove clip", "delete clip", "remove selected")):
+                _add("remove", "Remove selected timeline clip")
+            if any(k in ch for k in ("trim", "cut edges", "remove ends", "auto-trim", "autotrim")):
+                _add("trim", "Auto-trim 1s off selected clip edges")
+            if "fade" in ch or "crossfade" in ch or "dissolve" in ch:
+                _add("fade", "Fade all clips (1s)")
+            # B&W with on/off detection
+            if any(k in ch for k in ("black and white", "black & white", "b&w", "grayscale", "greyscale")) or ch.strip() == "bw":
+                if any(k in ch for k in ("remove", "off", "disable", "restore color", "back to color")):
+                    _add("bw_off", "Remove Black & White (restore color)")
+                else:
+                    _add("bw_on", "Apply Black & White")
+            if any(k in ch for k in ("normalize", "normalise", "loudnorm", "level audio", "loudness", "boost audio")):
+                _add("norm", "Normalize audio (all clips)")
+            if any(k in ch for k in ("balance", "white balance", "color correct", "auto color")):
+                _add("balance", "Auto color balance")
+            if "sync" in ch or "align audio" in ch or "lip sync" in ch:
+                _add("sync", "Auto-sync audio tracks")
+            if any(k in ch for k in ("lower third", "caption", "title", "overlay text")) or ("text" in ch):
+                lbl = f'Add text "{quoted}"' if quoted else "Add text overlay (asks for words)"
+                _add("text", lbl)
+            if any(k in ch for k in ("voiceover", "voice over", "narration", "narrate")) or ("record" in ch and "audio" in ch) or ch.strip() in ("vo", "record"):
+                _add("vo", "Record voiceover at playhead")
+            if any(k in ch for k in ("reset", "clear filters", "remove filters")):
+                _add("reset", "Reset all color/FX filters")
+            if "zoom out" in ch:
+                _add("zoomout", "Zoom timeline out")
+            elif "zoom in" in ch:
+                _add("zoomin", "Zoom timeline in")
+            if "mark out" in ch or "out point" in ch or ch.strip() == "out":
+                _add("out", "Mark media Out-point at preview pos")
+            elif "mark in" in ch or "in point" in ch or ch.strip() in ("in", "mark in-point"):
+                _add("in", "Mark media In-point at preview pos")
+            if any(k in ch for k in ("export", "render", "encode video", "save video")):
+                _add("export", "Export timeline")
+            elif ch.strip() == "stop":
+                _add("stop", "Stop export")
+        if quoted and not any(p["key"] == "text" for p in plan) and "text" in low:
+            _add("text", f'Add text "{quoted}"')
+        # stash quoted text for apply step
+        try:
+            self._ai_quoted_text = quoted
+        except Exception:
+            pass
+        return plan
+
+    def run_ai_assist(self):
+        prompt = ""
+        try:
+            prompt = self.ai_prompt_input.text()
+        except Exception:
+            pass
+        plan = self._ai_build_plan(prompt)
+        if not plan:
+            self.show_ai_capabilities()
+            self.status_label.setText("AI: didn't understand - showing what I can do.")
+            return
+        preview = "\n".join(f"• {p['label']}" for p in plan)
+        reply = QMessageBox.question(self, "AI Plan - Apply?",
+            f"You asked:\n\"{(prompt or '')[:200]}\"\n\nI will do only these real actions:\n{preview}\n\nApply in order?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            self.status_label.setText("AI: cancelled, nothing changed.")
+            return
+        self._ai_apply_plan(plan)
+
+    def _ai_apply_plan(self, plan):
+        quoted = getattr(self, '_ai_quoted_text', '') or ""
+        results = []
+        for p in plan:
+            key = p["key"]
+            try:
+                if key == "trim":
+                    if not getattr(self.timeline, 'selected_clip', None):
+                        # Help non-editors: operate on first clip if nothing selected
+                        if self.timeline.clips:
+                            self.timeline.selected_clip = self.timeline.clips[0]
+                            self.timeline.update()
+                    self.auto_trim_selected()
+                    results.append("trim: done")
+                elif key == "fade":
+                    self.auto_fade_all()
+                    results.append("fade: done")
+                elif key == "bw_on":
+                    self.auto_black_and_white(force_on=True)
+                    results.append("b&w: on")
+                elif key == "bw_off":
+                    self.auto_black_and_white(force_on=False)
+                    results.append("b&w: off")
+                elif key == "norm":
+                    self.auto_normalize_audio()
+                    results.append("normalize: done")
+                elif key == "balance":
+                    self.apply_auto_balance()
+                    results.append("balance: done")
+                elif key == "sync":
+                    self.auto_sync_audio_tracks()
+                    results.append("sync: launched")
+                elif key == "text":
+                    if quoted:
+                        try:
+                            start = float(getattr(self.timeline, 'playhead_position', 0.0) or 0.0)
+                        except Exception:
+                            start = 0.0
+                        tc = TextClip(quoted, start, 5.0)
+                        self.timeline.text_clips.append(tc)
+                        self.timeline.update()
+                        self.status_label.setText(f"Added text overlay: '{quoted[:20]}...'")
+                        results.append("text: added")
+                    else:
+                        self.add_text_overlay()
+                        results.append("text: dialog")
+                elif key == "vo":
+                    self.record_voiceover()
+                    results.append("voiceover: launched")
+                elif key == "reset":
+                    self.reset_all_filters()
+                    results.append("reset: done")
+                elif key == "add":
+                    self.add_to_timeline()
+                    results.append("add: done")
+                elif key == "remove":
+                    self.remove_from_timeline()
+                    results.append("remove: done")
+                elif key == "clear":
+                    self.clear_timeline()
+                    results.append("clear: launched")
+                elif key == "zoomin":
+                    self.zoom_in_timeline()
+                    results.append("zoom in: done")
+                elif key == "zoomout":
+                    self.zoom_out_timeline()
+                    results.append("zoom out: done")
+                elif key == "in":
+                    self.set_media_in_point()
+                    results.append("in-point: set")
+                elif key == "out":
+                    self.set_media_out_point()
+                    results.append("out-point: set")
+                elif key == "export":
+                    self.export_timeline()
+                    results.append("export: launched")
+                elif key == "stop":
+                    self.stop_timeline_export()
+                    results.append("stop: done")
+                else:
+                    results.append(f"{key}: skipped (unknown)")
+            except Exception as e:
+                results.append(f"{key}: failed ({e})")
+        try:
+            self.append_log("🤖 AI applied: " + "; ".join(results))
+        except Exception:
+            pass
+        self.status_label.setText("AI done: " + "; ".join(results)[:160])
+        try:
+            self.ai_prompt_input.clear()
+        except Exception:
+            pass
 
     def add_text_overlay(self):
         from PyQt6.QtWidgets import QInputDialog
@@ -9259,6 +10072,12 @@ class FastEncodeProApp(QMainWindow):
         # Keep EDL synced if we are currently looking at the full timeline
         if getattr(self, 'is_timeline_mode', False) and getattr(self, '_play_uses_timeline_edl', False):
             self.load_timeline_sequence(play=False)
+        try:
+            if getattr(self, 'is_timeline_mode', False) and getattr(self, '_play_uses_timeline_edl', False):
+                if hasattr(self, 'scrub_wave'):
+                    self.scrub_wave.set_media_duration(int(self.timeline.get_timeline_duration() * 1000))
+        except Exception:
+            pass
 
     def zoom_in_timeline(self):
         self.timeline.zoom_in()

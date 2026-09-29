@@ -7,6 +7,12 @@ v0.9.3 Features:
 - Master Canvas Compositor Engine: True NLE rendering via filter_complex.
 - Zero System RAM bottleneck; 100% frame-accurate Timeline rendering.
 - Added Automatic Audio Sync detection.
+- Audio Sync engine rewrite (DaVinci-style): phase-preserving spectral whitening +
+  block-wise normalized correlation with median-vote drift compensation; confidence now
+  measures alignment certainty (peak prominence), not shared-energy fraction; analyzes 90s.
+- Timeline export: clips with >1 audio track or a sync offset fall back to the full audio
+  graph (turbo audio only carried track 0 and silently ignored sync).
+- Solo-clip preview honors clip.sync_offset via adelay so synced tracks are heard in line.
 - Fixed Wayland ghost-window bugs during audio sync analysis.
 - Fixed PyQt6 thread-safety crashes for timeline waveforms.
 - Multi-clip export: video overlay uses timeline-aligned PTS (fixes black after first clip).
@@ -207,10 +213,28 @@ def _clear_managed_temp_files(temp_root):
     return deleted
 
 def _bootstrap_mpv_runtime_path():
-    """PyInstaller / frozen EXE: register folders where ``libmpv-2.dll`` is unpacked before ``import mpv``."""
-    if not getattr(sys, 'frozen', False):
-        return
+    """Register folders where ``libmpv-2.dll`` lives before ``import mpv``.
+    Frozen EXE: the _MEIPASS / exe dirs. Plain `python app.py` runs (the
+    double-click BAT): the script's own folder, where test zips bundle it."""
     bases = []
+    try:
+        _here = os.path.abspath(os.path.dirname(__file__))
+        if _here and os.path.isdir(_here):
+            bases.append(_here)
+    except Exception:
+        pass
+    if not getattr(sys, 'frozen', False) and bases:
+        for _b in bases:
+            try:
+                if hasattr(os, 'add_dll_directory'):
+                    os.add_dll_directory(_b)
+            except (OSError, ValueError, FileNotFoundError, AttributeError):
+                pass
+        try:
+            os.environ['PATH'] = os.pathsep.join(bases) + os.pathsep + os.environ.get('PATH', '')
+        except Exception:
+            pass
+        return
     meipass = getattr(sys, '_MEIPASS', None)
     if meipass:
         bases.append(os.path.abspath(meipass))
@@ -258,13 +282,13 @@ except (ImportError, OSError):
     print("âš ï¸  sounddevice or scipy unavailable - voiceover recording disabled")
 
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRectF, QObject, QSize
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QUrl, QPointF, QTimer, QEvent, QPoint, QRect, QRectF, QObject, QSize
 from PyQt6.QtGui import (
     QFont, QPalette, QColor, QPainter, QBrush, QPen, QCursor, QAction, QPainterPath,
     QMouseEvent, QImage, QPixmap, QConicalGradient, QRadialGradient, QLinearGradient,
 )
 
-__version__ = "0.97.1"
+__version__ = "0.97.2"
 GITHUB_REPO = "cpgplays/FastEncodePro"
 
 class UpdateManager:
@@ -873,20 +897,96 @@ def _correlate_full(a, b):
     except ImportError:
         return _correlate_full_numpy(a, b)
 
+def _xcorr_linear_fft(x, y):
+    """Linear cross-correlation of 1-D arrays (any lengths) via FFT.
+
+    Same ordering as scipy.signal.correlate(x, y, mode='full'):
+    index i <-> lag (i - (len(y)-1)).
+    """
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+    n, m = x.size, y.size
+    if n == 0 or m == 0:
+        return np.zeros(0, dtype=np.float64)
+    size = 1
+    while size < n + m - 1:
+        size *= 2
+    c = np.fft.irfft(np.fft.rfft(x, size) * np.conj(np.fft.rfft(y, size)), size)
+    return np.concatenate([c[size - m + 1:], c[:n]])
+
+
+def _spectral_whiten(x, sample_rate, beta=0.7, lowcut_hz=80.0):
+    """Partial spectral whitening (phase-preserving).
+
+    Flattens the broad spectral coloration (EQ differences between a digital
+    capture and a mic-through-air capture, tonal dominance of music/bass)
+    while preserving phase, which is where the delay information lives.
+    beta=1 is full PHAT-style whitening; 0.7 is a safer partial version that
+    does not blow up quiet bins. Also applies a low-cut for rumble.
+    """
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64).ravel()
+    n = x.size
+    if n < 16:
+        return x
+    X = np.fft.rfft(x)
+    mag = np.abs(X)
+    nb = mag.size
+    # Smooth the magnitude spectrum with a wide moving average (~500 Hz
+    # resolution): flattens broad coloration, keeps narrow structure.
+    bin_hz = float(sample_rate) / n
+    width_bins = max(8, min(nb // 4, int(round(500.0 / bin_hz))))
+    c = np.empty(nb + 1, dtype=np.float64)
+    c[0] = 0.0
+    np.cumsum(mag, out=c[1:])
+    half = width_bins // 2
+    idx = np.arange(nb)
+    lo = np.maximum(0, idx - half)
+    hi = np.minimum(nb, idx + half + 1)
+    smooth = (c[hi] - c[lo]) / np.maximum(hi - lo, 1)
+    med = float(np.median(smooth)) + 1e-12
+    W = np.maximum((smooth / med) ** beta, 1e-3)
+    Xw = X / W
+    freqs = np.fft.rfftfreq(n, 1.0 / float(sample_rate))
+    Xw[freqs < lowcut_hz] = 0.0
+    return np.fft.irfft(Xw, n)
+
+
 def compute_sync_offset_samples(audio1, audio2, sample_rate, max_lag_seconds=5.0):
-    """Waveform sync between two mono float tracks.
+    """Waveform sync between two mono float tracks (DaVinci-style).
 
     Returns (offset_ms, confidence). Positive offset means track2 (mic) is
     LATE relative to track1 (desktop): delaying track 0 by +offset aligns
     them, which is exactly how the timeline export applies clip.sync_offset.
 
-    Method: strip DC + normalize both to unit energy (gain/DC invariant, so
-    a quiet mic still matches a loud desktop feed), FFT cross-correlation,
-    peak search restricted to +/-max_lag (kills absurd 20s false peaks from
-    room tone), parabolic sub-sample refinement. Confidence is the normalized
-    peak height in [0, 1].
+    Method
+    ------
+    1. Partial spectral whitening of both tracks (phase-preserving): removes
+       broad EQ differences between a digital capture and a mic-through-air
+       capture and stops tonal/periodic content (bass, steady beats) from
+       dominating the correlation, while keeping the phase that carries the
+       delay - and keeping the matched-filter sensitivity to weak coherent
+       shared content buried under loud uncorrelated content (voice).
+    2. Block-wise normalized cross-correlation (4 s blocks): every block is
+       zero-mean/unit-variance normalized before correlating, so one loud
+       burst (cough, shout, explosion) cannot dominate the whole analysis.
+       Each block votes its own peak lag; the median vote wins, so a drifting
+       offset (separate devices) or an outlier block cannot smear or hijack
+       the result the way a single global argmax can.
+    3. Drift-compensated averaging: block correlograms are shift-aligned to
+       the median vote before averaging, so the true peak adds up coherently
+       even when the offset drifts across the analysis window.
+    4. Peak prominence scoring: confidence reflects how far the winning lag
+       stands above the correlogram noise floor AND above the runner-up
+       peak - i.e. certainty of alignment, not the fraction of shared
+       energy (which is what the old normalized-peak-height metric measured,
+       and why it always read "low" when the mic mostly carried voice).
+       Scattered block votes (nothing shared) or strong drift reduce it.
+    5. Parabolic sub-sample refinement for sub-millisecond precision.
     """
     import numpy as np
+
     try:
         sr = float(sample_rate)
     except Exception:
@@ -896,45 +996,172 @@ def compute_sync_offset_samples(audio1, audio2, sample_rate, max_lag_seconds=5.0
     a = np.asarray(audio1, dtype=np.float64).ravel()
     b = np.asarray(audio2, dtype=np.float64).ravel()
     n = int(min(a.size, b.size))
-    if n < int(sr):
+    if n < int(sr * 2.0):
         return 0, 0.0
-    a = a[:n] - float(np.mean(a[:n]))
-    b = b[:n] - float(np.mean(b[:n]))
-    ea = float(np.dot(a, a))
-    eb = float(np.dot(b, b))
-    if ea <= 0.0 or eb <= 0.0:
-        return 0, 0.0
-    a /= math.sqrt(ea)
-    b /= math.sqrt(eb)
-    corr = np.asarray(_correlate_full(a, b), dtype=np.float64)
-    center = n - 1
+    a = a[:n].copy()
+    b = b[:n].copy()
+
+    # --- 1. Whiten (also strips DC/rumble) ---
+    a = _spectral_whiten(a, sr)
+    b = _spectral_whiten(b, sr)
+
     try:
-        max_lag = max(1, min(n - 1, int(float(max_lag_seconds) * sr)))
+        max_lag = max(1, min(n - 1, int(round(float(max_lag_seconds) * sr))))
     except Exception:
-        max_lag = min(n - 1, int(5.0 * sr))
-    lo = max(0, center - max_lag)
-    hi = min(corr.size - 1, center + max_lag)
-    window = corr[lo:hi + 1]
-    if window.size == 0:
+        max_lag = max(1, min(n - 1, int(5.0 * sr)))
+    # Never search a lag window wider than the audio can support.
+    max_lag = min(max_lag, n // 4)
+
+    # --- 2. Block-wise normalized cross-correlation; each block votes ---
+    # 4 s blocks normally; shorter blocks for short clips (never below 1 s).
+    block_len = int(4.0 * sr)
+    if n < 6 * block_len:
+        block_len = max(int(1.0 * sr), n // 6)
+    if n < max_lag + 2 * block_len:
+        # Not enough audio to cover the lag window with a votable margin.
         return 0, 0.0
+    tiny = 1e-9
+    votes = []        # (vote_lag_samples, peak_value, t_center_seconds)
+    block_corrs = []  # (Ls, vals) per block for the aligned average
+    for s in range(0, n, block_len):
+        e = min(s + block_len, n)
+        if e - s < block_len // 2 and n > block_len:
+            break  # ignore a tiny tail block when full ones exist
+        lo = max(0, s - max_lag)
+        hi = min(n, e + max_lag)
+        za = a[s:e]
+        zb = b[lo:hi]
+        sa = float(np.std(za))
+        sb = float(np.std(zb))
+        if sa < tiny or sb < tiny:
+            continue  # silent block: nothing to align on
+        za = (za - float(np.mean(za))) / sa
+        zb = (zb - float(np.mean(zb))) / sb
+        c = _xcorr_linear_fft(za, zb)
+        # c index i <-> local lag (i - (len(zb)-1)); global lag L satisfies
+        # c_idx = L - s + hi - 1  (since lo + len(zb) == hi).
+        Lmin = max(-max_lag, s - hi + 1)
+        Lmax = min(max_lag, s + e - lo - 1)
+        if Lmax < Lmin:
+            continue
+        idx = np.arange(Lmin, Lmax + 1) - s + hi - 1
+        valid = (idx >= 0) & (idx < c.size)
+        if not np.any(valid):
+            continue
+        Ls = np.arange(Lmin, Lmax + 1)[valid]
+        vals = c[idx[valid]]
+        k = int(np.argmax(vals))
+        votes.append((int(Ls[k]), float(vals[k]), (s + e) / 2.0 / sr))
+        block_corrs.append((Ls, vals))
+
+    if len(votes) < 3:
+        return 0, 0.0
+    vote_lags = np.array([v[0] for v in votes], dtype=np.float64)
+    median_vote = float(np.median(vote_lags))
+    mad_samples = float(np.median(np.abs(vote_lags - median_vote)))
+    mad_ms = mad_samples * 1000.0 / sr
+
+    if mad_ms > 150.0:
+        # Votes are scattered: the tracks share nothing alignable (or the
+        # offset jumps around). Report the median guess with no confidence
+        # rather than aligning garbage into a fake sharp peak.
+        return int(round(-median_vote * 1000.0 / sr)), 0.0
+
+    # --- 3. Drift-compensated averaging: shift-align to the median vote ---
+    acc = np.zeros(2 * max_lag + 1, dtype=np.float64)
+    cnt = np.zeros(2 * max_lag + 1, dtype=np.float64)
+    median_int = int(round(median_vote))
+    for (Ls, vals), (vl, _pv, _t) in zip(block_corrs, votes):
+        shift = median_int - int(vl)
+        La = Ls + shift
+        ok = (La >= -max_lag) & (La <= max_lag)
+        if not np.any(ok):
+            continue
+        La = La[ok]
+        acc[La + max_lag] += vals[ok]
+        cnt[La + max_lag] += 1.0
+    mean_corr = acc / np.maximum(cnt, 1.0)
+
+    # --- 4. Peak pick near the median vote + prominence ---
+    search = int(min(max_lag, round(0.5 * sr)))  # +-0.5 s around median vote
+    c0 = max(0, median_int + max_lag - search)
+    c1 = min(mean_corr.size, median_int + max_lag + search + 1)
+    if c1 <= c0:
+        return int(round(-median_vote * 1000.0 / sr)), 0.0
+    window = mean_corr[c0:c1]
     peak_rel = int(np.argmax(window))
-    peak_idx = lo + peak_rel
-    peak_val = float(corr[peak_idx])
-    # Parabolic refinement for sub-sample precision.
+    peak_idx = c0 + peak_rel
+    peak_val = float(mean_corr[peak_idx])
+    if peak_val <= 0:
+        return int(round(-median_vote * 1000.0 / sr)), 0.0
+    floor = float(np.median(np.abs(mean_corr)))
+    excl = max(1, int(round(0.075 * sr)))  # +-75 ms exclusion zone
+    lo_x = max(0, peak_idx - excl)
+    hi_x = min(mean_corr.size, peak_idx + excl + 1)
+    masked = mean_corr.copy()
+    masked[lo_x:hi_x] = -np.inf
+    second_val = float(np.max(masked))
+    if not np.isfinite(second_val):
+        second_val = 0.0
+    second_val = max(second_val, 0.0)
+
+    prominence = peak_val / (floor + 1e-12)
+    isolation = peak_val / (second_val + 1e-12)
+
+    # --- 5. Parabolic sub-sample refinement ---
     shift = 0.0
-    if 0 < peak_idx < corr.size - 1:
-        y0 = float(corr[peak_idx - 1])
+    if 0 < peak_idx < mean_corr.size - 1:
+        y0 = float(mean_corr[peak_idx - 1])
         y1 = peak_val
-        y2 = float(corr[peak_idx + 1])
+        y2 = float(mean_corr[peak_idx + 1])
         denom = (y0 - 2.0 * y1 + y2)
         if denom != 0.0:
             shift = max(-0.5, min(0.5, 0.5 * (y0 - y2) / denom))
-    lag_samples = (peak_idx - center) + shift
-    # Convention check: if b[n] = a[n-D] (b delayed by D), the correlation
-    # peaks at lag k=-D, so the true delay is D = -k.
+    lag_samples = (peak_idx - max_lag) + shift
+
+    # Convention: 'full' ordering; if b[n] = a[n-D] (b delayed by D samples)
+    # the correlation peaks at lag -D, so the true delay is D = -lag.
+    # Positive return = track2 LATE -> delay track 0 by +offset to align.
     offset_ms = int(round(-lag_samples * 1000.0 / sr))
-    confidence = max(0.0, min(1.0, peak_val))
+
+    # --- 6. Prominence -> confidence in [0, 1] ---
+    conf_prom = (prominence - 2.0) / 10.0
+    conf_isol = (isolation - 1.05) / 0.9
+    confidence = 0.5 * (max(0.0, min(1.0, conf_prom))
+                        + max(0.0, min(1.0, conf_isol)))
+    # Residual disagreement between blocks (after removing any linear drift
+    # trend) reduces certainty.
+    # Residual disagreement between blocks (after removing any linear drift
+    # trend) reduces certainty. The trend fit is Theil-Sen (median of pairwise
+    # slopes): robust to the odd outlier block, unlike least squares.
+    ts = np.array([v[2] for v in votes])
+    try:
+        slopes = []
+        nv = len(vote_lags)
+        for ii in range(nv):
+            dts = ts[ii + 1:] - ts[ii]
+            ok = dts != 0
+            if np.any(ok):
+                slopes.extend(((vote_lags[ii + 1:][ok] - vote_lags[ii]) / dts[ok]).tolist())
+        slope = float(np.median(slopes)) if slopes else 0.0
+        intercept = float(np.median(vote_lags - slope * ts))
+        resid = vote_lags - (slope * ts + intercept)
+        resid_mad_ms = float(np.median(np.abs(resid))) * 1000.0 / sr
+        drift_ppm = abs(slope) * 1e6 / sr  # samples/s -> ppm
+    except Exception:
+        resid_mad_ms, drift_ppm = mad_ms, 0.0
+    if resid_mad_ms > 25.0:
+        confidence *= max(0.0, min(1.0, 1.0 - (resid_mad_ms - 25.0) / 35.0))
+    if drift_ppm > 100.0:
+        # A single delay number cannot fix drift; the median offset is still
+        # useful, just not certain.
+        confidence *= 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    # A razor-sharp dominant peak with no runner-up is a certain match.
+    if isolation > 4.0 and prominence > 8.0 and drift_ppm <= 100.0:
+        confidence = max(confidence, 0.95)
     return offset_ms, confidence
+
 
 def get_video_fps_static(filepath):
     try:
@@ -977,6 +1204,24 @@ def get_nvenc_preset_for_target(export_target_index):
 
 def get_export_extension_for_codec(codec):
     return ".mov" if codec == "prores_ks" else ".mp4"
+
+def get_export_extension_for_settings(settings):
+    """R77: output extension honoring audio-only exports (video exports
+    pick the container from the codec exactly as before)."""
+    if isinstance(settings, dict) and settings.get('audio_only'):
+        acodec = settings.get('audio_codec', 'aac')
+        if acodec == 'flac':
+            return ".flac"
+        if acodec in ('pcm_s24le', 'pcm_s16le', 'wav', 'copy'):
+            return ".wav"
+        if acodec == 'mp3':
+            return ".mp3"
+        return ".m4a"  # aac (default)
+    if isinstance(settings, dict):
+        codec = settings.get('video_codec', 'hevc_nvenc')
+    else:
+        codec = 'hevc_nvenc'
+    return get_export_extension_for_codec(codec)
 
 def should_enable_faststart(settings):
     # DISABLED v0.9.4: +faststart causes 10 min 117 Mbps random copy on 1000+ MB/s SSDs
@@ -1644,6 +1889,77 @@ class DwellClickFilter(QObject):
             QApplication.sendEvent(widget, QTest_release)
         QTimer.singleShot(100, self.overlay.show)
 
+# --- R76: app-wide "wheel must scroll, never change a setting" guard ---
+class _AppWheelGuard(QObject):
+    """One application-level event filter (R76).
+
+    Qt hands wheel events to whatever widget sits under the cursor, so
+    hovering a combo/spinbox/slider while scrolling silently changed its
+    value. This guard intercepts those events everywhere in the app:
+
+    - over a value widget inside a scrollable panel (export panel,
+      inspector dock, ...): the wheel is converted into a scroll of the
+      nearest enclosing scroll area and the original event is swallowed,
+      so the wheel scrolls the panel instead of changing the value;
+    - over a value widget with no scrollable ancestor (standalone
+      dialogs, dock bodies, the audio mixer): the wheel is swallowed;
+    - everywhere else (lists, text edits, combo popups, timeline, media
+      library...) the event passes through untouched.
+    """
+
+    _VALUE_WIDGETS = (QComboBox, QSpinBox, QDoubleSpinBox, QSlider,
+                      QAbstractSpinBox)
+
+    def _value_target(self, obj):
+        """The value widget a wheel event is aimed at, or None to let it
+        pass. The inner QLineEdit of a spinbox / editable combo receives
+        the wheel first, ignores it, and Qt propagates it up to that
+        parent - which would step the value - so guard it as part of the
+        parent value widget. A bare QLineEdit (text fields) is not a
+        value widget and scrolls nothing, so it passes through."""
+        if isinstance(obj, QLineEdit):
+            p = obj.parent()
+            while p is not None:
+                if isinstance(p, (QAbstractSpinBox, QComboBox)):
+                    return p
+                p = p.parent()
+            return None
+        return obj if isinstance(obj, self._VALUE_WIDGETS) else None
+
+    def eventFilter(self, obj, ev):
+        if ev.type() != QEvent.Type.Wheel:
+            return False
+        try:
+            w = self._value_target(obj)
+            if w is None:
+                return False
+            area = self._nearest_scroll_area(w)
+            if area is None:
+                ev.accept()      # no panel to scroll: swallow the wheel
+                return True
+            bar = area.verticalScrollBar()
+            pd = ev.pixelDelta()  # touchpad-style scroll
+            if pd is not None and (pd.y() or pd.x()):
+                bar.setValue(bar.value() - (pd.y() or pd.x()))
+            else:
+                delta = ev.angleDelta().y() or ev.angleDelta().x()
+                if delta:
+                    step = max(bar.singleStep(), 48)  # px per wheel notch
+                    bar.setValue(bar.value() - delta * step // 120)
+            ev.accept()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _nearest_scroll_area(w):
+        p = w.parent()
+        while p is not None:
+            if isinstance(p, QAbstractScrollArea):
+                return p
+            p = p.parent()
+        return None
+
 # --- MPV EMBED HELPERS (Hyprland-safe) ---
 def _is_wayland_session():
     try:
@@ -1781,68 +2097,515 @@ except Exception:
     _HAS_QOGL = False
 
 
-class _EmbeddedMpvGLWidget(_QOpenGLWidgetBase):
-    """libmpv render-API target. No wid/reparenting, so Wayland/Hyprland-safe.
+# --- R38: file logger for preview diagnostics ---
+def _fep_preview_log_path():
+    try:
+        if os.name == 'nt':
+            base = os.environ.get('APPDATA') or os.path.expanduser('~')
+            d = os.path.join(base, 'FastEncodePro')
+        else:
+            d = os.path.join(os.path.expanduser('~'), '.cache', 'FastEncodePro')
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, 'preview-debug.log')
+    except Exception:
+        return ''
 
-    Any failure is contained — caller falls back to the external MPV window.
+def _safe_mpv_prop(_m, _n):
+    try:
+        return _m[_n]
+    except Exception as _e:
+        return '?(err=%r)' % (_e,)
+
+
+def _fep_log(*args):
+    try:
+        msg = ' '.join(str(a) for a in args)
+    except Exception:
+        msg = '[fep-preview] (log format error)'
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+    try:
+        p = _fep_preview_log_path()
+        if p:
+            ts = datetime.datetime.now().strftime('%H:%M:%S')
+            with open(p, 'a', encoding='utf-8', errors='replace') as f:
+                f.write('[%s] %s\n' % (ts, msg))
+    except Exception:
+        pass
+
+def _fep_set_mpv_pill(win, text):
+    try:
+        lbl = getattr(win, 'mpv_pill_txt', None)
+        if lbl is not None:
+            lbl.setText(text)
+    except Exception:
+        pass
+
+
+class _SwPreviewWidget(QWidget):
+    """v7 software-only embedded preview: ZERO OpenGL.
+
+    mpv's software render API renders each frame into a CPU bytearray, which
+    is wrapped in a QImage and drawn in paintEvent. No QOpenGLWidget, no GL
+    context, no FBO, no graphics-driver involvement whatsoever.
     """
 
     def __init__(self, mpv_obj, parent=None):
         super().__init__(parent)
         self._mpv = mpv_obj
-        self._ctx = None
+        self._sw_ctx = None
+        self._ctx = None  # alias so _verify_embedded_gl treats us as ready
         self._init_error = None
+        self._backend = 'SW'
+        self._buf = None
+        self._frame = None
+        self._frame_count = 0
+        self._error_text = None
+        self._last_px_log_t = 0.0
+        self._last_err_log_t = 0.0
         self.setMinimumSize(320, 180)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setStyleSheet("background: black; border-radius: 20px;")
+        try:
+            import mpv as _mpv_mod
+            self._sw_ctx = _mpv_mod.MpvRenderContext(mpv_obj, api_type='sw')
+            self._ctx = self._sw_ctx
+            _fep_log('[fep-preview] v7 plain-widget SW context created (no GL anywhere)')
+        except Exception as e:
+            self._init_error = e
+            self._error_text = 'SW preview init failed: %s' % (e,)
+            _fep_log('[fep-preview] v7 plain SW ctx failed: %r' % (e,))
+            return
+        try:
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._tick)
+            self._timer.start(33)
+        except Exception:
+            pass
+
+    def shutdown_gl(self):
+        # API-compat no-op (there is no GL here); stops the render timer.
+        try:
+            if getattr(self, '_timer', None) is not None:
+                self._timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._sw_ctx is not None:
+                self._sw_ctx.free()
+        except Exception:
+            pass
+        self._sw_ctx = None
+        self._ctx = None
+
+    def _tick(self):
+        if self._sw_ctx is None:
+            return
+        try:
+            import ctypes as _ct
+            import time as _time
+            import mpv as _mpv_mod
+            _render = getattr(_mpv_mod, '_mpv_render_context_render', None)
+            if _render is None:
+                raise RuntimeError('python-mpv has no _mpv_render_context_render')
+            _RP = _mpv_mod.MpvRenderParam
+            w = max(2, int(self.width()))
+            h = max(2, int(self.height()))
+            stride = w * 4
+            buf = bytearray(stride * h)
+            addr = _ct.addressof(_ct.c_ubyte.from_buffer(buf))
+            _sz = (_ct.c_int * 2)(w, h)
+            _fmtb = _ct.create_string_buffer(b'rgb0')
+            _sti = _ct.c_int(stride)
+
+            def _mk(_tid, _daddr):
+                _p = _RP.__new__(_RP)
+                _p.type_id = _tid
+                _p.data = _daddr
+                return _p
+
+            arr = (_RP * 5)(
+                _mk(17, _ct.addressof(_sz)),
+                _mk(18, _ct.addressof(_fmtb)),
+                _mk(19, _ct.addressof(_sti)),
+                _mk(20, addr),
+                _mk(0, 0),
+            )
+            _render(self._sw_ctx.handle, arr)
+            # keep the buffer alive as long as the QImage references it
+            self._buf = buf
+            img = QImage(buf, w, h, stride, QImage.Format.Format_RGBX8888)
+            if img.isNull():
+                raise RuntimeError('QImage wrap failed')
+            self._frame = img
+            self._frame_count += 1
+            # killer diagnostic: log the actual pixel values mpv produced
+            now = _time.monotonic()
+            if self._frame_count <= 3 or (now - self._last_px_log_t) > 5.0:
+                self._last_px_log_t = now
+                _co = (h // 2) * stride + (w // 2) * 4
+                _r, _g, _b = buf[_co], buf[_co + 1], buf[_co + 2]
+                _fep_log('[fep-preview] v7 sw frame #%d %dx%d center RGB=(%d,%d,%d)' % (
+                    self._frame_count, w, h, _r, _g, _b))
+            self._error_text = None
+            self.update()
+        except Exception as e:
+            import time as _time
+            now = _time.monotonic()
+            if (now - self._last_err_log_t) > 5.0:
+                self._last_err_log_t = now
+                _fep_log('[fep-preview] v7 sw tick failed: %r' % (e,))
+            self._error_text = 'SW render failed: %s' % (e,)
+            self.update()
+
+    def paintEvent(self, ev):
+        try:
+            p = QPainter(self)
+            try:
+                if self._frame is not None:
+                    p.drawImage(self.rect(), self._frame)
+                else:
+                    p.fillRect(self.rect(), QColor('black'))
+                _msg = self._error_text
+                if _msg is None and self._frame is None and self._init_error is not None:
+                    _msg = 'SW preview init failed: %s' % (self._init_error,)
+                if _msg:
+                    p.setPen(QColor('#ff5555'))
+                    try:
+                        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, _msg[:220])
+                    except Exception:
+                        pass
+            finally:
+                p.end()
+        except Exception:
+            pass
+
+
+class _EmbeddedMpvGLWidget(_QOpenGLWidgetBase):
+    """libmpv render-API target. No wid/reparenting, so Wayland/Hyprland-safe.
+
+    Backend chain: OpenGL render API (Qt getProcAddress, then raw WGL), then
+    libmpv's software render API. Any total failure is contained — the caller
+    falls back to the external MPV window.
+    """
+
+    _frame_ready = pyqtSignal()
+
+    def __init__(self, mpv_obj, parent=None):
+        super().__init__(parent)
+        # Ask Qt for a real desktop OpenGL context (never ANGLE/GLES): mpv's
+        # GL probe parses glGetString(GL_VERSION) and rejects anything odd.
+        try:
+            from PyQt6.QtGui import QSurfaceFormat as _QSF
+            _fmt = _QSF()
+            _fmt.setRenderableType(_QSF.RenderableType.OpenGL)
+            _fmt.setProfile(_QSF.OpenGLContextProfile.CompatibilityProfile)
+            _fmt.setDepthBufferSize(24)
+            _fmt.setStencilBufferSize(8)
+            self.setFormat(_fmt)
+        except Exception as _e:
+            _fep_log('[fep-preview] setFormat(desktop GL) skipped:', _e)
+        self._mpv = mpv_obj
+        self._mpv_mod_ref = None
+        self._ctx = None
+        self._sw_ctx = None
+        self._sw_mode = False
+        self._sw_timer = None
+        self._backend = None
+        self._get_proc_fn = None
+        self._init_done = False
+        self._init_error = None
+        self._wgl_get_proc = None
+        try:
+            import sys as _sys
+            if _sys.platform == 'win32':
+                import ctypes as _ct
+                _wgl = _ct.windll.opengl32
+                _wgl.wglGetProcAddress.argtypes = [_ct.c_char_p]
+                _wgl.wglGetProcAddress.restype = _ct.c_void_p
+                _k32 = _ct.windll.kernel32
+                _k32.GetModuleHandleW.argtypes = [_ct.c_wchar_p]
+                _k32.GetModuleHandleW.restype = _ct.c_void_p
+                _k32.GetProcAddress.argtypes = [_ct.c_void_p, _ct.c_char_p]
+                _k32.GetProcAddress.restype = _ct.c_void_p
+                _hgl = _k32.GetModuleHandleW('opengl32.dll')
+                def _wgl_get_proc(_c, _name, _wgl=_wgl, _k32=_k32, _hgl=_hgl):
+                    try:
+                        _n = _name if isinstance(_name, (bytes, bytearray)) else str(_name).encode('utf-8', 'ignore')
+                        _a = _wgl.wglGetProcAddress(_n)
+                        if not _a or _a in (1, 2, 3, -1):
+                            _a = _k32.GetProcAddress(_hgl, _n)
+                        return _a or 0
+                    except Exception:
+                        return 0
+                self._wgl_get_proc = _wgl_get_proc
+        except Exception as _e:
+            _fep_log('[fep-preview] WGL loader unavailable:', _e)
+        self.setMinimumSize(320, 180)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _gl_preflight(self):
+        """Replicate mpv's GL probe (glGetString via getProcAddress) and report
+        exactly what mpv will see when it tries mpv_render_context_create."""
+        import ctypes as _ct
+        bits = []
+        try:
+            _c = self.context()
+            bits.append('ctx_none=%s' % (_c is None))
+            if _c is None:
+                return ' '.join(bits)
+            try:
+                from PyQt6.QtGui import QOpenGLContext as _QGC
+                bits.append('valid=%s current=%s' % (_c.isValid(), _QGC.currentContext() is _c))
+            except Exception as _e:
+                bits.append('ctxinfo_err=%r' % (_e,))
+            try:
+                _f = _c.format()
+                bits.append('renderable=%s gl=%s.%s profile=%s' % (
+                    _f.renderableType(), _f.majorVersion(), _f.minorVersion(), _f.profile()))
+            except Exception as _e:
+                bits.append('fmt_err=%r' % (_e,))
+            for _nm in ('glGetString', 'glClear'):
+                try:
+                    _a = _c.getProcAddress(_nm.encode('utf-8'))
+                    bits.append('%s_addr=%s' % (_nm, hex(int(_a)) if _a else '0'))
+                except Exception as _e:
+                    bits.append('%s_err=%r' % (_nm, _e))
+            try:
+                _a = _c.getProcAddress(b'glGetString')
+                if _a:
+                    _fn = _ct.CFUNCTYPE(_ct.c_char_p, _ct.c_uint)(int(_a))
+                    bits.append('glGetString(GL_VERSION)=%r' % (_fn(0x1F02),))
+                else:
+                    bits.append('glGetString(GL_VERSION)=<no addr>')
+            except Exception as _e:
+                bits.append('glversion_err=%r' % (_e,))
+        except Exception as _e:
+            bits.append('preflight_err=%r' % (_e,))
+        return ' '.join(bits)
+
+    def _make_get_proc_fn(self, _mpv_mod, kind):
+        import ctypes as _ct
+        try:
+            _fn_t = _mpv_mod.MpvGlGetProcAddressFn
+        except AttributeError:
+            _fn_t = _ct.CFUNCTYPE(_ct.c_void_p, _ct.c_void_p, _ct.c_char_p)
+        if kind == 'wgl' and self._wgl_get_proc is not None:
+            return _fn_t(self._wgl_get_proc)
+        def _get_proc(_ctx_ptr, name):
+            try:
+                if isinstance(name, (bytes, bytearray)):
+                    name = bytes(name).decode('utf-8', 'ignore')
+                _c = self.context()
+                if _c is None:
+                    _fep_log('[fep-preview] getProcAddress(%r): no GL context!' % (name,))
+                    return 0
+                _nb = name if isinstance(name, (bytes, bytearray)) else str(name).encode('utf-8', 'ignore')
+                addr = _c.getProcAddress(bytes(_nb))
+                return int(addr) if addr else 0
+            except Exception as _e:
+                _fep_log('[fep-preview] getProcAddress(%r) raised: %r' % (name, _e))
+                return 0
+        return _fn_t(_get_proc)
+
+    def _try_gl_backend(self, _mpv_mod, kind):
+        _fn = self._make_get_proc_fn(_mpv_mod, kind)
+        self._get_proc_fn = _fn  # keep alive: mpv calls it long after create
+        params = {'get_proc_address': _fn}
+        try:
+            return _mpv_mod.MpvRenderContext(self._mpv, api_type='opengl', opengl_init_params=params)
+        except TypeError:
+            return _mpv_mod.MpvRenderContext(self._mpv, 'opengl', opengl_init_params=params)
+
+    def _start_sw_backend(self, _mpv_mod):
+        self._sw_ctx = _mpv_mod.MpvRenderContext(self._mpv, api_type='sw')
+        self._ctx = self._sw_ctx  # so _verify_embedded_gl sees a live context
+        self._sw_mode = True
+        self._backend = 'SW'
+        self._sw_timer = QTimer(self)
+        self._sw_timer.timeout.connect(self._sw_tick)
+        self._sw_timer.start(33)
+        _fep_log('[fep-preview] software render backend active (libmpv sw)')
+
+    def _sw_tick(self):
+        try:
+            if self._sw_ctx is not None and self._sw_mode:
+                try:
+                    if self._sw_ctx.update():
+                        self.update()
+                except Exception as _e:
+                    _fep_log('[fep-preview] sw update() failed:', _e)
+        except Exception:
+            pass
+
+    def _sw_render_frame(self):
+        """Render one software frame and blit it. python-mpv 1.0.8 has no
+        sw_* render-param types, so the param array is built by hand
+        (ids from mpv render.h: SW_SIZE=17 SW_FORMAT=18 SW_STRIDE=19
+        SW_POINTER=20)."""
+        import ctypes as _ct
+        _mpv_mod = self._mpv_mod_ref
+        _render = getattr(_mpv_mod, '_mpv_render_context_render', None)
+        if _render is None:
+            raise RuntimeError("python-mpv has no _mpv_render_context_render")
+        _RP = _mpv_mod.MpvRenderParam
+        w = max(2, int(self.width()))
+        h = max(2, int(self.height()))
+        stride = w * 4
+        buf = bytearray(stride * h)
+        addr = _ct.addressof(_ct.c_ubyte.from_buffer(buf))
+        _sz = (_ct.c_int * 2)(w, h)
+        _fmtb = _ct.create_string_buffer(b'rgb0')
+        _sti = _ct.c_int(stride)
+        def _mk(_tid, _daddr):
+            _p = _RP.__new__(_RP)
+            _p.type_id = _tid
+            _p.data = _daddr
+            return _p
+        arr = (_RP * 5)(
+            _mk(17, _ct.addressof(_sz)),
+            _mk(18, _ct.addressof(_fmtb)),
+            _mk(19, _ct.addressof(_sti)),
+            _mk(20, addr),
+            _mk(0, 0),
+        )
+        _render(self._sw_ctx.handle, arr)
+        from PyQt6.QtGui import QImage as _QI, QPainter as _QP
+        img = _QI(buf, w, h, stride, _QI.Format.Format_RGBX8888)
+        if img.isNull():
+            raise RuntimeError('QImage from sw buffer failed')
+        p = _QP(self)
+        try:
+            p.drawImage(self.rect(), img)
+        finally:
+            p.end()
 
     def initializeGL(self):
         if not _HAS_QOGL:
             self._init_error = RuntimeError("QOpenGLWidget unavailable")
             return
+        if self._init_done or self._init_error is not None:
+            return
+        # R71: free any leftover render context from the previous native
+        # window BEFORE creating the new one. initializeGL always runs with
+        # the GL context current (Qt guarantees it; _fs_rebuild_render_ctx
+        # calls makeCurrent() first), so this free is safe - and it makes
+        # re-init idempotent no matter how many times Qt auto-runs us
+        # during a reparent/show cycle.
+        try:
+            _stale = getattr(self, '_ctx', None)
+            if _stale is not None:
+                try:
+                    _fr = getattr(_stale, 'free', None)
+                    if callable(_fr):
+                        _fr()
+                except Exception:
+                    pass
+                self._ctx = None
+            self._sw_ctx = None
+            self._sw_mode = False
+            try:
+                if getattr(self, '_sw_timer', None) is not None:
+                    self._sw_timer.stop()
+            except Exception:
+                pass
+        except Exception:
+            pass
         try:
             import mpv as _mpv_mod
+            self._mpv_mod_ref = _mpv_mod
             if not hasattr(_mpv_mod, 'MpvRenderContext'):
                 raise RuntimeError("python-mpv has no MpvRenderContext (needs libmpv render API)")
-
-            def _get_proc(_ctx_ptr, name):
+            _sw_only = False
+            try:
+                _s2 = QSettings("FastEncodePro", "App2026ExactV2")
+                _sw_only = bool(_s2.value("mpv_sw_render", False, type=bool))
+            except Exception:
+                pass
+            if _sw_only:
+                _fep_log('[fep-preview] software-only preview requested via settings')
+                self._start_sw_backend(_mpv_mod)
+                self._init_done = True
+                return
+            _fep_log('[fep-preview] GL preflight: ' + self._gl_preflight())
+            _err1 = None
+            try:
+                self._ctx = self._try_gl_backend(_mpv_mod, 'qt')
+            except Exception as e:
+                _err1 = e
+                _fep_log('[fep-preview] GL attempt 1 (Qt getProcAddress) failed:', repr(e))
+            if self._ctx is None and self._wgl_get_proc is not None:
                 try:
-                    if isinstance(name, (bytes, bytearray)):
-                        name = bytes(name).decode('utf-8', 'ignore')
-                    addr = self.context().getProcAddress(str(name))
-                    return int(addr) if addr else 0
+                    self._ctx = self._try_gl_backend(_mpv_mod, 'wgl')
+                    _fep_log('[fep-preview] GL render context created via raw WGL loader')
+                except Exception as e:
+                    _fep_log('[fep-preview] GL attempt 2 (raw WGL) failed:', repr(e))
+                    _err1 = _err1 or e
+            if self._ctx is not None:
+                self._backend = 'GL'
+                self._init_done = True
+                _fep_log('[fep-preview] OpenGL render backend active')
+                try:
+                    self._frame_ready.disconnect()
                 except Exception:
-                    return 0
-
-            params = {'get_proc_address': _get_proc}
-            try:
-                self._ctx = _mpv_mod.MpvRenderContext(self._mpv, api_type='opengl', opengl_init_params=params)
-            except TypeError:
-                # older signature: (mpv, api_type, params) positionally
-                self._ctx = _mpv_mod.MpvRenderContext(self._mpv, 'opengl', opengl_init_params=params)
-
-            try:
+                    pass
+                try:
+                    self._frame_ready.connect(
+                        self.update,
+                        Qt.ConnectionType.QueuedConnection | Qt.ConnectionType.UniqueConnection)
+                except Exception:
+                    pass
                 def _on_mpv_update():
+                    try:
+                        self._frame_ready.emit()
+                    except Exception:
+                        pass
+                try:
+                    self._ctx.update_cb = _on_mpv_update
+                except Exception as _e:
+                    _fep_log('[fep-preview] update_cb hook failed:', _e)
+                try:
+                    _upd = getattr(self._ctx, 'update', None)
+                    _has_frame = bool(_upd()) if callable(_upd) else False
+                except Exception as _e:
+                    _has_frame = False
+                    _fep_log('[fep-preview] render init update() err:', repr(_e))
+                _fep_log('[fep-preview] render ctx ready, update()->%s' % (_has_frame,))
+                if _has_frame:
                     try:
                         self.update()
                     except Exception:
                         pass
-                if hasattr(self._ctx, 'set_update_callback'):
-                    try:
-                        self._ctx.set_update_callback(_on_mpv_update)
-                    except Exception:
-                        pass
-                if hasattr(self._ctx, 'update_cb'):
-                    try:
-                        self._ctx.update_cb = _on_mpv_update
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                return
+            try:
+                self._start_sw_backend(_mpv_mod)
+                self._init_done = True
+                return
+            except Exception as e:
+                _fep_log('[fep-preview] software backend failed:', repr(e))
+                _err1 = _err1 or e
+            self._init_error = RuntimeError('all render backends failed: %r' % (_err1,))
+            self._ctx = None
         except Exception as e:
             self._init_error = e
             self._ctx = None
 
     def paintGL(self):
+        if self._sw_mode:
+            # Software backend: render to a CPU buffer, blit as QImage.
+            try:
+                self._sw_render_frame()
+            except Exception as _e:
+                _fep_log('[fep-preview] sw paint failed:', repr(_e))
+                try:
+                    if self._sw_timer is not None:
+                        self._sw_timer.stop()
+                except Exception:
+                    pass
+                self._sw_mode = False
+            return
         if not self._ctx:
             return
         try:
@@ -1853,6 +2616,10 @@ class _EmbeddedMpvGLWidget(_QOpenGLWidgetBase):
                 fbo = int(self.defaultFramebufferObject())
             except Exception:
                 fbo = 0
+            if not getattr(self, '_geom_logged', False):
+                self._geom_logged = True
+                _fep_log('[fep-preview] first render: widget=%dx%d dpr=%s fbo=%s -> w=%d h=%d backend=%s' % (
+                    self.width(), self.height(), self.devicePixelRatio(), fbo, w, h, self._backend))
             try:
                 self._ctx.render(flip_y=True, opengl_fbo={'w': w, 'h': h, 'fbo': fbo})
             except TypeError:
@@ -1870,6 +2637,14 @@ class _EmbeddedMpvGLWidget(_QOpenGLWidgetBase):
 
     def shutdown_gl(self):
         try:
+            if self._sw_timer is not None:
+                try:
+                    self._sw_timer.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
             if self._ctx is not None:
                 try:
                     free = getattr(self._ctx, 'free', None)
@@ -1879,6 +2654,93 @@ class _EmbeddedMpvGLWidget(_QOpenGLWidgetBase):
                     pass
         finally:
             self._ctx = None
+            self._sw_ctx = None
+            self._sw_mode = False
+
+
+class CropOverlayWidget(QWidget):
+    """Transparent click-drag overlay for drawing a crop rectangle on the player.
+
+    Emits cropCommitted(QRect in overlay coords) on left-release,
+    cropCancelled on right-click / Esc.
+    """
+    cropCommitted = pyqtSignal(object)
+    cropCancelled = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setStyleSheet("background: transparent;")
+        try:
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
+        self._dragging = False
+        self._start = None
+        self._current = None
+        self._existing = None
+
+    def set_existing(self, rect):
+        self._existing = rect
+        self._current = None
+        self.update()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._start = ev.position().toPoint()
+            self._current = QRect(self._start, QSize(1, 1))
+            self.update()
+        elif ev.button() == Qt.MouseButton.RightButton:
+            self.cropCancelled.emit()
+
+    def mouseMoveEvent(self, ev):
+        if self._dragging and self._start is not None:
+            self._current = QRect(self._start, ev.position().toPoint()).normalized()
+            self.update()
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._dragging:
+            self._dragging = False
+            rect = self._current.normalized() if self._current is not None else None
+            self._current = None
+            self.update()
+            if rect is not None and rect.width() >= 4 and rect.height() >= 4:
+                self.cropCommitted.emit(rect)
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key.Key_Escape:
+            self.cropCancelled.emit()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        try:
+            full = self.rect()
+            dim = QColor(0, 0, 0, 140)
+            rect = None
+            if self._dragging and self._current is not None:
+                rect = self._current.normalized()
+            elif self._existing is not None:
+                rect = self._existing
+            if rect is not None and rect.width() > 2 and rect.height() > 2:
+                p.fillRect(0, 0, full.width(), max(0, rect.top()), dim)
+                p.fillRect(0, rect.bottom(), full.width(), max(0, full.height() - rect.bottom()), dim)
+                p.fillRect(0, rect.top(), max(0, rect.left()), rect.height(), dim)
+                p.fillRect(rect.right(), rect.top(), max(0, full.width() - rect.right()), rect.height(), dim)
+                p.setPen(QPen(QColor(0, 255, 136), 2))
+                p.drawRect(rect)
+                p.setBrush(QColor(0, 255, 136))
+                p.setPen(Qt.PenStyle.NoPen)
+                for cx, cy in ((rect.left(), rect.top()), (rect.right(), rect.top()),
+                               (rect.left(), rect.bottom()), (rect.right(), rect.bottom())):
+                    p.drawEllipse(cx - 5, cy - 5, 10, 10)
+            else:
+                p.fillRect(full, dim)
+            p.setPen(QColor(255, 255, 255, 200))
+            p.drawText(12, 24, "Drag to draw the crop box   \u2022   right-click / Esc cancels")
+        finally:
+            p.end()
 
 
 # --- MPV VIDEO WIDGET ---
@@ -1886,6 +2748,7 @@ class _EmbeddedMpvGLWidget(_QOpenGLWidgetBase):
 class MPVVideoWidget(QWidget):
     positionChanged = pyqtSignal(int)
     durationChanged = pyqtSignal(int)
+    fileLoaded = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1906,6 +2769,7 @@ class MPVVideoWidget(QWidget):
         self.embed_error = ""
         self._gl_widget = None
         self._embed_container = None
+        self._crop_overlay = None
         try:
             self.preview_mode = _mpv_preview_mode_static()
         except Exception:
@@ -1961,6 +2825,94 @@ class MPVVideoWidget(QWidget):
         # On Wayland, creating MPV immediately can segfault
         QTimer.singleShot(100, self._init_mpv)
 
+    # ---------- FEATS1: crop overlay support ----------
+    def video_display_widget(self):
+        """The widget actually showing video (GL widget, wid container, or self)."""
+        try:
+            if self._gl_widget is not None:
+                return self._gl_widget
+            if self._embed_container is not None:
+                return self._embed_container
+        except Exception:
+            pass
+        return self
+
+    def show_crop_overlay(self, show, existing_rect=None):
+        """Show/hide the click-drag crop overlay over the video area."""
+        ov = getattr(self, '_crop_overlay', None)
+        if show:
+            if ov is None:
+                ov = CropOverlayWidget(self)
+                self._crop_overlay = ov
+            try:
+                ov.setGeometry(self.video_display_widget().geometry())
+            except Exception:
+                try:
+                    ov.setGeometry(self.rect())
+                except Exception:
+                    pass
+            if existing_rect is not None:
+                try:
+                    ov.set_existing(existing_rect)
+                except Exception:
+                    pass
+            ov.show()
+            ov.raise_()
+            try:
+                ov.setFocus()
+            except Exception:
+                pass
+            return ov
+        if ov is not None:
+            try:
+                ov.hide()
+            except Exception:
+                pass
+        return None
+
+    def video_params_size(self):
+        try:
+            if self.mpv is not None:
+                w = self.mpv['video-params/w']
+                h = self.mpv['video-params/h']
+                if w and h:
+                    return int(w), int(h)
+        except Exception:
+            pass
+        return 0, 0
+
+    def map_overlay_rect_to_video(self, qrect):
+        """Overlay-widget rect -> (x, y, w, h) in source video pixels (letterbox-aware)."""
+        try:
+            ov = getattr(self, '_crop_overlay', None)
+            vw, vh = self.video_params_size()
+            if vw <= 0 or vh <= 0 or ov is None:
+                return None
+            W = max(1, ov.width())
+            H = max(1, ov.height())
+            scale = min(W / vw, H / vh)
+            dw, dh = vw * scale, vh * scale
+            dx, dy = (W - dw) / 2.0, (H - dh) / 2.0
+            x = max(0.0, min(float(vw - 2), (qrect.left() - dx) / scale))
+            y = max(0.0, min(float(vh - 2), (qrect.top() - dy) / scale))
+            w = max(2.0, min(float(vw) - x, qrect.width() / scale))
+            h = max(2.0, min(float(vh) - y, qrect.height() / scale))
+            return (x, y, w, h)
+        except Exception:
+            return None
+
+    def resizeEvent(self, ev):
+        try:
+            super().resizeEvent(ev)
+        except Exception:
+            pass
+        try:
+            ov = getattr(self, '_crop_overlay', None)
+            if ov is not None and ov.isVisible():
+                ov.setGeometry(self.video_display_widget().geometry())
+        except Exception:
+            pass
+
     def is_embedded(self):
         return bool(self.embedded_mode and self._gl_widget is not None)
 
@@ -2005,6 +2957,24 @@ class MPVVideoWidget(QWidget):
         if not self.mpv:
             self._file_loading = False
             return
+        _hw = _safe_mpv_prop(self.mpv, 'hwdec-current')
+        _hw_opt = _safe_mpv_prop(self.mpv, 'hwdec')
+        try:
+            _vw = self.mpv['video-params/w']
+            _vh = self.mpv['video-params/h']
+            _vperr = ''
+        except Exception as _e:
+            _vw, _vh = '?', '?'
+            _vperr = ' video-params-err=%r' % (_e,)
+            try:
+                QTimer.singleShot(1500, lambda: _fep_log(
+                    '[fep-preview] video-params retry: %sx%s' % (
+                        _safe_mpv_prop(self.mpv, 'video-params/w'),
+                        _safe_mpv_prop(self.mpv, 'video-params/h'))))
+            except Exception:
+                pass
+        _fep_log('[fep-preview] file-loaded: hwdec-current=%s hwdec-opt=%s video=%sx%s%s' % (
+            _hw, _hw_opt, _vw, _vh, _vperr))
         try:
             if self._pending_audio_filter is not None:
                 try:
@@ -2025,6 +2995,14 @@ class MPVVideoWidget(QWidget):
                 except Exception:
                     pass
                 self._pending_seek_ms = None
+            # Loading is done BEFORE emitting: slots (e.g. the timeline
+            # audio mix) must apply lavfi filters immediately instead of
+            # having them parked as pending and silently dropped.
+            self._file_loading = False
+            try:
+                self.fileLoaded.emit()
+            except Exception:
+                pass
         finally:
             self._file_loading = False
 
@@ -2107,7 +3085,9 @@ class MPVVideoWidget(QWidget):
         """Hyprland-safe embed. Returns True on success, False to fall back.
 
         Wayland/Hyprland: libmpv OpenGL render into QOpenGLWidget (no wid).
-        X11/Windows: wid embed first (native), then libmpv render.
+        Windows: libmpv OpenGL render into QOpenGLWidget (the wid foreign-window
+        embed shows a green frame on many Windows GPUs - render path is primary).
+        X11: wid embed first (native), then libmpv render.
         """
         import mpv as _mpv_mod
         wayland = _is_wayland_session()
@@ -2122,8 +3102,10 @@ class MPVVideoWidget(QWidget):
                 self.embed_error = "python-mpv lacks MpvRenderContext — using external window."
                 return False
 
-        # --- Path A: wid embed (X11/Windows only — NEVER on Wayland/Hyprland) ---
-        if not wayland:
+        # --- Path A: wid embed (X11 only - NEVER on Wayland/Hyprland, and no longer
+        # on Windows: the wid foreign-window embed shows a green frame on many
+        # Windows GPUs. Windows now uses the libmpv render path (Path B) below. ---
+        if not wayland and os.name != 'nt':
             try:
                 container = QWidget(self)
                 container.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
@@ -2139,7 +3121,9 @@ class MPVVideoWidget(QWidget):
                 # Must be visible + native before winId() is usable.
                 container.show()
                 wid = str(int(container.winId()))
-                mpv_obj = _mpv_mod.MPV(
+                # Windows green-screen fix: optional compatibility mode forces
+                # software decoding + explicit D3D11 (Settings > Preview).
+                _mpv_kwargs = dict(
                     vo='gpu',
                     wid=wid,
                     hwdec='auto-copy',
@@ -2155,6 +3139,17 @@ class MPVVideoWidget(QWidget):
                     cache='yes',
                     demuxer_max_bytes='100MiB',
                 )
+                try:
+                    _compat = False
+                    if os.name == 'nt':
+                        _s = QSettings("FastEncodePro", "App2026ExactV2")
+                        _compat = bool(_s.value("mpv_embed_compat", False, type=bool))
+                    if _compat:
+                        _mpv_kwargs['hwdec'] = 'no'
+                        _mpv_kwargs['gpu_api'] = 'd3d11'
+                except Exception:
+                    pass
+                mpv_obj = _mpv_mod.MPV(**_mpv_kwargs)
                 self.mpv = mpv_obj
                 self._embed_container = container
                 self.embedded_mode = True
@@ -2189,9 +3184,30 @@ class MPVVideoWidget(QWidget):
 
         # --- Path B: libmpv OpenGL render (the Wayland/Hyprland-safe path) ---
         try:
+            _b_hwdec = 'auto-copy'
+            try:
+                if os.name == 'nt':
+                    _s = QSettings("FastEncodePro", "App2026ExactV2")
+                    if bool(_s.value("mpv_embed_compat", False, type=bool)):
+                        _b_hwdec = 'no'
+            except Exception:
+                pass
+            # R72 diagnostic: mpv's own internal log has been completely
+            # invisible up to now - we've only ever seen our own fep-preview
+            # lines. Wiring this up surfaces whatever mpv itself says about
+            # its video output around a render-context teardown/rebuild
+            # (vo reinit, vo errors, etc.), which is exactly the piece the
+            # fullscreen black-screen investigation has been missing.
+            # warn-and-worse only, so this stays quiet in normal operation.
+            def _mpv_log_handler(loglevel, component, message):
+                try:
+                    if loglevel in ('fatal', 'error', 'warn'):
+                        _fep_log('[fep-mpv:%s] [%s] %s' % (loglevel, component, message))
+                except Exception:
+                    pass
             mpv_obj = _mpv_mod.MPV(
                 vo='libmpv',
-                hwdec='auto-copy',
+                hwdec=_b_hwdec,
                 keep_open='yes',
                 idle='yes',
                 hr_seek='yes',
@@ -2202,13 +3218,27 @@ class MPVVideoWidget(QWidget):
                 audio_fallback_to_null='yes',
                 cache='yes',
                 demuxer_max_bytes='100MiB',
+                log_handler=_mpv_log_handler,
+                loglevel='warn',
             )
         except Exception as e:
             self.embed_error = f"libmpv vo failed: {e}"[:300]
             return False
 
         try:
-            gl = _EmbeddedMpvGLWidget(mpv_obj, self)
+            _sw_plain = False
+            try:
+                _s_sw = QSettings("FastEncodePro", "App2026ExactV2")
+                _sw_plain = bool(_s_sw.value("mpv_sw_render", False, type=bool))
+            except Exception:
+                pass
+            _fep_log('[fep-preview] ===== FEP VERSION 15 LOG STARTS HERE =====')
+            _fep_log('[fep-preview] FEP build v15 starting')
+            if _sw_plain:
+                _fep_log('[fep-preview] v7: SW mode -> plain QWidget preview (zero GL)')
+                gl = _SwPreviewWidget(mpv_obj, self)
+            else:
+                gl = _EmbeddedMpvGLWidget(mpv_obj, self)
             self.layout().addWidget(gl, stretch=1)
             try:
                 self.info_label.hide()
@@ -2226,7 +3256,8 @@ class MPVVideoWidget(QWidget):
                 pass
             if getattr(gl, '_init_error', None) is not None:
                 err = getattr(gl, '_init_error', None)
-                self.embed_error = f"GL render init failed: {err}"[:300]
+                _be0 = getattr(gl, '_backend', 'GL') or 'GL'
+                self.embed_error = f"{_be0} render init failed: {err}"[:300]
                 try:
                     gl.hide()
                     gl.deleteLater()
@@ -2247,8 +3278,10 @@ class MPVVideoWidget(QWidget):
             self.embed_error = ""
             self._attach_mpv_observers()
             try:
-                loc = "Hyprland/Wayland" if (hypr or wayland) else "embedded"
-                self.info_label.setText(f"Video Preview — embedded ({loc}, libmpv)")
+                loc = "Hyprland/Wayland" if (hypr or wayland) else ("Windows" if os.name == 'nt' else "embedded")
+                _be = getattr(gl, '_backend', None) or 'GL'
+                self.info_label.setText(f"Video Preview — embedded ({loc}, libmpv-{_be})")
+                _fep_set_mpv_pill(self.window(), "MPV  •  libmpv-" + str(_be))
             except Exception:
                 pass
             try:
@@ -2341,6 +3374,7 @@ class MPVVideoWidget(QWidget):
                     self.info_label.setText(f"No preview loaded (embed fallback: {self.embed_error[:120]})")
                 else:
                     self.info_label.setText("No preview loaded")
+                _fep_set_mpv_pill(self.window(), "MPV  •  External window")
             except Exception:
                 pass
 
@@ -2621,15 +3655,19 @@ class MPVVideoWidget(QWidget):
 
     def set_audio_complex_filter(self, filter_string):
         if not self.mpv:
+            _fep_log('[fep-audio] set_audio_complex_filter: no mpv, dropped')
             return
         self._pending_audio_filter = filter_string
         if self._file_loading:
+            _fep_log('[fep-audio] set_audio_complex_filter: parked as pending (file loading)')
             return
         try:
             self.mpv.lavfi_complex = filter_string
             self._pending_audio_filter = None
-        except Exception:
-            pass
+            _fep_log('[fep-audio] lavfi_complex applied OK len=%d head=%r' % (
+                len(filter_string or ''), (filter_string or '')[:120]))
+        except Exception as e:
+            _fep_log('[fep-audio] lavfi_complex FAILED: %r' % (e,))
 
     def set_video_filter(self, filter_string):
         if not self.mpv:
@@ -2640,6 +3678,13 @@ class MPVVideoWidget(QWidget):
         try:
             self.mpv['vf'] = filter_string
             self._pending_video_filter = None
+            _fep_log('[fep-preview] vf ->', filter_string[:160])
+            try:
+                _gw = getattr(self, '_gl_widget', None)
+                if _gw is not None:
+                    _gw.update()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2672,6 +3717,8 @@ class TimelineClip:
         self.volumes = volumes if volumes else [0.0] * max(1, self.audio_streams)
         self.normalization = normalization if normalization else [False] * max(1, self.audio_streams)
         self.sync_offset = sync_offset if sync_offset is not None else 0
+        self.crop = None          # (x, y, w, h) in source pixels, or None
+        self.rotation = 0.0       # degrees clockwise
 
         self.waveform_pixmap = None
         self.transition_type = None
@@ -2713,12 +3760,14 @@ class TimelineClip:
             "duration": self.full_duration,
             "volumes": self.volumes,
             "normalization": self.normalization,
-            "sync_offset": self.sync_offset
+            "sync_offset": self.sync_offset,
+            "crop": [float(v) for v in self.crop] if self.crop else None,
+            "rotation": float(self.rotation or 0.0)
         }
 
     @staticmethod
     def from_dict(data):
-        return TimelineClip(
+        clip = TimelineClip(
             data["file_path"],
             data["track"],
             data["start_time"],
@@ -2729,6 +3778,16 @@ class TimelineClip:
             data.get("normalization", [False]),
             data.get("sync_offset", 0)
         )
+        try:
+            _c = data.get("crop")
+            clip.crop = tuple(float(v) for v in _c) if _c else None
+        except Exception:
+            clip.crop = None
+        try:
+            clip.rotation = float(data.get("rotation", 0) or 0)
+        except Exception:
+            clip.rotation = 0.0
+        return clip
 
 class TextClip:
     def __init__(self, text, start_time, duration):
@@ -3560,7 +4619,7 @@ def _parse_ffmpeg_time(line):
         pass
     return None
 
-def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress_callback=None):
+def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=90, progress_callback=None):
     import subprocess
     import tempfile
     import os
@@ -3654,7 +4713,13 @@ def auto_sync_audio(video_file, track1=0, track2=1, sample_duration=30, progress
 import hashlib
 
 class ProxyWorker(QThread):
-    finished = pyqtSignal(str, str, bool)
+    # NEVER name a custom signal 'finished': it shadows QThread.finished.
+    # Completion is split in two: proxy_done carries the result (emitted
+    # from run()), and QThread's real finished() - emitted by Qt only after
+    # the thread has fully stopped - does the deleteLater() cleanup.
+    # Deleting the worker any earlier aborts the process
+    # ("QThread: Destroyed while thread is still running").
+    proxy_done = pyqtSignal(str, str, bool)
     progress = pyqtSignal(str, int)  # original_path, percent 0-100
     log = pyqtSignal(str)
 
@@ -3727,7 +4792,7 @@ class ProxyWorker(QThread):
             for line in iter(self._process.stderr.readline, ''):
                 if self.should_stop:
                     self._process.kill()
-                    self.finished.emit(self.original_path, self.proxy_path, False)
+                    self.proxy_done.emit(self.original_path, self.proxy_path, False)
                     return
 
                 t = _parse_ffmpeg_time(line)
@@ -3740,10 +4805,10 @@ class ProxyWorker(QThread):
             success = self._process.returncode == 0
             if success:
                 self.progress.emit(self.original_path, 100)
-            self.finished.emit(self.original_path, self.proxy_path, success)
+            self.proxy_done.emit(self.original_path, self.proxy_path, success)
         except Exception as e:
             self.log.emit(f"Proxy error {self.original_path}: {e}")
-            self.finished.emit(self.original_path, self.proxy_path, False)
+            self.proxy_done.emit(self.original_path, self.proxy_path, False)
         finally:
             self._process = None
 
@@ -3812,7 +4877,8 @@ class ProxyManager(QObject):
 
         self.active_worker = ProxyWorker(orig, proxy)
         self.active_worker.progress.connect(self.on_file_progress)
-        self.active_worker.finished.connect(self.on_worker_finished)
+        self.active_worker.proxy_done.connect(self.on_proxy_done)
+        self.active_worker.finished.connect(self.on_worker_thread_finished)
         self.active_worker.start()
 
     def on_file_progress(self, orig, pct):
@@ -3825,17 +4891,27 @@ class ProxyManager(QObject):
         self.file_progress.emit(orig, pct)
         self.overall_progress.emit(pct, completed, remaining)
 
-    def on_worker_finished(self, orig, proxy, success):
+    def on_proxy_done(self, orig, proxy, success):
+        # Runs while the worker thread may still be unwinding run():
+        # record the result ONLY. Cleanup happens in
+        # on_worker_thread_finished, where the thread is fully stopped.
         if success:
             self.proxy_map[orig] = proxy
+
+    def on_worker_thread_finished(self):
+        # QThread.finished is emitted by Qt after the thread stopped:
+        # deleteLater() is safe here. sender() guards against a stale
+        # worker cleaning up a newer active worker.
+        worker = self.sender()
         try:
-            if self.active_worker:
-                self.active_worker.deleteLater()
+            if worker is not None:
+                worker.deleteLater()
         except:
             pass
-        self.active_worker = None
-        self.current_file = None
-        self.process_queue()
+        if worker is not None and self.active_worker is worker:
+            self.active_worker = None
+            self.current_file = None
+            self.process_queue()
 
     def get_proxy(self, file_path):
         p = self.proxy_map.get(file_path)
@@ -3890,6 +4966,119 @@ class ProxyManager(QObject):
         except:
             return 0, 0.0
     
+def build_geometry_filters(crop, rotation):
+    """Per-clip geometry -> ffmpeg/mpv vf filter list.
+
+    crop: (x, y, w, h) in SOURCE pixels, or None.
+    rotation: degrees clockwise. 90/180/270 use transpose (exact);
+    anything else uses the rotate filter.
+    """
+    filters = []
+    try:
+        if crop:
+            x, y, w, h = (float(v) for v in crop)
+            w = max(2, int(round(w)))
+            h = max(2, int(round(h)))
+            x = max(0, int(round(x)))
+            y = max(0, int(round(y)))
+            if w % 2:
+                w -= 1
+            if h % 2:
+                h -= 1
+            if x % 2:
+                x -= 1
+            if y % 2:
+                y -= 1
+            if w >= 2 and h >= 2:
+                filters.append(f"crop={w}:{h}:{x}:{y}")
+        rot = float(rotation or 0) % 360.0
+        if 0.001 < rot < 359.999:
+            if abs(rot - 90) < 0.5:
+                filters.append("transpose=1")  # 90 cw
+            elif abs(rot - 180) < 0.5:
+                filters.append("transpose=1,transpose=1")
+            elif abs(rot - 270) < 0.5:
+                filters.append("transpose=2")  # 90 ccw
+            else:
+                import math
+                filters.append(f"rotate={math.radians(rot):.6f}:fillcolor=black")
+    except Exception:
+        pass
+    return filters
+
+
+def atempo_chain_for_speed(speed):
+    """Split a speed multiplier into atempo-compatible factors (0.5..100 each)."""
+    parts = []
+    try:
+        s = float(speed)
+        if s <= 0:
+            return []
+        while s > 2.0 + 1e-9:
+            parts.append(2.0)
+            s /= 2.0
+        while s < 0.5 - 1e-9:
+            parts.append(0.5)
+            s /= 0.5
+        if abs(s - 1.0) > 1e-9:
+            parts.append(round(s, 6))
+    except Exception:
+        pass
+    return [f"atempo={p:.6g}" for p in parts]
+
+
+def render_timelapse_subclip(src_path, in_point, out_point, speed, dest_path, log=None):
+    """Render a sped-up intermediate file for time-lapse.
+
+    Video: setpts=PTS/speed. Audio: atempo chain. Returns (True, new_duration_s)
+    or (False, 0). Results are cached on disk by content hash.
+    """
+    import subprocess as _sp
+    import os as _os
+    try:
+        speed = float(speed)
+        if speed <= 0:
+            return False, 0
+        src_dur = float(out_point) - float(in_point)
+        if src_dur <= 0.05:
+            return False, 0
+        new_dur = src_dur / speed
+        if _os.path.exists(dest_path) and _os.path.getsize(dest_path) > 1024:
+            return True, new_dur
+        has_audio = False
+        try:
+            pr = _sp.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'a:0',
+                 '-show_entries', 'stream=index', '-of', 'csv=p=0', src_path],
+                capture_output=True, text=True, timeout=10,
+                creationflags=_sp.CREATE_NO_WINDOW if _os.name == 'nt' else 0)
+            has_audio = bool((pr.stdout or '').strip())
+        except Exception:
+            has_audio = False
+        cmd = ['ffmpeg', '-y',
+               '-ss', f"{float(in_point):.3f}", '-t', f"{src_dur:.3f}",
+               '-i', src_path,
+               '-vf', f"setpts=PTS/{speed:.6g}"]
+        af = atempo_chain_for_speed(speed)
+        if has_audio and af:
+            cmd += ['-af', ",".join(af), '-c:a', 'aac', '-b:a', '160k']
+        else:
+            cmd += ['-an']
+        cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+                '-pix_fmt', 'yuv420p', '-movflags', '+faststart', dest_path]
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=900,
+                    creationflags=_sp.CREATE_NO_WINDOW if _os.name == 'nt' else 0)
+        if r.returncode != 0 or not _os.path.exists(dest_path):
+            if log:
+                log(f"timelapse ffmpeg failed: {(r.stderr or '')[-300:]}")
+            return False, 0
+        return True, new_dur
+    except Exception as e:
+        if log:
+            log(f"timelapse render error: {e}")
+        return False, 0
+
+
 class TimelineRenderingEngine:
     """
     MASTER CANVAS COMPOSITOR ENGINE (v0.9.4e)
@@ -3960,9 +5149,22 @@ class TimelineRenderingEngine:
             if not self.timeline.clips:
                 return False, "No clips on timeline"
 
+            # R77: AUDIO-ONLY EXPORT - build and run the audio graph only.
+            audio_only = bool(self.settings.get('audio_only', False))
+            if audio_only:
+                self.log("AUDIO-ONLY EXPORT: rendering the audio master only (no video stream).")
+
             timeline_duration = self.get_timeline_duration()
             timeline_fps = self.settings.get('timeline_fps', 60.0)
             sorted_clips = sorted(self.timeline.clips, key=lambda c: c.start_time)
+            # FEATS1: per-clip crop/rotate are CPU filters - any geometry on the
+            # timeline forces the whole export onto the CPU compositing path
+            # (keeps the canvas format consistent; avoids CUDA/CPU mixing).
+            any_clip_geometry = any(
+                build_geometry_filters(getattr(c, 'crop', None), getattr(c, 'rotation', 0))
+                for c in sorted_clips)
+            if any_clip_geometry:
+                self.log("Crop/rotate on timeline: using CPU compositing for this export.")
 
             source_width, source_height = self.get_video_metadata(sorted_clips[0].file_path)
             # Auto-detect source bit depth and set pixel_format / resolution for project
@@ -4054,7 +5256,7 @@ class TimelineRenderingEngine:
             self.settings['export_height'] = export_height
             pipeline_buf = get_pipeline_buffer_sizes(self.settings)
 
-            if use_gpu_composite and use_gpu_decode and is_nvenc:
+            if use_gpu_composite and use_gpu_decode and is_nvenc and not any_clip_geometry:
                 self.log(f"🚀 5070 TURBO MODE ACTIVE - Full GPU Canvas (VRAM only) [V7 FIXED]")
                 self.log(f"   Target: {pipeline_buf.get('frames_needed', 128)} frames * {pipeline_buf.get('frame_mb', 12):.1f}MB = {pipeline_buf.get('frames_needed', 128)*pipeline_buf.get('frame_mb', 12)/1024:.1f}GB VRAM")
             else:
@@ -4080,7 +5282,7 @@ class TimelineRenderingEngine:
                 cmd_inputs_v.extend(['-ss', str(clip.in_point)])
                 cmd_inputs_v.extend(['-t', str(clip.get_trimmed_duration())])
                 
-                if use_gpu_composite and use_gpu_decode and is_nvenc:
+                if use_gpu_composite and use_gpu_decode and is_nvenc and not any_clip_geometry:
                     cmd_inputs_v.extend(['-thread_queue_size', str(pipeline_buf['thread_queue_size']), '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', '-extra_hw_frames', str(pipeline_buf['extra_hw_frames']), '-i', clip.file_path])
                 else:
                     codec = self._get_video_codec(clip.file_path)
@@ -4101,7 +5303,7 @@ class TimelineRenderingEngine:
                 
             early_filters_check = self._build_video_filters()
             early_text_check = getattr(self.timeline, 'text_clips', [])
-            early_is_turbo_check = self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec','')
+            early_is_turbo_check = self.settings.get('use_gpu_composite', False) and self.settings.get('use_gpu_decode', False) and 'nvenc' in self.settings.get('video_codec','') and not any_clip_geometry
             has_real_filters = has_optional_video_filters(self.settings)
             early_hybrid = early_is_turbo_check and bool(has_real_filters or early_text_check)
             force_cpu_overlay_for_10bit = False
@@ -4145,7 +5347,7 @@ class TimelineRenderingEngine:
                 except:
                     clip_w, clip_h = export_width, export_height
 
-                is_turbo = use_gpu_composite and use_gpu_decode and is_nvenc
+                is_turbo = use_gpu_composite and use_gpu_decode and is_nvenc and not any_clip_geometry
                 use_cpu_overlay = early_hybrid or (is_10bit and is_turbo)
                 
                 if clip_w == export_width and clip_h == export_height:
@@ -4185,7 +5387,14 @@ class TimelineRenderingEngine:
                 else:
                     trans_filter = ""
                 
-                video_filter_complex.append(f"{v_trimmed}{scale_str}{v_scaled}")
+                v_geo_src = v_trimmed
+                _geo = build_geometry_filters(getattr(clip, 'crop', None), getattr(clip, 'rotation', 0))
+                if _geo:
+                    v_geo_lbl = f"[v{i}_geo]"
+                    video_filter_complex.append(f"{v_trimmed}{','.join(_geo)}{v_geo_lbl}")
+                    v_geo_src = v_geo_lbl
+                    self.log(f"Clip {i} ({clip.name}): geometry {' + '.join(_geo)}")
+                video_filter_complex.append(f"{v_geo_src}{scale_str}{v_scaled}")
                 
                 if trans_filter:
                     video_filter_complex.append(f"{v_scaled}{trans_filter}{v_trans}")
@@ -4200,6 +5409,13 @@ class TimelineRenderingEngine:
 
                 # --- AUDIO GRAPH ---
                 is_turbo_audio = use_gpu_composite and use_gpu_decode and is_nvenc
+                if is_turbo_audio and (getattr(clip, 'audio_streams', 1) > 1 or getattr(clip, 'sync_offset', 0) != 0):
+                    # Turbo audio only carries track 0: it would silently drop
+                    # the mic track and ignore any sync offset. Fall back to the
+                    # full audio graph for this clip (video stays on turbo).
+                    self.log(f"AUDIO: clip '{clip.name}' has {getattr(clip, 'audio_streams', 1)} audio track(s) / "
+                             f"sync {getattr(clip, 'sync_offset', 0):+d}ms - using full audio graph instead of turbo.")
+                    is_turbo_audio = False
                 if is_turbo_audio:
                     a_in = f"[{i}:a:0]"
                     a_trimmed = f"[a{i}_0_trim]"
@@ -4545,6 +5761,48 @@ class TimelineRenderingEngine:
                 return True, f"{pass_name} pass complete."
 
             start_time = time.time()
+
+            # R77: audio-only export - one pass over the audio graph; the
+            # video graph built above is simply never used or executed.
+            if audio_only:
+                audio_only_cmd = ['ffmpeg', '-y', '-v', 'warning', '-stats', '-stats_period', '0.5']
+                audio_only_cmd.extend(cmd_inputs_a)
+                if audio_filter_complex:
+                    audio_only_cmd.extend(['-filter_complex', ';'.join(audio_filter_complex)])
+                audio_only_cmd.extend(['-map', map_a])
+                a_codec = self.settings.get('audio_codec', 'aac')
+                if a_codec == 'flac':
+                    audio_only_cmd.extend(['-c:a', 'flac'])
+                elif a_codec in ('pcm_s24le', 'pcm_s16le'):
+                    audio_only_cmd.extend(['-c:a', a_codec])
+                elif a_codec == 'copy':
+                    # Stream copy is impossible through the audio mix graph
+                    # (filtering + copy cannot be combined) - same fallback
+                    # the split-render mux path has always used.
+                    self.log("Audio 'Copy Stream' cannot pass through the mix graph - writing 24-bit PCM WAV instead.")
+                    audio_only_cmd.extend(['-c:a', 'pcm_s24le'])
+                else:  # aac default
+                    audio_only_cmd.extend(['-c:a', 'aac', '-b:a', '320k'])
+                try:
+                    _sr = int(self.settings.get('audio_sample_rate', 48000) or 48000)
+                    if _sr > 0:
+                        audio_only_cmd.extend(['-ar', str(_sr)])
+                except Exception:
+                    pass
+                audio_only_cmd.extend(['-vn'])  # belt-and-braces: never write a video stream
+                audio_only_cmd.extend(['-t', f"{timeline_duration:.6f}"])
+                append_output_file_args(audio_only_cmd, self.output_path, self.settings, self.log)
+
+                self.last_commands = {'audio_only': audio_only_cmd}
+                if self.dry_run:
+                    return True, "Dry run: audio-only command built (no render executed)."
+
+                success, msg = execute_pass(audio_only_cmd, 0, 100, "Audio", throughput_path=self.output_path)
+                if not success:
+                    return False, msg
+                elapsed = time.time() - start_time
+                self.progress(100)
+                return True, f"Audio-Only Render Complete! {elapsed:.1f}s"
 
             if single_pass:
                 # One command, one read of each input, one write of the final
@@ -6030,6 +7288,16 @@ class ExportPanelWidget(QScrollArea):
         audio_layout.addWidget(QLabel("Sample Rate:"))
         audio_layout.addWidget(self.sample_combo)
 
+        # R77: AUDIO-ONLY EXPORT - master the timeline audio with no video.
+        # Container follows the audio codec: AAC -> .m4a, PCM -> .wav, FLAC -> .flac.
+        self.audio_only_check = QCheckBox("Audio-only export (no video stream)")
+        self.audio_only_check.setToolTip(
+            "Export just the mixed audio master. Container follows the audio "
+            "codec: AAC -> .m4a, PCM -> .wav, FLAC -> .flac.")
+        self.audio_only_check.setStyleSheet("color: rgba(255,255,255,0.85); font-size: 11px;")
+        self.audio_only_check.toggled.connect(self._on_audio_only_toggled)
+        audio_layout.addWidget(self.audio_only_check)
+
         norm_card = QWidget()
         norm_card.setStyleSheet("background: rgba(0,255,136,0.05); border: 1px solid rgba(0,255,136,0.2); border-radius: 12px;")
         norm_layout = QVBoxLayout(norm_card)
@@ -6117,12 +7385,6 @@ class ExportPanelWidget(QScrollArea):
         self._on_rate_control_changed(0)
         self._on_codec_changed(self.codec_combo.currentIndex())
         
-    def wheelEvent(self, event):
-        """Prevent scroll wheel from changing settings in export panel"""
-        # Ignore wheel events to prevent accidental changes when scrolling
-        event.ignore()
-        return
-
     def _on_codec_changed(self, idx):
         try:
             codec_id = self.codec_options[idx][1] if idx < len(self.codec_options) else "hevc_nvenc"
@@ -6238,11 +7500,29 @@ class ExportPanelWidget(QScrollArea):
                     break
         self._update_export_btn()
         
+    def _on_audio_only_toggled(self, on):
+        """R77: in audio-only mode the video pipeline controls are disabled
+        (they would have no effect) and the export button says so."""
+        for name in ('codec_combo', 'res_combo', 'fps_combo', 'pixel_format_combo',
+                     'nvenc_2pass_check', 'container_combo', 'bf_slider', 'gop_slider',
+                     'prores_profile_combo', 'nvenc_target_combo'):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.setEnabled(not on)
+                except Exception:
+                    pass
+        self._update_export_btn()
+
     def _update_export_btn(self):
         try:
             rc = self.rate_control_combo.currentIndex()
             # EXACT HTML: Export with RTX 5070 • CBR100
-            if rc == 3:  # CQP
+            if getattr(self, 'audio_only_check', None) is not None and self.audio_only_check.isChecked():
+                a_name = {0: 'AAC 320k', 1: 'WAV 24-bit', 2: 'FLAC',
+                          3: 'AAC 192k', 4: 'AUDIO COPY'}.get(self.audio_combo.currentIndex(), 'AUDIO')
+                self.export_btn.setText(f"  ▶   Export AUDIO ONLY • {a_name}")
+            elif rc == 3:  # CQP
                 qp = self.cqp_spin.value()
                 self.export_btn.setText(f"  ▶   Export with RTX 5070 • QP{qp}")
             elif rc == 4:  # Lossless
@@ -6307,6 +7587,7 @@ class ExportPanelWidget(QScrollArea):
             'b_frames': self.bf_slider.value(),
             'gop_size': self.gop_slider.value(),
             'container_format': self.container_combo.currentIndex(),
+            'audio_only': self.audio_only_check.isChecked() if hasattr(self, 'audio_only_check') else False,
             'single_pass_render': self.single_pass_check.isChecked() if hasattr(self, 'single_pass_check') else True,
             'temp_dir': getattr(self.app, 'temp_dir', tempfile.gettempdir()) if self.app else tempfile.gettempdir(),
         }
@@ -6391,6 +7672,263 @@ class ExportWindow(QDialog):
 
 
 
+class _FullscreenPlayerDialog(QDialog):
+    """Fullscreen video player with auto-hiding big-button controls (R59).
+
+    Reparents the app's video_stack (render widget + overlays) into itself,
+    so the SAME mpv instance keeps playing - no reload, no state loss.
+    The GL render context is torn down before each move and rebuilt after,
+    because the underlying native window changes.
+    Click-only: Esc also exits, but the big Exit button is the primary path.
+    """
+
+    _HIDE_MS = 2500
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._app = app
+        self.setWindowTitle("FastEncodePro - Fullscreen Player")
+        self.setStyleSheet("background: black;")
+        self.setMouseTracking(True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self._video_holder = QWidget()
+        self._video_holder.setStyleSheet("background: black;")
+        self._video_holder.setMouseTracking(True)
+        self._holder_layout = QVBoxLayout(self._video_holder)
+        self._holder_layout.setContentsMargins(0, 0, 0, 0)
+        self._holder_layout.setSpacing(0)
+        lay.addWidget(self._video_holder, stretch=1)
+        # --- bottom control bar (auto-hide) ---
+        self._bar = QWidget()
+        self._bar.setMouseTracking(True)
+        self._bar.setStyleSheet(
+            "background: rgba(10,10,14,0.88);"
+            " border-top: 1px solid rgba(255,255,255,0.14);")
+        blay = QHBoxLayout(self._bar)
+        blay.setContentsMargins(24, 14, 24, 14)
+        blay.setSpacing(18)
+        _btn_style = (
+            "QPushButton { font-size: 20px; font-weight: bold; color: white;"
+            " background: rgba(125,249,255,0.14);"
+            " border: 2px solid rgba(125,249,255,0.45); border-radius: 16px; }"
+            "QPushButton:hover { background: rgba(125,249,255,0.30); }")
+        self._play_btn = QPushButton("▶")
+        self._play_btn.setFixedSize(200, 64)
+        self._play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._play_btn.setStyleSheet(_btn_style)
+        self._play_btn.clicked.connect(self._on_play_toggle)
+        blay.addWidget(self._play_btn)
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, 0)
+        self._slider.setMinimumHeight(48)
+        self._slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._slider.setStyleSheet(
+            "QSlider::groove:horizontal { border: none; height: 14px;"
+            " background: rgba(255,255,255,0.16); border-radius: 7px; }"
+            "QSlider::sub-page:horizontal { background: rgba(125,249,255,0.5);"
+            " border-radius: 7px; }"
+            "QSlider::handle:horizontal { background: white;"
+            " border: 3px solid #7df9ff; width: 36px; height: 36px;"
+            " margin: -13px 0; border-radius: 18px; }")
+        self._slider.sliderMoved.connect(self._on_slider_moved)
+        self._slider.sliderReleased.connect(self._on_slider_released)
+        blay.addWidget(self._slider, stretch=1)
+        self._time_label = QLabel("--:--:-- / --:--:--")
+        self._time_label.setStyleSheet(
+            "color: rgba(255,255,255,0.9); font-size: 16px;"
+            " font-family: Consolas, monospace;")
+        blay.addWidget(self._time_label)
+        self._exit_btn = QPushButton("⛶ Exit")
+        self._exit_btn.setFixedSize(200, 64)
+        self._exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._exit_btn.setStyleSheet(_btn_style)
+        self._exit_btn.clicked.connect(self._on_exit_clicked)
+        blay.addWidget(self._exit_btn)
+        lay.addWidget(self._bar)
+        self._bar.installEventFilter(self)
+        try:
+            vw = app.video_widget
+            vw.positionChanged.connect(self._on_position_changed)
+            vw.durationChanged.connect(self._on_duration_changed)
+        except Exception:
+            pass
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._hide_controls)
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._poll_state)
+        self._poll.start(400)
+        # R72 diagnostic readout: distinguishes "mpv core fine, render
+        # context dead" (time_pos advancing, screen black) from "something
+        # paused mpv on fullscreen enter" (time_pos frozen). Purely a
+        # read-only overlay - never hidden by the auto-hide bar, no writes
+        # to mpv/render state. Remove once the black-screen bug is closed.
+        self._diag_label = QLabel("", self)
+        self._diag_label.setStyleSheet(
+            "color: #7CFC7C; font-size: 13px; font-family: Consolas, monospace;"
+            " background: rgba(0,0,0,0.6); padding: 4px 10px; border-radius: 6px;")
+        self._diag_label.move(16, 16)
+        try:
+            self._diag_label.setVisible(True)
+            self._diag_label.raise_()
+        except Exception:
+            pass
+        try:
+            self._on_duration_changed(app.video_widget.duration())
+            self._on_position_changed(app.video_widget.position())
+        except Exception:
+            pass
+        self._poll_state()
+        self._poke()
+
+    # -- control auto-hide: any mouse movement shows the bar and restarts
+    # the idle timer; 2.5 s without movement hides the bar and the cursor --
+    def _poke(self):
+        try:
+            self._bar.setVisible(True)
+            self.unsetCursor()
+        except Exception:
+            pass
+        try:
+            self._hide_timer.start(self._HIDE_MS)
+        except Exception:
+            pass
+
+    def _hide_controls(self):
+        try:
+            self._bar.setVisible(False)
+            self.setCursor(Qt.CursorShape.BlankCursor)
+        except Exception:
+            pass
+
+    def mouseMoveEvent(self, ev):
+        try:
+            self._poke()
+        except Exception:
+            pass
+        super().mouseMoveEvent(ev)
+
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() == QEvent.Type.MouseMove:
+                self._poke()
+        except Exception:
+            pass
+        return super().eventFilter(obj, ev)
+
+    def keyPressEvent(self, ev):
+        try:
+            if ev.key() == Qt.Key.Key_Escape:
+                self._on_exit_clicked()
+                return
+        except Exception:
+            pass
+        super().keyPressEvent(ev)
+
+    # -- transport --
+    def _on_play_toggle(self):
+        try:
+            self._app.toggle_play()
+        except Exception:
+            pass
+        self._poll_state()
+        self._poke()
+
+    def _on_slider_moved(self, v):
+        try:
+            self._app.video_widget.seek(int(v), exact=False)
+        except Exception:
+            pass
+        self._poke()
+
+    def _on_slider_released(self):
+        try:
+            self._app.video_widget.seek(int(self._slider.value()), exact=True)
+        except Exception:
+            pass
+        self._poke()
+
+    def _on_position_changed(self, ms):
+        try:
+            if not self._slider.isSliderDown():
+                self._slider.setValue(int(ms or 0))
+            self._update_time_label()
+        except Exception:
+            pass
+
+    def _on_duration_changed(self, ms):
+        try:
+            self._slider.setRange(0, max(0, int(ms or 0)))
+            self._update_time_label()
+        except Exception:
+            pass
+
+    def _update_time_label(self):
+        try:
+            vw = self._app.video_widget
+            pos = int(vw.position() or 0)
+            dur = int(vw.duration() or 0)
+            if dur <= 0:
+                dur = int(self._slider.maximum() or 0)
+            self._time_label.setText("%s / %s" % (
+                self._app.format_timecode(pos), self._app.format_timecode(dur)))
+        except Exception:
+            pass
+
+    def _poll_state(self):
+        try:
+            paused = bool(self._app.video_widget.is_paused())
+            self._play_btn.setText("▶" if paused else "❚❚")
+        except Exception:
+            pass
+        self._update_diag_label()
+
+    def _update_diag_label(self):
+        # R72: read-only status line. `upd` calls the same _ctx.update()
+        # every other kick/poll path already calls, so this never consumes
+        # anything the real render path depends on - it's just a peek.
+        try:
+            vw = getattr(self._app, 'video_widget', None)
+            rw = getattr(vw, '_gl_widget', None) if vw is not None else None
+            paused = bool(vw.is_paused()) if vw is not None else None
+            pos_ms = vw.position() if vw is not None else None
+            backend = getattr(rw, '_backend', None) if rw is not None else None
+            init_done = bool(getattr(rw, '_init_done', False)) if rw is not None else False
+            upd = None
+            try:
+                _ctx = getattr(rw, '_ctx', None)
+                _u = getattr(_ctx, 'update', None)
+                if callable(_u):
+                    upd = bool(_u())
+            except Exception:
+                upd = 'err'
+            self._diag_label.setText(
+                "pos=%sms  paused=%s  backend=%s  init_done=%s  update()=%s" % (
+                    pos_ms, paused, backend, init_done, upd))
+            self._diag_label.adjustSize()
+            self._diag_label.raise_()
+        except Exception:
+            pass
+
+    def _on_exit_clicked(self):
+        try:
+            self._app.exit_fullscreen()
+        except Exception:
+            pass
+
+    def closeEvent(self, ev):
+        try:
+            if getattr(self._app, '_fs_dialog', None) is self:
+                self._app.exit_fullscreen()
+                ev.ignore()
+                return
+        except Exception:
+            pass
+        super().closeEvent(ev)
+
+
 class FastEncodeProApp(QMainWindow):
 
 
@@ -6418,7 +7956,7 @@ class FastEncodeProApp(QMainWindow):
         self.setTabPosition(Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
         # Keep minimum size but don't force fixed aspect that breaks docking
         self.setMinimumSize(1100, 700)
-        self.setWindowTitle(f"FastEncode Pro v{__version__} - 2026 Glass Edition • HYPRLAND EDITION")
+        self.setWindowTitle(f"FastEncode Pro v{__version__} - v15 TEST BUILD - 2026 Glass Edition")
         # Screen geometry - FIXED for maximized zoom bug
         # Don't force geometry if session wants maximized, use resize + move instead of setGeometry
         screen = QApplication.primaryScreen()
@@ -6443,10 +7981,20 @@ class FastEncodeProApp(QMainWindow):
         self.media_library = []
         self.current_media = None
         self.video_widget = None
+        self._fs_dialog = None
+        # R74: in-place fullscreen auto-hide (idle) state
+        self._fs_idle_hidden = False
+        self._fs_chrome = None          # stash of widgets hidden while idle
+        self._fs_idle_timer = None      # single-shot: hides UI after idle
+        self._fs_mouse_poll = None      # polls QCursor.pos(): idle watchdog
+        self._fs_last_mouse = None      # last seen cursor position
         self.timeline_duration = 0
         self.is_timeline_mode = False
         self._play_uses_timeline_edl = False
         self.dwell_filter = DwellClickFilter(self)
+        # R76: app-wide wheel guard - scrolling must never change a setting
+        self._wheel_guard = _AppWheelGuard(self)
+        QApplication.instance().installEventFilter(self._wheel_guard)
         self.hw_caps = detect_hardware_capabilities()
         self.app_settings = QSettings("FastEncodePro", "App2026ExactV2")
         try:
@@ -6663,6 +8211,7 @@ class FastEncodeProApp(QMainWindow):
         mpv_txt = QLabel("MPV  •  Hardware Decode")
         mpv_txt.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.7); background: transparent; border: none;")
         mpv_layout.addWidget(mpv_txt)
+        self.mpv_pill_txt = mpv_txt
         preview_header.addWidget(mpv_pill)
         # resolution pill
         res_pill = QWidget()
@@ -6700,7 +8249,8 @@ class FastEncodeProApp(QMainWindow):
         self.timecode_label.setStyleSheet("background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 4px 10px; font-family: Consolas, monospace; font-size: 11px; color: rgba(255,255,255,0.7);")
         preview_header.addWidget(self.timecode_label)
         fs_btn = QPushButton("⛶")
-        fs_btn.setFixedSize(28, 28)
+        fs_btn.setFixedSize(44, 44)
+        fs_btn.setToolTip("Fullscreen player")
         fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         fs_btn.setStyleSheet("background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; color: rgba(255,255,255,0.6);")
         fs_btn.clicked.connect(self.enter_fullscreen)
@@ -6728,15 +8278,18 @@ class FastEncodeProApp(QMainWindow):
         self.video_widget.show()
         self.video_widget.positionChanged.connect(self._on_position_changed)
         self.video_widget.durationChanged.connect(self._on_duration_changed)
+        self.video_widget.fileLoaded.connect(self._on_preview_file_loaded)
         # --- overlays (children of video_stack, raised) ---
         self.rec_badge = QLabel("REC • 4K HDR")
         self.rec_badge.setStyleSheet("background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 4px 8px; font-size: 10px; color: white;")
         self.rec_badge.setParent(self.video_stack)
         self.rec_badge.move(12, 12)
+        self.rec_badge.adjustSize()  # R56: was 640x480 default -> dark overlay
         self.nvenc_badge = QLabel("NVENC HEVC")
         self.nvenc_badge.setStyleSheet("background: rgba(0,255,136,0.15); border: 1px solid rgba(0,255,136,0.3); border-radius: 10px; padding: 4px 8px; font-size: 10px; color: #00ff88;")
         self.nvenc_badge.setParent(self.video_stack)
         self.nvenc_badge.move(110, 12)
+        self.nvenc_badge.adjustSize()  # R56: was 640x480 default -> green overlay
         self.gpu_temp_badge = QLabel("RTX 5070 • 73% • 71°C")
         self.gpu_temp_badge.setStyleSheet("background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 4px 8px; font-family: Consolas, monospace; font-size: 10px; color: rgba(255,255,255,0.7);")
         self.gpu_temp_badge.setParent(self.video_stack)
@@ -6838,9 +8391,28 @@ class FastEncodeProApp(QMainWindow):
         self.trim_info = QLabel("In: 00:00:00 | Out: 00:00:00 | Duration: 00:00:00")
         self.trim_info.setVisible(False)
 
-        central_layout.addWidget(preview_area, stretch=1)
+        # R74: keep references to the preview chrome so in-place fullscreen
+        # can auto-hide ALL of it after idle (video-only view).
+        self._fs_chrome = {
+            'preview_header': preview_header,
+            'mpv_pill': mpv_pill,
+            'res_pill': res_pill,
+            'preview_mode_badge': self.preview_mode_badge,
+            'timecode_label': self.timecode_label,
+            'fs_btn': fs_btn,
+            'preview_ctrl': preview_ctrl,
+            'scrubber_container': scrubber_container,
+            'preview_empty_label': self.preview_empty_label,
+        }
+        self._fs_idle_timer = QTimer(self)
+        self._fs_idle_timer.setSingleShot(True)
+        self._fs_idle_timer.timeout.connect(self._fs_hide_ui)
+        self._fs_mouse_poll = QTimer(self)
+        self._fs_mouse_poll.setInterval(250)
+        self._fs_mouse_poll.timeout.connect(self._fs_poll_activity)
+        self._fs_last_mouse = None
 
-        self.apply_theme()
+        central_layout.addWidget(preview_area, stretch=1)
         self.create_dockable_ui()
         self.create_menus()
         self.load_settings()
@@ -6920,16 +8492,27 @@ class FastEncodeProApp(QMainWindow):
                 has_media = False
             try:
                 if hasattr(self, 'preview_empty_label'):
-                    self.preview_empty_label.setVisible(not has_media)
+                    # R74: don't resurrect the label hidden by fullscreen idle
+                    if not (getattr(self, '_fs_idle_hidden', False)
+                            and not self.preview_empty_label.isVisible()):
+                        self.preview_empty_label.setVisible(not has_media)
             except Exception:
                 pass
-            for _name in ('rec_badge', 'nvenc_badge', 'gpu_temp_badge', 'center_play', 'preview_glow'):
+            _fs_idle = bool(getattr(self, '_fs_idle_hidden', False))
+            for _name in ('rec_badge', 'nvenc_badge', 'gpu_temp_badge', 'preview_glow'):
                 try:
                     _w = getattr(self, _name, None)
                     if _w is not None:
+                        # R74: don't resurrect overlays hidden by fullscreen idle
+                        if _fs_idle and not _w.isVisible():
+                            continue
                         _w.setVisible(bool(has_media))
                 except Exception:
                     pass
+            try:
+                self._refresh_center_play()
+            except Exception:
+                pass
             try:
                 self._position_preview_overlays()
             except Exception:
@@ -6980,6 +8563,10 @@ class FastEncodeProApp(QMainWindow):
         except Exception:
             pass
         if not hasattr(self, 'video_stack'):
+            return
+        # R74: while fullscreen-idle the chrome is hidden; do not reposition
+        # (and never resurrect) the overlays until the user moves again.
+        if getattr(self, '_fs_idle_hidden', False):
             return
         try:
             vs = self.video_stack
@@ -7071,12 +8658,20 @@ class FastEncodeProApp(QMainWindow):
             return
         from PyQt6.QtWidgets import QFileDialog
         try:
-            codec_for_ext = settings_override.get('video_codec', 'hevc_nvenc') if isinstance(settings_override, dict) else 'hevc_nvenc'
-            ext = get_export_extension_for_codec(codec_for_ext)
+            ext = get_export_extension_for_settings(settings_override if isinstance(settings_override, dict) else {})
         except Exception as e:
             print(f"Extension lookup failed: {e}")
             ext = ".mp4"
-        output_file, _ = QFileDialog.getSaveFileName(self, "Choose Location & Start Export", f"timeline_export{ext}", f"Video Files (*{ext})")
+        # Non-native dialog: the Windows native save dialog can hang (white /
+        # "not responding") before it ever paints - e.g. a bad shell extension
+        # or an unreachable folder in its history. Qt's built-in dialog avoids
+        # all of that and picks a path identically.
+        print("Opening save dialog...")
+        output_file, _ = QFileDialog.getSaveFileName(
+            self, "Choose Location & Start Export", f"timeline_export{ext}",
+            f"Media Files (*{ext})",
+            options=QFileDialog.Option.DontUseNativeDialog)
+        print(f"Save dialog returned: {output_file!r}")
         if not output_file:
             print("User cancelled")
             return
@@ -7117,7 +8712,7 @@ class FastEncodeProApp(QMainWindow):
             self.timeline_export_thread.finished.connect(self.timeline_export_done)
             self.timeline_export_thread.playhead_update.connect(self.timeline.set_playhead_position)
             self.progress_bar.setValue(0)
-            self.status_label.setText(f"Exporting (Direct): {base_settings.get('video_codec','unknown').upper()}")
+            self.status_label.setText(f"Exporting (Direct): {'AUDIO-ONLY' if base_settings.get('audio_only') else base_settings.get('video_codec','unknown').upper()}")
             self.render_dialog.show()
             try:
                 if hasattr(self, 'vram_timer'):
@@ -7635,13 +9230,6 @@ class FastEncodeProApp(QMainWindow):
         clear_timeline_btn.setToolTip("Remove ALL clips from timeline")
         clear_timeline_btn.clicked.connect(self.clear_timeline)
         tc_layout.addWidget(clear_timeline_btn)
-        self.export_timeline_btn = QPushButton("💾 EXPORT")
-        self.export_timeline_btn.setStyleSheet(self.button_style("#a855f7"))
-        self.export_timeline_btn.setMinimumHeight(40)
-        self.export_timeline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.export_timeline_btn.setToolTip("Export timeline via Export window")
-        self.export_timeline_btn.clicked.connect(self.export_timeline)
-        tc_layout.addWidget(self.export_timeline_btn)
         self.stop_export_btn = QPushButton("⏹️ STOP")
         self.stop_export_btn.setStyleSheet(self.button_style("#ff5f56"))
         self.stop_export_btn.setMinimumHeight(40)
@@ -7688,8 +9276,14 @@ class FastEncodeProApp(QMainWindow):
         for text, color, tip, func in [
             ("✨ Balance", "rgba(255,255,255,0.08)", "Auto color balance", self.apply_auto_balance),
             ("🎯 Sync", "rgba(255,255,255,0.08)", "Auto-sync audio tracks", self.auto_sync_audio_tracks),
+            ("✂ Split", "rgba(255,255,255,0.08)", "Split selected clip at playhead", self.split_selected_at_playhead),
             ("🔤 Text", "rgba(255,255,255,0.08)", "Add text / lower third", self.add_text_overlay),
             ("🎙 VO", "rgba(255,255,255,0.08)", "Record voiceover at playhead", self.record_voiceover),
+            ("✂ Crop", "rgba(255,255,255,0.08)", "Draw a crop rectangle on the player (selected clip)", self.toggle_crop_mode),
+            ("⟲ 90°", "rgba(255,255,255,0.08)", "Rotate selected clip 90° counter-clockwise", lambda: self.rotate_selected_clip(-90)),
+            ("⟳ 90°", "rgba(255,255,255,0.08)", "Rotate selected clip 90° clockwise", lambda: self.rotate_selected_clip(90)),
+            ("⌖ Reset", "rgba(255,255,255,0.08)", "Clear crop + rotation on selected clip", self.reset_clip_geometry),
+            ("⏩ Lapse", "rgba(255,255,255,0.08)", "Time-lapse the selected clip (pick a speed)", self.timelapse_selected_clip_dialog),
             ("◀ In", "rgba(255,255,255,0.08)", "Set media In-point at preview pos", self.set_media_in_point),
             ("Out ▶", "rgba(255,255,255,0.08)", "Set media Out-point at preview pos", self.set_media_out_point),
             ("− Zoom", "rgba(255,255,255,0.08)", "Zoom timeline out", self.zoom_out_timeline),
@@ -7716,9 +9310,9 @@ class FastEncodeProApp(QMainWindow):
         ai_label.setToolTip("Describe what you want. Only real app actions are offered. Nothing is invented.")
         ai_layout.addWidget(ai_label)
         self.ai_prompt_input = QLineEdit()
-        self.ai_prompt_input.setPlaceholderText('e.g. "trim edges, fade all, make it black and white and normalize" then press Apply')
+        self.ai_prompt_input.setPlaceholderText('e.g. "split at 1:23, cut 0:10 to 0:20, timelapse 1:00 to 1:30 at 8x" then press Apply')
         self.ai_prompt_input.setMinimumHeight(32)
-        self.ai_prompt_input.setStyleSheet("background: #0a0a0e; border: 1px solid rgba(125,249,255,0.25); border-radius: 8px; padding: 4px 10px; color: white; font-size: 11px;")
+        self.ai_prompt_input.setStyleSheet("background: #0a0a0e; border: 1px solid rgba(125,249,255,0.25); border-radius: 8px; padding: 4px 10px; color: white; font-size: 12px;")
         self.ai_prompt_input.returnPressed.connect(self.run_ai_assist)
         ai_layout.addWidget(self.ai_prompt_input, stretch=1)
         ai_apply_btn = QPushButton("Apply")
@@ -7728,6 +9322,14 @@ class FastEncodeProApp(QMainWindow):
         ai_apply_btn.setToolTip("Parse prompt into real actions, preview, then apply")
         ai_apply_btn.clicked.connect(self.run_ai_assist)
         ai_layout.addWidget(ai_apply_btn)
+        self.ai_undo_btn = QPushButton("↩ Undo")
+        self.ai_undo_btn.setStyleSheet(self.button_style("rgba(255,255,255,0.08)"))
+        self.ai_undo_btn.setMinimumHeight(32)
+        self.ai_undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ai_undo_btn.setToolTip("Undo the last AI apply (restores timeline clips + color/FX)")
+        self.ai_undo_btn.setEnabled(False)
+        self.ai_undo_btn.clicked.connect(self._ai_undo_clicked)
+        ai_layout.addWidget(self.ai_undo_btn)
         ai_help_btn = QPushButton("?")
         ai_help_btn.setFixedSize(32, 32)
         ai_help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -8387,17 +9989,37 @@ class FastEncodeProApp(QMainWindow):
         os.makedirs(self.proxy_manager.proxy_dir, exist_ok=True)
 
     def open_settings_dialog(self):
-        from PyQt6.QtWidgets import QDialog, QSpinBox, QCheckBox
+        from PyQt6.QtWidgets import QDialog, QSpinBox, QCheckBox, QScrollArea, QFrame
         dialog = QDialog(self)
-        dialog.setWindowTitle("FastEncode Pro - Performance Settings")
+        dialog.setWindowTitle("FastEncode Pro - Performance Settings (build v15)")
+        dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowType.WindowMaximizeButtonHint)
+        dialog.resize(620, 740)
         dialog.setMinimumWidth(480)
         dialog.setStyleSheet("QDialog { background: #0f0f14; border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; } QLabel { color: rgba(255,255,255,0.8); font-size: 12px; } QGroupBox { background: #15151a; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 20px 12px 12px 12px; margin-top: 12px; color: rgba(255,255,255,0.5); font-size: 10px; letter-spacing: 1px; } QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 4px 8px; margin-left: 12px; background: #0f0f14; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; }")
         layout = QVBoxLayout(dialog)
         layout.setSpacing(16)
         layout.setContentsMargins(20,20,20,20)
         title = QLabel("Performance & Hardware")
-        title.setStyleSheet("font-size: 16px; font-weight: 700; color: white;")
         layout.addWidget(title)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { width: 28px; background: #15151a; margin: 0px; }"
+            "QScrollBar::handle:vertical { background: #3a3a44; border-radius: 6px; min-height: 60px; }"
+            "QScrollBar::handle:vertical:hover { background: #4a4a55; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            " height: 30px; background: #1f1f26; subcontrol-origin: margin; }"
+            "QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {"
+            " width: 18px; height: 18px; background: #7df9ff; }"
+        )
+        scroll_content = QWidget()
+        content_layout = QVBoxLayout(scroll_content)
+        content_layout.setSpacing(16)
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll, stretch=1)
         cpu_group = QGroupBox("CPU CORES")
         cpu_layout = QVBoxLayout(cpu_group)
         import os
@@ -8414,7 +10036,7 @@ class FastEncodeProApp(QMainWindow):
         cpu_row.addWidget(cpu_spin)
         cpu_row.addStretch()
         cpu_layout.addLayout(cpu_row)
-        layout.addWidget(cpu_group)
+        content_layout.addWidget(cpu_group)
         gpu_group = QGroupBox("GPU VRAM")
         gpu_layout = QVBoxLayout(gpu_group)
         gpu_name = self.hw_caps.get('gpu_name', 'Unknown GPU')
@@ -8443,7 +10065,7 @@ class FastEncodeProApp(QMainWindow):
         vram_mb_row.addWidget(vram_mb_spin)
         vram_mb_row.addStretch()
         gpu_layout.addLayout(vram_mb_row)
-        layout.addWidget(gpu_group)
+        content_layout.addWidget(gpu_group)
         temp_group = QGroupBox("TEMPORARY FILES")
         temp_layout = QVBoxLayout(temp_group)
         temp_info = QLabel("Render intermediates and video proxies can use hundreds of GB. They are removed automatically after each completed or cancelled render.")
@@ -8464,7 +10086,7 @@ class FastEncodeProApp(QMainWindow):
         clear_temp_btn.setStyleSheet(self.button_style("#ff5f56"))
         clear_temp_btn.clicked.connect(lambda: self.clear_managed_temp_files())
         temp_layout.addWidget(clear_temp_btn)
-        layout.addWidget(temp_group)
+        content_layout.addWidget(temp_group)
         proxy_group = QGroupBox("PROXY SETTINGS")
         proxy_layout = QVBoxLayout(proxy_group)
         auto_check = QCheckBox("Auto-generate proxies on import (disable to stop auto-proxy)")
@@ -8478,7 +10100,7 @@ class FastEncodeProApp(QMainWindow):
         clear_btn.setStyleSheet(self.button_style("#ff5f56"))
         clear_btn.clicked.connect(lambda: (self.clear_all_proxies(), proxy_info.setText(f"Proxy folder: {self.proxy_manager.get_proxy_dir()}\nCurrent proxies: {len(self.proxy_manager.proxy_map)}")))
         proxy_layout.addWidget(clear_btn)
-        layout.addWidget(proxy_group)
+        content_layout.addWidget(proxy_group)
         preview_group = QGroupBox("PREVIEW PLAYER")
         preview_layout_g = QVBoxLayout(preview_group)
         try:
@@ -8511,7 +10133,67 @@ class FastEncodeProApp(QMainWindow):
         preview_note.setWordWrap(True)
         preview_note.setStyleSheet("color: rgba(255,255,255,0.5); font-size: 11px;")
         preview_layout_g.addWidget(preview_note)
-        layout.addWidget(preview_group)
+        compat_check = QCheckBox("Embedded preview compatibility mode (Windows green-screen fix)")
+        try:
+            compat_check.setChecked(bool(self.app_settings.value("mpv_embed_compat", False, type=bool)))
+        except Exception:
+            pass
+        compat_check.setStyleSheet(
+            "QCheckBox { color: white; padding: 10px; font-size: 14px;"
+            " font-weight: bold; spacing: 14px; }"
+            "QCheckBox::indicator { width: 34px; height: 34px;"
+            " border-radius: 8px; border: 3px solid #7df9ff;"
+            " background: #000000; }"
+            "QCheckBox::indicator:checked { background: #00ff88;"
+            " border: 3px solid #00ff88; }"
+        )
+        compat_check.setToolTip("Windows only: forces software decoding in the embedded preview. Takes effect after restart.")
+        _v8lbl = QLabel("BUILD v15 - if you do not see this line, you are not running v15")
+        _v8lbl.setStyleSheet("color: #00ff88; font-size: 14px; font-weight: bold; padding: 8px;")
+        preview_layout_g.addWidget(_v8lbl)
+        preview_layout_g.addWidget(compat_check)
+        sw_check = QCheckBox("Software preview rendering (slower, bypasses the graphics driver)")
+        try:
+            sw_check.setChecked(bool(self.app_settings.value("mpv_sw_render", False, type=bool)))
+        except Exception:
+            pass
+        sw_check.setStyleSheet(
+            "QCheckBox { color: white; padding: 10px; font-size: 14px;"
+            " font-weight: bold; spacing: 14px; }"
+            "QCheckBox::indicator { width: 34px; height: 34px;"
+            " border-radius: 8px; border: 3px solid #7df9ff;"
+            " background: #000000; }"
+            "QCheckBox::indicator:checked { background: #00ff88;"
+            " border: 3px solid #00ff88; }"
+        )
+        sw_check.setToolTip("If the embedded preview shows a corrupted or green picture, try this. Renders video on the CPU instead of the GPU. Takes effect after restart.")
+        preview_layout_g.addWidget(sw_check)
+        log_btn = QPushButton("Open preview debug log")
+        log_btn.setMinimumSize(200, 48)
+        log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        log_btn.setToolTip("Opens the preview diagnostics log (which video renderer is running).")
+        def _open_fep_log(_checked=False):
+            try:
+                p = _fep_preview_log_path()
+            except Exception:
+                p = ""
+            try:
+                if p and os.path.isfile(p):
+                    from PyQt6.QtGui import QDesktopServices as _QDS
+                    from PyQt6.QtCore import QUrl as _QU
+                    _QDS.openUrl(_QU.fromLocalFile(p))
+                else:
+                    QMessageBox.information(self, "Preview debug log",
+                                            "No preview log yet. Play a video in the preview first.")
+            except Exception as e:
+                try:
+                    QMessageBox.warning(self, "Preview debug log",
+                                        "Couldn't open the log: %s" % (e,))
+                except Exception:
+                    pass
+        log_btn.clicked.connect(_open_fep_log)
+        preview_layout_g.addWidget(log_btn)
+        content_layout.addWidget(preview_group)
         access_quick_group = QGroupBox("ACCESSIBILITY")
         access_quick_layout = QVBoxLayout(access_quick_group)
         dwell_quick_check = QCheckBox("Enable Dwell Click (eye tracking auto-click)")
@@ -8543,7 +10225,7 @@ class FastEncodeProApp(QMainWindow):
         dwell_quick_hint.setWordWrap(True)
         dwell_quick_hint.setStyleSheet("color: rgba(255,255,255,0.5); font-size: 11px;")
         access_quick_layout.addWidget(dwell_quick_hint)
-        layout.addWidget(access_quick_group)
+        content_layout.addWidget(access_quick_group)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("Cancel")
@@ -8573,6 +10255,14 @@ class FastEncodeProApp(QMainWindow):
             self.app_settings.setValue("auto_proxy_enabled", self.auto_proxy_enabled)
             _new_mode = ['auto', 'embed', 'external'][max(0, min(2, preview_mode_combo.currentIndex()))]
             self.app_settings.setValue("mpv_preview_mode", _new_mode)
+            try:
+                self.app_settings.setValue("mpv_embed_compat", bool(compat_check.isChecked()))
+            except Exception:
+                pass
+            try:
+                self.app_settings.setValue("mpv_sw_render", bool(sw_check.isChecked()))
+            except Exception:
+                pass
             try:
                 if hasattr(self, 'video_widget') and self.video_widget:
                     self.video_widget.set_preview_mode(_new_mode)
@@ -9053,6 +10743,16 @@ class FastEncodeProApp(QMainWindow):
         except Exception:
             pass
 
+        # FEATS1: EDL preview - live-switch per-clip crop/rotation at clip boundaries.
+        try:
+            if getattr(self, '_play_uses_timeline_edl', False):
+                _cc = self._timeline_clip_at(float(position_ms) / 1000.0)
+                if _cc is not getattr(self, '_edl_geom_clip', None):
+                    self._edl_geom_clip = _cc
+                    self.update_live_preview_filters(clip=_cc)
+        except Exception:
+            pass
+
     def _on_duration_changed(self, duration_ms):
         if duration_ms <= 0:
             if self.is_timeline_mode and self._play_uses_timeline_edl:
@@ -9075,7 +10775,6 @@ class FastEncodeProApp(QMainWindow):
                 self.scrub_wave.set_media_duration(duration_ms)
         except Exception:
             pass
-
     def on_media_selected(self, item):
         self.is_timeline_mode = False
         self._play_uses_timeline_edl = False
@@ -9149,6 +10848,7 @@ class FastEncodeProApp(QMainWindow):
                 f.write(edl_content)
 
             self.video_widget.set_audio_complex_filter("")
+            self._edl_geom_clip = None
 
             edl_path = path.replace('\\', '/')
             # FIX: Clamp playhead so we don't seek past end (black screen)
@@ -9167,12 +10867,15 @@ class FastEncodeProApp(QMainWindow):
 
             if self.video_widget.load_file(edl_path, seek_ms=seek_ms):
                 # Add voiceover files as external audio tracks
+                vo_added = 0
                 for vo in vo_clips:
                     if os.path.exists(vo.file_path):
                         try:
                             self.video_widget.mpv.audio_add(vo.file_path)
+                            vo_added += 1
                         except Exception:
                             pass
+                self._edl_vo_added = vo_added
 
                 # Set timeline-derived duration immediately as fallback
                 # so scrubber/timecode work before MPV's async observer fires
@@ -9187,10 +10890,10 @@ class FastEncodeProApp(QMainWindow):
                     pass
                 if play:
                     self.video_widget.play()
-                    self.play_btn.setText("â¸ï¸ Pause")
+                    self._set_play_ui(False)
                 else:
                     self.video_widget.pause()
-                    self.play_btn.setText("â–¶ï¸ Play")
+                    self._set_play_ui(True)
                 self.update_live_preview_filters()
         except Exception as e:
             self.status_label.setText(f"Timeline preview error: {e}")
@@ -9203,6 +10906,10 @@ class FastEncodeProApp(QMainWindow):
     def on_timeline_clip_selected(self, clip):
         self.is_timeline_mode = True
         self._play_uses_timeline_edl = False
+        try:
+            self._cancel_crop_mode()
+        except Exception:
+            pass
 
         while len(clip.normalization) < len(clip.volumes):
             clip.normalization.append(False)
@@ -9223,7 +10930,8 @@ class FastEncodeProApp(QMainWindow):
         seek_ms = int(clip.in_point * 1000)
         if self.video_widget.load_file(self.proxy_manager.get_proxy(clip.file_path), seek_ms=seek_ms):
             self.video_widget.pause()
-            self.apply_audio_mix_preview(clip.file_path, clip.volumes, clip.normalization)
+            self.apply_audio_mix_preview(clip.file_path, clip.volumes, clip.normalization,
+                                        getattr(clip, 'sync_offset', 0))
             self.update_live_preview_filters()
 
         in_tc = self.format_timecode(int(clip.in_point * 1000))
@@ -9241,6 +10949,27 @@ class FastEncodeProApp(QMainWindow):
         self.t1_val.setText(f"{self.track1_slider.value()} dB")
         self.t2_val.setText(f"{self.track2_slider.value()} dB")
 
+        if getattr(self, '_play_uses_timeline_edl', False) \
+                and getattr(self, 'is_timeline_mode', False):
+            # Timeline mode: the sliders ARE the mix. Write through to the
+            # selected clip when there is one, then rebuild the EDL graph
+            # from the live UI values (works even with no clip selected).
+            clip = self.timeline.selected_clip
+            if clip is not None:
+                while len(clip.volumes) < 2:
+                    clip.volumes.append(0.0)
+                    clip.normalization.append(False)
+                clip.volumes[0] = float(self.track1_slider.value())
+                clip.normalization[0] = self.track1_norm.isChecked()
+                clip.volumes[1] = float(self.track2_slider.value())
+                clip.normalization[1] = self.track2_norm.isChecked()
+            self.apply_timeline_audio_mix(
+                volumes=[float(self.track1_slider.value()),
+                         float(self.track2_slider.value())],
+                normalizations=[self.track1_norm.isChecked(),
+                                self.track2_norm.isChecked()])
+            return
+
         if self.timeline.selected_clip:
             clip = self.timeline.selected_clip
             while len(clip.volumes) < 2:
@@ -9253,12 +10982,26 @@ class FastEncodeProApp(QMainWindow):
             clip.volumes[1] = float(self.track2_slider.value())
             clip.normalization[1] = self.track2_norm.isChecked()
 
-            self.apply_audio_mix_preview(clip.file_path, clip.volumes, clip.normalization)
+            self.apply_audio_mix_preview(clip.file_path, clip.volumes, clip.normalization,
+                                        getattr(clip, 'sync_offset', 0))
 
-    def apply_audio_mix_preview(self, file_path, volumes, normalization=None):
+    def apply_audio_mix_preview(self, file_path, volumes, normalization=None, sync_offset_ms=0):
         if not self.video_widget: return
 
         n_streams = get_audio_stream_count_static(file_path)
+
+        def _sync_delay_chain(track_idx):
+            # Mirror the export logic: sync_offset > 0 means track 1 (mic) is
+            # late, so delay track 0; sync_offset < 0 delays track 1.
+            try:
+                off = int(sync_offset_ms)
+            except Exception:
+                return ""
+            if off > 0 and track_idx == 0:
+                return f"adelay={off}|{off},"
+            if off < 0 and track_idx == 1:
+                return f"adelay={abs(off)}|{abs(off)},"
+            return ""
 
         if n_streams > 1:
             filter_parts = []
@@ -9270,6 +11013,7 @@ class FastEncodeProApp(QMainWindow):
                 chain = f"volume={vol_db}dB"
                 if norm:
                     chain = f"loudnorm,{chain}"
+                chain = _sync_delay_chain(i) + chain
 
                 filter_parts.append(f"[aid{i+1}]{chain}[a{i}]")
                 inputs.append(f"[a{i}]")
@@ -9285,6 +11029,144 @@ class FastEncodeProApp(QMainWindow):
             if norm:
                 chain = f"loudnorm,{chain}"
             self.video_widget.set_audio_complex_filter(f"[aid1]{chain}[ao]")
+
+    def _on_preview_file_loaded(self):
+        """Rebuild the timeline audio mix once mpv knows every audio track.
+
+        mpv only plays its *selected* audio track by default, so without a
+        lavfi-complex mix the EDL preview plays just one track. track-list is
+        only populated after file-loaded, hence this runs here and not in
+        load_timeline_sequence itself.
+        """
+        try:
+            _fep_log('[fep-audio] fileLoaded slot: is_timeline_mode=%s edl=%s' % (
+                getattr(self, 'is_timeline_mode', False),
+                getattr(self, '_play_uses_timeline_edl', False)))
+            if getattr(self, 'is_timeline_mode', False) \
+                    and getattr(self, '_play_uses_timeline_edl', False):
+                self.apply_timeline_audio_mix()
+        except Exception:
+            pass
+
+    def _mpv_audio_track_ids(self):
+        """All audio track ids mpv currently knows, in order (EDL tracks first,
+        then external files added via audio_add)."""
+        try:
+            mpv = getattr(self.video_widget, 'mpv', None)
+            if not mpv:
+                _fep_log('[fep-audio] track-list: no mpv instance')
+                return []
+            tracks = mpv.command('get_property', 'track-list') or []
+            try:
+                _fep_log('[fep-audio] track-list: %d entries %s' % (
+                    len(tracks),
+                    [(t.get('id'), t.get('type')) for t in tracks][:14]))
+            except Exception:
+                pass
+            return [int(t.get('id')) for t in tracks if t.get('type') == 'audio']
+        except Exception as e:
+            _fep_log('[fep-audio] track-list read FAILED: %r' % (e,))
+            return []
+
+    @staticmethod
+    def _build_timeline_audio_filter(audio_ids, vo_count, volumes,
+                                     normalizations, sync_offset_ms,
+                                     single_clip):
+        """Pure filter-graph builder (kept static so it is unit-testable).
+
+        audio_ids: mpv audio track ids in order; the trailing vo_count of them
+        are external voiceover files. Mixes EVERY track to [ao] with the mixer
+        volumes / loudnorm flags applied to the timeline's own tracks.
+        """
+        ids = list(audio_ids or [])
+        if not ids:
+            return ""
+        n_edl = max(0, len(ids) - max(0, int(vo_count or 0)))
+        vols = [float(v) for v in (volumes or [])]
+        norms = [bool(n) for n in (normalizations or [])]
+        while len(vols) < n_edl:
+            vols.append(0.0)
+        while len(norms) < n_edl:
+            norms.append(False)
+        try:
+            sync_ms = int(sync_offset_ms or 0)
+        except Exception:
+            sync_ms = 0
+        chains = []
+        for i, aid in enumerate(ids):
+            if i < n_edl:
+                chain = ""
+                if single_clip and sync_ms:
+                    if sync_ms > 0 and i == 0:
+                        chain += f"adelay={sync_ms}|{sync_ms},"
+                    elif sync_ms < 0 and i == 1:
+                        chain += f"adelay={abs(sync_ms)}|{abs(sync_ms)},"
+                chain += f"volume={vols[i]}dB"
+                if norms[i]:
+                    chain += ",loudnorm"
+            else:
+                chain = "volume=0dB"
+            chains.append((aid, chain))
+        if len(chains) == 1:
+            aid, chain = chains[0]
+            return f"[aid{aid}]{chain}[ao]"
+        parts = []
+        tags = []
+        for i, (aid, chain) in enumerate(chains):
+            parts.append(f"[aid{aid}]{chain}[am{i}]")
+            tags.append(f"[am{i}]")
+        return (";".join(parts) + ";" + "".join(tags) +
+                f"amix=inputs={len(chains)}:duration=longest:"
+                f"dropout_transition=0[ao]")
+
+    def apply_timeline_audio_mix(self, volumes=None, normalizations=None,
+                                   _retry=True):
+        """(Re)build the EDL preview audio graph from live mixer state.
+
+        volumes/normalizations override the clip's stored values (used by the
+        mixer sliders so they work even with no clip selected).
+        """
+        try:
+            vw = getattr(self, 'video_widget', None)
+            if not vw or not getattr(vw, 'mpv', None):
+                _fep_log('[fep-audio] apply_timeline_audio_mix: no video_widget/mpv')
+                return
+            ids = self._mpv_audio_track_ids()
+            if not ids:
+                _fep_log('[fep-audio] apply_timeline_audio_mix: track-list gave 0 audio ids')
+                if _retry:
+                    QTimer.singleShot(
+                        500,
+                        lambda: self.apply_timeline_audio_mix(
+                            volumes=volumes, normalizations=normalizations,
+                            _retry=False))
+                return
+            tl = getattr(self, 'timeline', None)
+            clips = list(getattr(tl, 'clips', []) or [])
+            clip = getattr(tl, 'selected_clip', None)
+            if clip is None and len(clips) == 1:
+                clip = clips[0]
+            vo_count = min(int(getattr(self, '_edl_vo_added', 0) or 0),
+                           len(ids))
+            if volumes is None:
+                volumes = getattr(clip, 'volumes', None)
+            if normalizations is None:
+                normalizations = getattr(clip, 'normalization', None)
+            filt = self._build_timeline_audio_filter(
+                ids, vo_count, volumes, normalizations,
+                getattr(clip, 'sync_offset', 0), len(clips) == 1)
+            if filt:
+                vw.set_audio_complex_filter(filt)
+                try:
+                    self.append_log(
+                        f"timeline mix: {len(ids)} audio track(s), "
+                        f"filter={filt[:160]}")
+                except Exception:
+                    pass
+                _fep_log('[fep-audio] timeline mix: %d audio track(s), filter=%s' % (
+                    len(ids), filt[:200]))
+        except Exception:
+            pass
 
     def auto_sync_audio_tracks(self):
         if not self.timeline.selected_clip:
@@ -9330,7 +11212,7 @@ class FastEncodeProApp(QMainWindow):
             self,
             "Auto-Sync Audio",
             f"Analyze audio sync for: {clip.name}"
-            "This will analyze the first 30 seconds to detect"
+            "This will analyze the first 90 seconds to detect"
             "the sync offset between audio tracks."
             "Track 0 (desktop) will be used as reference."
             "Track 1 (mic) will be synchronized."
@@ -9359,7 +11241,7 @@ class FastEncodeProApp(QMainWindow):
                 clip.file_path,
                 track1=0,
                 track2=1,
-                sample_duration=30,
+                sample_duration=90,
                 progress_callback=update_progress
             )
 
@@ -9418,6 +11300,16 @@ class FastEncodeProApp(QMainWindow):
                 self.sync_status_label.setText(f"Sync: {offset_ms:+d}ms ({conf_text})")
                 self.append_log(f"✅ Audio sync applied: {offset_ms:+d}ms (confidence: {confidence_pct}%)")
                 self.append_log(f"   This offset will be applied during timeline export.")
+                # Refresh the preview so the tracks are heard in line
+                # immediately.
+                try:
+                    if getattr(self, '_play_uses_timeline_edl', False):
+                        self.apply_timeline_audio_mix()
+                    else:
+                        self.apply_audio_mix_preview(clip.file_path, clip.volumes,
+                                                    clip.normalization, clip.sync_offset)
+                except Exception:
+                    pass
             else:
                 self.append_log(f"Audio sync detected ({offset_ms:+d}ms) but not applied")
 
@@ -9473,12 +11365,34 @@ class FastEncodeProApp(QMainWindow):
         try:
             if hasattr(self, 'play_btn'):
                 self.play_btn.setText("▶" if paused else "❚❚")
-            if hasattr(self, 'center_play'):
-                self.center_play.setText("▶" if paused else "❚❚")
         except Exception:
             pass
         try:
             self._last_play_ui_paused = bool(paused)
+        except Exception:
+            pass
+        self._refresh_center_play(paused)
+
+    def _refresh_center_play(self, paused=None):
+        """Big center play button: visible only when media is loaded AND
+        paused (YouTube-style). Never lingers over playing video. R58."""
+        try:
+            vw = getattr(self, 'video_widget', None)
+            cur = getattr(vw, 'current_file', None) if vw is not None else None
+            has_media = bool(cur and os.path.exists(cur))
+            if paused is None:
+                try:
+                    paused = bool(vw.is_paused()) if vw is not None else True
+                except Exception:
+                    paused = True
+            btn = getattr(self, 'center_play', None)
+            if btn is not None:
+                btn.setText("▶" if paused else "❚❚")
+                # R74: never resurrect the center button while fullscreen-idle
+                _show = bool(has_media and paused)
+                if getattr(self, '_fs_idle_hidden', False) and not btn.isVisible():
+                    _show = False
+                btn.setVisible(_show)
         except Exception:
             pass
 
@@ -9625,8 +11539,364 @@ class FastEncodeProApp(QMainWindow):
         s = s % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
 
+    def _fs_teardown_render_ctx(self):
+        """Detach the render widget's mpv context before video_stack moves
+        to a new native window. R71: the free() MUST happen with the widget's
+        GL context current - freeing an mpv OpenGL render context with no
+        current GL context wedges mpv's video output (black screen,
+        update() never fires, playback appears stopped) until a seek forces
+        a reconfig. Guards are reset so the rebuild does one clean init."""
+        try:
+            vw = getattr(self, 'video_widget', None)
+            rw = getattr(vw, '_gl_widget', None)
+            if isinstance(rw, _EmbeddedMpvGLWidget):
+                try:
+                    rw._frame_ready.disconnect()
+                except Exception:
+                    pass
+                try:
+                    rw.makeCurrent()
+                except Exception:
+                    pass
+                try:
+                    rw.shutdown_gl()
+                except Exception:
+                    pass
+                try:
+                    rw.doneCurrent()
+                except Exception:
+                    pass
+                rw._init_done = False
+                rw._init_error = None
+                rw._backend = None
+                rw._geom_logged = False
+        except Exception:
+            pass
+
+    def _fs_kick_render(self, attempt=1):
+        """Poll update() after a render-ctx move: covers the VO spin-up
+        window when the fresh context has not delivered its first edge
+        yet. A positive hit queues a repaint. R62."""
+        try:
+            vw = getattr(self, 'video_widget', None)
+            rw = getattr(vw, '_gl_widget', None)
+            got = False
+            if isinstance(rw, _EmbeddedMpvGLWidget):
+                try:
+                    _upd = getattr(getattr(rw, '_ctx', None), 'update', None)
+                    if callable(_upd):
+                        got = bool(_upd())
+                except Exception as _e:
+                    _fep_log('[fep-preview] fs kick update() err:', repr(_e))
+            _fep_log('[fep-preview] fs render kick #%d update()->%s' % (attempt, got))
+            if got and rw is not None:
+                try:
+                    rw.update()
+                except Exception:
+                    pass
+            elif attempt < 6:
+                try:
+                    QTimer.singleShot(300, lambda: self._fs_kick_render(attempt + 1))
+                except Exception:
+                    pass
+            else:
+                _fep_log('[fep-preview] fs render kick: still no frame after retries')
+                try:
+                    _vw = getattr(self, 'video_widget', None)
+                    _vw_mpv = getattr(_vw, 'mpv', None) if _vw is not None else None
+                    _pos_ms = _vw.position() if _vw is not None else None
+                    if _vw_mpv is not None and _pos_ms is not None:
+                        _vw.seek(int(_pos_ms), exact=True)
+                        _fep_log('[fep-preview] fs kick: last-resort exact seek to %d ms' % (int(_pos_ms),))
+                except Exception as _e:
+                    _fep_log('[fep-preview] fs kick last-resort seek failed:', repr(_e))
+        except Exception as _e:
+            _fep_log('[fep-preview] fs kick failed:', repr(_e))
+
+    def _fs_rebuild_render_ctx(self):
+        """One clean render-context init after a move. R71: Qt may have
+        auto-run initializeGL during showFullScreen at an awkward moment -
+        or not at all - so we never depend on its timing. Guards are reset
+        and initializeGL runs exactly once here, with the GL context current
+        (makeCurrent); initializeGL itself frees any leftover context first,
+        so a half-initialized auto-run can never poison the result."""
+        try:
+            vw = getattr(self, 'video_widget', None)
+            rw = getattr(vw, '_gl_widget', None)
+            if not isinstance(rw, _EmbeddedMpvGLWidget):
+                return
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+            try:
+                rw._init_done = False
+                rw._init_error = None
+            except Exception:
+                pass
+            try:
+                rw.makeCurrent()
+            except Exception as e:
+                _fep_log('[fep-preview] fs rebuild makeCurrent failed:', repr(e))
+            try:
+                rw.initializeGL()
+            except Exception as e:
+                _fep_log('[fep-preview] fullscreen re-init failed:', repr(e))
+            try:
+                rw.doneCurrent()
+            except Exception:
+                pass
+            try:
+                rw.update()
+            except Exception:
+                pass
+            try:
+                self._fs_kick_render()
+            except Exception:
+                pass
+            try:
+                _vw = getattr(self, 'video_widget', None)
+                _vw_mpv = getattr(_vw, 'mpv', None) if _vw is not None else None
+                _paused = bool(_vw.is_paused()) if _vw is not None else False
+                _pos_ms = _vw.position() if _vw is not None else None
+                if _paused and _vw_mpv is not None and _pos_ms is not None:
+                    _vw.seek(int(_pos_ms), exact=True)
+                    _fep_log('[fep-preview] fs rebuild: paused, pumped still frame via exact seek to %d ms' % (int(_pos_ms),))
+            except Exception as _e:
+                _fep_log('[fep-preview] fs still-frame pump failed:', repr(_e))
+        except Exception:
+            pass
+
     def enter_fullscreen(self):
-        pass
+        """R73: in-place fullscreen. Fullscreens the main window itself and
+        hides everything except the preview area (which already has play/
+        pause/skip via preview_ctrl and seeking via the scrubber - nothing
+        new needed there). video_stack's parent NEVER changes and the mpv
+        render context is NEVER torn down or recreated - this sidesteps the
+        libmpv render-API bug the debug log caught red-handed: any SECOND
+        mpv_render_context_create() against the same mpv instance logs
+        '[libmpv_render] after creating texture: OpenGL error INVALID_ENUM'
+        and that context never receives another frame, permanently. The
+        old dialog-reparent approach (R59-R71) always hit this on the first
+        rebuild; this approach never creates a second context at all.
+        Toggles: calling this again while already fullscreen exits instead.
+        """
+        try:
+            if getattr(self, '_fs_active', False):
+                self.exit_fullscreen()
+                return
+            vw = getattr(self, 'video_widget', None)
+            if vw is None or not vw.is_embedded():
+                try:
+                    self.status_label.setText(
+                        "Fullscreen player needs the embedded preview "
+                        "(not the external mpv window).")
+                except Exception:
+                    pass
+                return
+            self._fs_was_maximized = self.isMaximized()
+            self._fs_hidden_docks = []
+            try:
+                for _dock in self.findChildren(QDockWidget):
+                    try:
+                        if _dock.isVisible():
+                            self._fs_hidden_docks.append(_dock)
+                            _dock.setVisible(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                _mb = self.menuBar()
+                self._fs_menubar_was_visible = bool(_mb.isVisible())
+                _mb.setVisible(False)
+            except Exception:
+                self._fs_menubar_was_visible = None
+            try:
+                self._fs_topbar_was_visible = bool(self.top_bar.isVisible())
+                self.top_bar.setVisible(False)
+            except Exception:
+                self._fs_topbar_was_visible = None
+            self._fs_active = True
+            # R74: application-level event filter sees ALL input events, so
+            # any mouse/click/wheel/key anywhere restores the hidden UI.
+            try:
+                QApplication.instance().installEventFilter(self)
+            except Exception:
+                pass
+            self.showFullScreen()
+            # R74: start idle auto-hide (3 s without input -> video only)
+            try:
+                self._fs_last_mouse = None
+                self._fs_mouse_poll.start()
+                self._fs_idle_timer.start(self._FS_IDLE_MS)
+            except Exception:
+                pass
+            _fep_log('[fep-preview] entered in-place fullscreen (video_stack untouched)')
+        except Exception as e:
+            _fep_log('[fep-preview] enter_fullscreen failed:', repr(e))
+            self._fs_active = False
+
+    def exit_fullscreen(self):
+        """R73: reverse of enter_fullscreen - restore whichever docks/bars
+        were actually visible before (not force-show everything), then
+        restore the window's prior maximized/normal state."""
+        if not getattr(self, '_fs_active', False):
+            return
+        try:
+            for _dock in (getattr(self, '_fs_hidden_docks', None) or []):
+                try:
+                    _dock.setVisible(True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._fs_hidden_docks = []
+        # R74: stop idle auto-hide and restore everything it hid.
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
+        try:
+            self._fs_idle_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._fs_mouse_poll.stop()
+        except Exception:
+            pass
+        try:
+            self._fs_show_ui()
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_fs_menubar_was_visible', False):
+                self.menuBar().setVisible(True)
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_fs_topbar_was_visible', False):
+                self.top_bar.setVisible(True)
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_fs_was_maximized', False):
+                self.showMaximized()
+            else:
+                self.showNormal()
+        except Exception:
+            pass
+        self._fs_active = False
+        _fep_log('[fep-preview] exited in-place fullscreen')
+
+    # -- R74: idle auto-hide. After 3 s without mouse movement, clicks,
+    # wheel or keys, ALL preview chrome (header pills, control bar,
+    # scrubber, badges) and the cursor hide, leaving only the video. Any
+    # activity restores them immediately. Cursor is tracked by polling
+    # QCursor.pos() because the video widgets don't enable mouse tracking
+    # (an event-only approach would miss motion over the mpv surface).
+    _FS_IDLE_MS = 3000
+
+    def _fs_ui_children(self):
+        """Unique list of every chrome widget the idle hide touches.
+        preview_header is a layout (skipped); the empty-state label is
+        deduplicated here so hide/show capture its visibility exactly once."""
+        chrome = getattr(self, '_fs_chrome', None) or {}
+        named = ('rec_badge', 'nvenc_badge', 'gpu_temp_badge', 'center_play',
+                 'preview_glow', 'preview_empty_label')
+        seen, widgets = set(), []
+        for w in list(chrome.values()) + [getattr(self, n, None) for n in named]:
+            if isinstance(w, QWidget) and id(w) not in seen:
+                seen.add(id(w))
+                widgets.append(w)
+        return widgets
+
+    def _fs_show_ui(self):
+        """Restore chrome + cursor (activity while fullscreen, or on exit)."""
+        self._fs_idle_hidden = False
+        try:
+            self._fs_idle_timer.stop()
+        except Exception:
+            pass
+        for w in self._fs_ui_children():
+            try:
+                w.setVisible(bool(getattr(w, '_fs_was_visible', True)))
+            except Exception:
+                pass
+        try:
+            self.unsetCursor()
+        except Exception:
+            pass
+
+    def _fs_hide_ui(self):
+        """Hide all preview chrome + blank the cursor (idle in fullscreen)."""
+        if not getattr(self, '_fs_active', False):
+            return
+        self._fs_idle_hidden = True
+        for w in self._fs_ui_children():
+            try:
+                w._fs_was_visible = bool(w.isVisible())
+            except Exception:
+                pass
+            try:
+                w.setVisible(False)
+            except Exception:
+                pass
+        try:
+            self.setCursor(Qt.CursorShape.BlankCursor)
+        except Exception:
+            pass
+        _fep_log('[fep-preview] fullscreen idle: chrome + cursor hidden')
+
+    def _fs_activity(self):
+        """Any input while fullscreen: show UI and restart the idle timer."""
+        if not getattr(self, '_fs_active', False):
+            return
+        if getattr(self, '_fs_idle_hidden', False):
+            self._fs_show_ui()
+        try:
+            self._fs_idle_timer.start(self._FS_IDLE_MS)
+        except Exception:
+            pass
+
+    def _fs_poll_activity(self):
+        """Idle watchdog: detect mouse movement over widgets that don't
+        report mouse-move events (the mpv video surface)."""
+        if not getattr(self, '_fs_active', False):
+            return
+        try:
+            pos = QCursor.pos()
+            last = getattr(self, '_fs_last_mouse', None)
+            self._fs_last_mouse = QPoint(pos)
+            if last is not None and (pos - last).manhattanLength() > 0:
+                self._fs_activity()
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, ev):
+        try:
+            if getattr(self, '_fs_active', False):
+                ev_type = ev.type()
+                if ev_type in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress,
+                               QEvent.Type.MouseButtonRelease, QEvent.Type.Wheel,
+                               QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+                    self._fs_activity()
+        except Exception:
+            pass
+        return super().eventFilter(obj, ev)
+
+    def keyPressEvent(self, ev):
+        # R73: Escape exits in-place fullscreen. Only acts while fullscreen
+        # is active, so this never intercepts Escape elsewhere in the app.
+        try:
+            if getattr(self, '_fs_active', False):
+                if ev.key() == Qt.Key.Key_Escape:
+                    self.exit_fullscreen()
+                    return
+                self._fs_activity()
+        except Exception:
+            pass
+        super().keyPressEvent(ev)
 
     def set_media_in_point(self):
         if self.current_media and self.video_widget:
@@ -9764,44 +12034,740 @@ class FastEncodeProApp(QMainWindow):
         self.update_timeline_duration()
         self.status_label.setText("Audio Normalized (loudnorm on all clips).")
 
-    # --- AI ASSIST (prompt -> real actions only, never invented) ---
+    # --- AI ASSIST v2 (prompt -> real actions only, never invented) ---
+    # Constrained local agent: natural-language prompt -> plan of REAL app
+    # operations -> user reviews the plan (big, click-friendly buttons) ->
+    # apply -> one-level undo. No network, no API keys, works offline.
+    # Plan items use a JSON-friendly {"key","label","params"} schema so a
+    # future LLM backend could emit the same plans; the parser below is the
+    # built-in local planner and is the only thing that runs today.
+    #
+    # Honest limits (also shown in the ? dialog): this is a deterministic
+    # planner, not a large language model. It understands the edit vocabulary
+    # listed in show_ai_capabilities(). Anything outside that vocabulary is
+    # reported as "didn't understand" instead of being guessed at.
+
+    # ---------- timecode / range parsing ----------
+    def _ai_parse_colon_tc(self, token):
+        """'1:23' -> 83.0, '01:02:03' -> 3723.0, '1:23.5' -> 83.5. None if bad."""
+        try:
+            parts = token.strip().split(':')
+            if len(parts) == 2:
+                m, s = parts
+                return int(m) * 60 + float(s)
+            if len(parts) == 3:
+                h, m, s = parts
+                return int(h) * 3600 + int(m) * 60 + float(s)
+        except Exception:
+            pass
+        return None
+
+    def _ai_find_timecodes(self, text):
+        """Find every timecode in lowered text. Returns [(start, end, seconds)]."""
+        import re as _re
+        found = []
+        colon_re = _re.compile(r'(?<!\d)(?:(\d+):)?([0-5]?\d):([0-5]\d(?:\.\d+)?)(?![\d.])')
+        for m in colon_re.finditer(text):
+            secs = self._ai_parse_colon_tc(m.group(0))
+            if secs is not None:
+                found.append((m.start(), m.end(), secs))
+        unit_re = _re.compile(r'(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?|h|m|s)(?![a-z])')
+        umatches = []
+        for m in unit_re.finditer(text):
+            # Accept at string start / after a non-word char, or chained like
+            # "2m30s" (letter-unit directly after digit+unit).
+            ok = False
+            if m.start() == 0:
+                ok = True
+            else:
+                prev = text[m.start() - 1]
+                if not (prev.isalnum() or prev == '_'):
+                    ok = True
+                elif prev.lower() in ('h', 'm', 's') and m.start() >= 2 and text[m.start() - 2].isdigit():
+                    ok = True
+            if ok:
+                umatches.append(m)
+        # Merge adjacent unit tokens ("2m30s", "2 min 30 sec") into one span.
+        i = 0
+        mult = {'h': 3600.0, 'm': 60.0, 's': 1.0}
+        while i < len(umatches):
+            j = i
+            total = 0.0
+            while j < len(umatches):
+                mj = umatches[j]
+                gap = text[umatches[j - 1].end():mj.start()] if j > i else ''
+                if j > i and _re.fullmatch(r'\s*', gap) is None:
+                    break
+                u = mj.group(2).lower()[0]
+                total += float(mj.group(1)) * mult.get(u, 1.0)
+                j += 1
+            # Skip a unit token that overlaps a colon match we already took.
+            s0, e0 = umatches[i].start(), umatches[j - 1].end()
+            if not any(s0 < e and e0 > s for s, e, _ in found):
+                found.append((s0, e0, total))
+            i = j
+        found.sort(key=lambda t: t[0])
+        return found
+
+    def _ai_protect_ranges(self, text, ranges):
+        """Replace 'from A to B' / 'between A and B' / 'A to B' / 'A-B' with
+        __rangeN__ placeholders so chunk-splitting on 'and'/commas can't break
+        them. ranges maps placeholder -> (start_secs, end_secs)."""
+        import re as _re
+        tcs = self._ai_find_timecodes(text)
+        if len(tcs) < 2:
+            return text
+        out = text
+        n = 0
+        # Walk right-to-left so earlier spans stay valid.
+        for i in range(len(tcs) - 2, -1, -1):
+            s0, e0, v0 = tcs[i]
+            s1, e1, v1 = tcs[i + 1]
+            # Skip if either endpoint was already consumed by a range.
+            if '__range' in out[s0:e1]:
+                continue
+            mid = out[e0:s1].strip().lower()
+            pre = out[max(0, s0 - 9):s0].lower()
+            is_range = False
+            if mid in ('to', '-', '\u2013', '\u2014', 'thru', 'through'):
+                is_range = True
+            elif mid == 'and' and ('between' in pre or 'from' in pre):
+                is_range = True
+            if is_range and v1 > v0:
+                key = '__range%d__' % n
+                ranges[key] = (v0, v1)
+                out = out[:s0] + key + out[e1:]
+                n += 1
+        return out
+
+    def _ai_fmt_tc(self, secs):
+        try:
+            secs = max(0.0, float(secs))
+        except Exception:
+            return "0:00"
+        h = int(secs // 3600)
+        m = int((secs % 3600) // 60)
+        s = secs % 60
+        if h:
+            return "%d:%02d:%04.1f" % (h, m, s)
+        return "%d:%04.1f" % (m, s)
+
+    # ---------- clip targeting ----------
+    def _ai_target_spec(self, low_text):
+        """Extract who the prompt is about: all clips, clip N, last, or a name."""
+        import re as _re
+        t = low_text
+        if _re.search(r'\b(all|every)\b[^,;]*\bclips?\b', t):
+            return {'kind': 'all'}
+        m = _re.search(r'\bclip\s+(\d+)\b', t)
+        if m:
+            return {'kind': 'index', 'value': int(m.group(1))}
+        m = _re.search(r'\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|sixth|6th|last)\s+clip\b', t)
+        if m:
+            w = m.group(1)
+            if w == 'last':
+                return {'kind': 'last'}
+            num = {'first': 1, '1st': 1, 'second': 2, '2nd': 2, 'third': 3, '3rd': 3,
+                   'fourth': 4, '4th': 4, 'fifth': 5, '5th': 5, 'sixth': 6, '6th': 6}[w]
+            return {'kind': 'index', 'value': num}
+        m = _re.search(r'\bthe\s+([a-z0-9_.\-]+)\s+clip\b', t)
+        if m and m.group(1) not in ('first', 'second', 'third', 'selected'):
+            return {'kind': 'name', 'value': m.group(1)}
+        return None
+
+    def _ai_resolve_target(self, spec):
+        """(clip_or_None, display_label, is_all). Falls back to selected/first clip."""
+        try:
+            clips = list(getattr(self.timeline, 'clips', []) or [])
+        except Exception:
+            clips = []
+        if spec and spec.get('kind') == 'all':
+            return None, "all clips", True
+        if clips and spec and spec.get('kind') == 'index':
+            i = spec['value'] - 1
+            if 0 <= i < len(clips):
+                return clips[i], 'clip %d "%s"' % (i + 1, clips[i].name), False
+            return None, "clip %d (not on timeline)" % spec['value'], False
+        if clips and spec and spec.get('kind') == 'last':
+            return clips[-1], 'last clip "%s"' % clips[-1].name, False
+        if clips and spec and spec.get('kind') == 'name':
+            q = spec['value'].lower()
+            for c in clips:
+                if q in (c.name or '').lower():
+                    return c, 'clip "%s"' % c.name, False
+            return None, 'clip named "%s" (not found)' % spec['value'], False
+        try:
+            sel = getattr(self.timeline, 'selected_clip', None)
+        except Exception:
+            sel = None
+        if sel is not None and sel in clips:
+            return sel, 'selected clip "%s"' % sel.name, False
+        if clips:
+            return clips[0], 'first clip "%s"' % clips[0].name, False
+        return None, "no clips on timeline", False
+
+    # ---------- timeline surgery ----------
+    def _ai_split_clip_at(self, clip, t):
+        """Split clip at timeline-time t. Returns (right_clip, message)."""
+        try:
+            tl = self.timeline
+            if clip not in getattr(tl, 'clips', []):
+                return None, "clip is not on the timeline"
+            start = float(clip.start_time)
+            end = float(clip.get_end_time())
+            if not (start < t < end):
+                return None, "time %s is outside the clip (%s-%s)" % (
+                    self._ai_fmt_tc(t), self._ai_fmt_tc(start), self._ai_fmt_tc(end))
+            ct = clip.timeline_time_to_clip_time(t)
+            if ct is None or not (clip.in_point < ct < clip.out_point):
+                return None, "time %s is outside the clip media" % self._ai_fmt_tc(t)
+            orig_out = clip.out_point
+            clip.out_point = ct
+            right = TimelineClip(
+                clip.file_path, clip.track, t, ct, orig_out, clip.full_duration,
+                list(getattr(clip, 'volumes', [0.0]) or [0.0]),
+                list(getattr(clip, 'normalization', [False]) or [False]),
+                getattr(clip, 'sync_offset', 0))
+            # FEATS1: keep the source-frame crop/rotation on both halves.
+            try:
+                right.crop = tuple(clip.crop) if getattr(clip, 'crop', None) else None
+                right.rotation = float(getattr(clip, 'rotation', 0) or 0)
+            except Exception:
+                pass
+            idx = tl.clips.index(clip)
+            tl.clips.insert(idx + 1, right)
+            tl.update()
+            self.update_timeline_duration()
+            return right, "ok"
+        except Exception as e:
+            return None, str(e)[:120]
+
+    def _ai_cut_range(self, clip, t0, t1):
+        """Remove [t0, t1] from clip's track and close the gap (ripple)."""
+        try:
+            tl = self.timeline
+            t0, t1 = min(t0, t1), max(t0, t1)
+            if t1 - t0 < 0.05:
+                return "range too small to cut"
+            right1, msg = self._ai_split_clip_at(clip, t1)
+            if right1 is None:
+                # t1 past the clip end: just trim the tail instead.
+                ct = clip.timeline_time_to_clip_time(t0)
+                if ct is not None and clip.in_point < ct < clip.out_point:
+                    clip.out_point = ct
+                    tl.update()
+                    self.update_timeline_duration()
+                    return "trimmed tail from %s" % self._ai_fmt_tc(t0)
+                return "cut failed: %s" % msg
+            middle, msg2 = self._ai_split_clip_at(clip, t0)
+            if middle is None:
+                return "cut failed: %s" % msg2
+            try:
+                tl.clips.remove(middle)
+            except Exception:
+                pass
+            gap = t1 - t0
+            for c in list(tl.clips):
+                try:
+                    if getattr(c, 'track', 0) == getattr(clip, 'track', 0) and c.start_time >= t1 - 1e-6:
+                        c.start_time -= gap
+                except Exception:
+                    pass
+            tl.update()
+            self.update_timeline_duration()
+            return "cut %s-%s and closed the gap" % (self._ai_fmt_tc(t0), self._ai_fmt_tc(t1))
+        except Exception as e:
+            return "cut failed: %s" % str(e)[:120]
+
+    def _ai_keep_range(self, clip, t0, t1):
+        """Keep only [t0, t1] of the clip (adjust in/out points)."""
+        try:
+            t0, t1 = min(t0, t1), max(t0, t1)
+            ct0 = clip.timeline_time_to_clip_time(t0)
+            ct1 = clip.timeline_time_to_clip_time(t1)
+            if ct0 is None or ct1 is None:
+                return "range is outside the clip"
+            if not (clip.in_point <= ct0 < ct1 <= clip.out_point):
+                return "range is outside the clip media"
+            clip.in_point = ct0
+            clip.out_point = ct1
+            self.timeline.update()
+            self.update_timeline_duration()
+            return "kept only %s-%s" % (self._ai_fmt_tc(t0), self._ai_fmt_tc(t1))
+        except Exception as e:
+            return "keep failed: %s" % str(e)[:120]
+
+    # ---------- FEATS1: crop / rotate / time-lapse ----------
+    def _selected_timeline_clip(self):
+        return getattr(self.timeline, 'selected_clip', None)
+
+    def toggle_crop_mode(self):
+        """Crop button: draw a rectangle right on the player for the selected clip."""
+        if getattr(self, '_crop_mode', False):
+            self._cancel_crop_mode()
+            self.status_label.setText("Crop cancelled.")
+            return
+        clip = self._selected_timeline_clip()
+        if clip is None:
+            self.status_label.setText("Select a timeline clip first, then Crop.")
+            return
+        vw = getattr(self, 'video_widget', None)
+        if vw is None or getattr(vw, 'mpv', None) is None:
+            self.status_label.setText("Preview is not ready - play the clip once, then Crop.")
+            return
+        try:
+            if getattr(self, '_play_uses_timeline_edl', False):
+                self.on_timeline_clip_selected(clip)
+        except Exception:
+            pass
+        # Crop is defined in SOURCE pixels: clear geometry while drawing.
+        try:
+            vw.set_video_filter("")
+        except Exception:
+            pass
+        self._crop_mode = True
+        self._crop_clip = clip
+        try:
+            ov = vw.show_crop_overlay(True)
+            try:
+                ov.cropCommitted.disconnect()
+            except Exception:
+                pass
+            try:
+                ov.cropCancelled.disconnect()
+            except Exception:
+                pass
+            ov.cropCommitted.connect(self._on_crop_committed)
+            ov.cropCancelled.connect(self._cancel_crop_mode)
+            self.status_label.setText("Crop: drag a rectangle on the video. Right-click / Esc cancels.")
+        except Exception as e:
+            self._crop_mode = False
+            self._crop_clip = None
+            self.status_label.setText(f"Crop unavailable: {e}")
+            try:
+                self.update_live_preview_filters()
+            except Exception:
+                pass
+
+    def _cancel_crop_mode(self):
+        """Leave crop mode, restoring normal preview filters. No-op when not cropping."""
+        if not getattr(self, '_crop_mode', False):
+            return
+        self._crop_mode = False
+        self._crop_clip = None
+        try:
+            if getattr(self, 'video_widget', None):
+                self.video_widget.show_crop_overlay(False)
+        except Exception:
+            pass
+        try:
+            self.update_live_preview_filters()
+        except Exception:
+            pass
+
+    def _on_crop_committed(self, qrect):
+        try:
+            vw = getattr(self, 'video_widget', None)
+            clip = getattr(self, '_crop_clip', None)
+            self._crop_mode = False
+            self._crop_clip = None
+            try:
+                if vw:
+                    vw.show_crop_overlay(False)
+            except Exception:
+                pass
+            if clip is not None and vw is not None and qrect.width() >= 4 and qrect.height() >= 4:
+                vrect = vw.map_overlay_rect_to_video(qrect)
+                if vrect:
+                    clip.crop = vrect
+                    self.status_label.setText(
+                        f"Crop {int(vrect[2])}x{int(vrect[3])} set on '{clip.name}'.")
+                    try:
+                        self.timeline.update()
+                    except Exception:
+                        pass
+                else:
+                    self.status_label.setText(
+                        "Crop failed: couldn't map the box to video pixels.")
+                    _fep_log('[fep-preview] crop mapping returned None; box dropped')
+            try:
+                self.update_live_preview_filters()
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                self.status_label.setText(f"Crop failed: {e}")
+            except Exception:
+                pass
+
+    def rotate_selected_clip(self, deg):
+        clip = self._selected_timeline_clip()
+        if clip is None:
+            self.status_label.setText("Select a timeline clip first.")
+            return
+        try:
+            clip.rotation = (float(getattr(clip, 'rotation', 0) or 0) + float(deg)) % 360.0
+        except Exception:
+            clip.rotation = 0.0
+        self.update_live_preview_filters()
+        self.status_label.setText(f"Rotation {clip.rotation:.0f}° on '{clip.name}'.")
+
+    def reset_clip_geometry(self):
+        clip = self._selected_timeline_clip()
+        if clip is None:
+            self.status_label.setText("Select a timeline clip first.")
+            return
+        clip.crop = None
+        clip.rotation = 0.0
+        self._cancel_crop_mode()
+        self.update_live_preview_filters()
+        try:
+            self.timeline.update()
+        except Exception:
+            pass
+        self.status_label.setText(f"Crop + rotation cleared on '{clip.name}'.")
+
+    def timelapse_selected_clip_dialog(self):
+        """Time-lapse button: pick a speed, render the selected clip sped up."""
+        clip = self._selected_timeline_clip()
+        if clip is None:
+            self.status_label.setText("Select a timeline clip first, then Time-lapse.")
+            return
+        try:
+            dur = clip.get_trimmed_duration()
+        except Exception:
+            dur = 0
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Time-lapse")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(f"Speed up '{clip.name}' ({dur:.1f}s)? Later clips ripple left."))
+        row = QHBoxLayout()
+        for s in (2, 4, 8, 16, 32):
+            b = QPushButton(f"{s}x")
+            b.setMinimumSize(72, 48)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _checked=False, s=s: self._timelapse_dialog_chosen(dlg, clip, float(s)))
+            row.addWidget(b)
+        lay.addLayout(row)
+        dlg.exec()
+
+    def _timelapse_dialog_chosen(self, dlg, clip, speed):
+        try:
+            dlg.accept()
+        except Exception:
+            pass
+        self._timelapse_clips([clip], speed, snapshot=True)
+
+    def _render_timelapse_for_clip(self, clip, speed, tl_dir):
+        try:
+            import hashlib as _hl
+            src = clip.file_path
+            in_p, out_p = float(clip.in_point), float(clip.out_point)
+            if out_p - in_p < 0.2:
+                return None, "clip too short"
+            key = _hl.md5(f"{src}|{in_p:.3f}|{out_p:.3f}|{speed:g}".encode("utf-8")).hexdigest()
+            dest = os.path.join(tl_dir, f"timelapse_{key}_{speed:g}x.mp4")
+            ok, new_dur = render_timelapse_subclip(
+                src, in_p, out_p, speed, dest,
+                log=lambda m: print(f"[timelapse] {m}"))
+            if not ok:
+                return None, "ffmpeg render failed (see console)"
+            nc = TimelineClip(
+                dest, clip.track, clip.start_time, 0, None, new_dur,
+                list(getattr(clip, 'volumes', [0.0]) or [0.0]),
+                list(getattr(clip, 'normalization', [False]) or [False]),
+                getattr(clip, 'sync_offset', 0))
+            return nc, "ok"
+        except Exception as e:
+            return None, str(e)[:160]
+
+    def _timelapse_clips(self, clips, speed, snapshot=True):
+        """Replace clips with rendered sped-up versions; ripple later clips left."""
+        tl = getattr(self, 'timeline', None)
+        clips = [c for c in sorted(clips, key=lambda c: c.start_time)
+                 if tl is not None and c in getattr(tl, 'clips', [])]
+        if not clips:
+            self.status_label.setText("Time-lapse: no clips.")
+            return False
+        if snapshot:
+            try:
+                self._ai_snapshot()
+            except Exception:
+                pass
+        try:
+            self.status_label.setText(f"Rendering time-lapse {speed:g}x - one moment...")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+        except Exception:
+            pass
+        ok_all = True
+        try:
+            tl_dir = os.path.join(tempfile.gettempdir(), 'FastEncodePro', 'timelapse')
+            os.makedirs(tl_dir, exist_ok=True)
+            for clip in list(clips):
+                if clip not in getattr(tl, 'clips', []):
+                    continue
+                new_clip, msg = self._render_timelapse_for_clip(clip, speed, tl_dir)
+                if new_clip is None:
+                    self.status_label.setText(f"Time-lapse failed: {msg}")
+                    ok_all = False
+                    continue
+                try:
+                    idx = tl.clips.index(clip)
+                except ValueError:
+                    continue
+                old_tl_dur = clip.get_trimmed_duration()
+                new_tl_dur = new_clip.get_trimmed_duration()
+                new_clip.start_time = clip.start_time
+                tl.clips[idx] = new_clip
+                if getattr(tl, 'selected_clip', None) is clip:
+                    tl.selected_clip = new_clip
+                delta = old_tl_dur - new_tl_dur
+                if abs(delta) > 1e-6:
+                    old_end = float(clip.start_time) + old_tl_dur
+                    for c in list(tl.clips):
+                        try:
+                            if c is not new_clip and getattr(c, 'track', 0) == getattr(clip, 'track', 0) \
+                               and float(c.start_time) >= old_end - 1e-6:
+                                c.start_time = float(c.start_time) - delta
+                        except Exception:
+                            pass
+            try:
+                tl.update()
+            except Exception:
+                pass
+            try:
+                self.update_timeline_duration()
+            except Exception:
+                pass
+            try:
+                self.load_timeline_sequence()
+            except Exception:
+                pass
+            if snapshot:
+                try:
+                    self.ai_undo_btn.setEnabled(True)
+                except Exception:
+                    pass
+            self.status_label.setText(
+                f"Time-lapse {speed:g}x done." if ok_all else "Time-lapse finished with errors.")
+        finally:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+        return ok_all
+
+    def _ai_timelapse_range(self, t0, t1, speed):
+        """AI op: time-lapse [t0, t1] - split boundaries, render sped pieces, ripple."""
+        try:
+            tl = self.timeline
+            t0, t1 = min(t0, t1), max(t0, t1)
+            if t1 - t0 < 0.2:
+                return "time-lapse: range too small"
+            for clip in list(getattr(tl, 'clips', []) or []):
+                try:
+                    s, e = float(clip.start_time), float(clip.get_end_time())
+                except Exception:
+                    continue
+                if s < t1 < e:
+                    self._ai_split_clip_at(clip, t1)
+                for c2 in list(getattr(tl, 'clips', []) or []):
+                    try:
+                        s2, e2 = float(c2.start_time), float(c2.get_end_time())
+                    except Exception:
+                        continue
+                    if s2 < t0 < e2:
+                        self._ai_split_clip_at(c2, t0)
+                        break
+            inside = []
+            for c in list(getattr(tl, 'clips', []) or []):
+                try:
+                    s, e = float(c.start_time), float(c.get_end_time())
+                except Exception:
+                    continue
+                if s >= t0 - 1e-6 and e <= t1 + 1e-6 and e - s > 0.05:
+                    inside.append(c)
+            if not inside:
+                return "time-lapse: no clips in range"
+            ok = self._timelapse_clips(inside, speed, snapshot=False)
+            return "time-lapse %s-%s at %sx: %s" % (
+                self._ai_fmt_tc(t0), self._ai_fmt_tc(t1), ("%g" % speed), "done" if ok else "failed")
+        except Exception as e:
+            return "time-lapse failed: %s" % str(e)[:120]
+
+    def split_selected_at_playhead(self):
+        """One-click (More row): split the selected clip at the playhead."""
+        c = getattr(self.timeline, 'selected_clip', None)
+        if c is None and getattr(self.timeline, 'clips', None):
+            c = self.timeline.clips[0]
+            self.timeline.selected_clip = c
+        if c is None:
+            self.status_label.setText("Split: no clips on the timeline.")
+            return
+        try:
+            t = float(getattr(self.timeline, 'playhead_position', 0.0) or 0.0)
+        except Exception:
+            t = 0.0
+        self._ai_snapshot()
+        right, msg = self._ai_split_clip_at(c, t)
+        if right is None:
+            self.status_label.setText("Split: %s." % msg)
+        else:
+            self.status_label.setText("Split \"%s\" at %s." % (c.name, self._ai_fmt_tc(t)))
+            try:
+                self.ai_undo_btn.setEnabled(True)
+            except Exception:
+                pass
+
+    # ---------- undo ----------
+    def _ai_snapshot(self):
+        """One-level undo snapshot of timeline clips + color/FX state."""
+        data = {'clips': [], 'text': [], 'audio': [], 'settings': {}}
+        try:
+            tl = self.timeline
+            for c in list(getattr(tl, 'clips', []) or []):
+                try:
+                    data['clips'].append(c.to_dict())
+                except Exception:
+                    pass
+            for t in list(getattr(tl, 'text_clips', []) or []):
+                data['text'].append({
+                    'text': getattr(t, 'text', ''), 'start': getattr(t, 'start_time', 0.0),
+                    'duration': getattr(t, 'duration', 5.0),
+                    'color': getattr(t, 'font_color', 'white'),
+                    'size': getattr(t, 'font_size', 48),
+                    'x': getattr(t, 'x', '(w-text_w)/2'), 'y': getattr(t, 'y', '(h-text_h)-50')})
+            for a in list(getattr(tl, 'audio_clips', []) or []):
+                data['audio'].append({
+                    'path': getattr(a, 'file_path', ''), 'start': getattr(a, 'start_time', 0.0),
+                    'duration': getattr(a, 'duration', 0.0)})
+            s = {}
+            try:
+                s['bw'] = bool(self.app_settings.value('color_bw_mode', False, type=bool))
+            except Exception:
+                s['bw'] = False
+            for attr in ('color_brightness_slider', 'color_contrast_slider',
+                         'color_saturation_slider', 'color_gamma_slider'):
+                w = getattr(self, attr, None)
+                s[attr] = w.value() if w is not None else 0
+            for attr in ('denoise_combo', 'deflicker_combo', 'exposure_combo',
+                         'temporal_combo', 'sharpness_combo'):
+                w = getattr(self, attr, None)
+                s[attr] = w.currentText() if w is not None else 'Off'
+            data['settings'] = s
+        except Exception:
+            pass
+        self._ai_undo_snapshot = data
+
+    def _ai_restore_snapshot(self):
+        snap = getattr(self, '_ai_undo_snapshot', None)
+        if not snap:
+            return False
+        try:
+            tl = self.timeline
+            new_clips = []
+            for d in snap.get('clips', []):
+                try:
+                    new_clips.append(TimelineClip.from_dict(d))
+                except Exception:
+                    pass
+            tl.clips = new_clips
+            tl.selected_clip = new_clips[0] if new_clips else None
+            tl.text_clips = []
+            for t in snap.get('text', []):
+                try:
+                    tc = TextClip(t['text'], t['start'], t['duration'])
+                    tc.font_color = t.get('color', 'white')
+                    tc.font_size = t.get('size', 48)
+                    tc.x = t.get('x', '(w-text_w)/2')
+                    tc.y = t.get('y', '(h-text_h)-50')
+                    tl.text_clips.append(tc)
+                except Exception:
+                    pass
+            tl.audio_clips = []
+            for a in snap.get('audio', []):
+                try:
+                    tl.audio_clips.append(AudioClip(a['path'], a['start'], a['duration']))
+                except Exception:
+                    pass
+            s = snap.get('settings', {})
+            for attr in ('color_brightness_slider', 'color_contrast_slider',
+                         'color_saturation_slider', 'color_gamma_slider'):
+                w = getattr(self, attr, None)
+                if w is not None:
+                    try:
+                        w.setValue(int(s.get(attr, 0)))
+                    except Exception:
+                        pass
+            for attr in ('denoise_combo', 'deflicker_combo', 'exposure_combo',
+                         'temporal_combo', 'sharpness_combo'):
+                w = getattr(self, attr, None)
+                if w is not None:
+                    try:
+                        w.setCurrentText(s.get(attr, 'Off'))
+                    except Exception:
+                        pass
+            try:
+                self.app_settings.setValue('color_bw_mode', bool(s.get('bw', False)))
+            except Exception:
+                pass
+            try:
+                self.update_live_preview_filters()
+            except Exception:
+                pass
+            tl.update()
+            self.update_timeline_duration()
+            return True
+        except Exception:
+            return False
+
+    def _ai_undo_clicked(self):
+        if self._ai_restore_snapshot():
+            self.status_label.setText("AI: undone - timeline restored to before the last AI apply.")
+            try:
+                self.append_log("AI: undo applied.")
+            except Exception:
+                pass
+        else:
+            self.status_label.setText("AI: nothing to undo yet.")
+
+    # ---------- capability help ----------
     def show_ai_capabilities(self):
         QMessageBox.information(self, "AI Assistant - What I Can Do",
-            "I can only do what the app can actually do. Type any of these in the AI box:\n\n"
-            "• trim / trim edges (selected clip)\n"
-            "• fade all / crossfade\n"
-            "• black and white on/off\n"
-            "• normalize audio\n"
-            "• balance / auto color balance\n"
-            "• sync audio\n"
-            "• add text \"your words here\"\n"
-            "• record voiceover\n"
-            "• reset filters\n"
-            "• add to timeline / remove clip / clear timeline\n"
-            "• zoom in / zoom out\n"
-            "• mark in / mark out (media trim)\n"
-            "• export / stop\n\n"
-            "Example: 'trim edges, fade all, normalize and export'\n"
-            "You always preview before anything runs.")
+            "I only do what the app can actually do - nothing is invented. "
+            "You always review the plan before anything runs, and you can undo it after.\n\n"
+            "CUTS (give timecodes like 1:23 or 90 seconds):\n"
+            "\u2022 split at 1:23 / split clip 2 at 0:45 and 2:10\n"
+            "\u2022 cut from 1:00 to 1:30 (removes it and closes the gap)\n"
+            "\u2022 keep only from 0:10 to 0:20\n"
+            "\u2022 cut the first 10 seconds / cut the last 5 seconds\n"
+            "\u2022 timelapse from 1:00 to 1:30 at 8x / timelapse clip 2 at 4x\n"
+            "\u2022 trim start to 1:00 / trim end to 2:30 / trim edges\n\n"
+            "COLOR & FILTERS:\n"
+            "\u2022 make it brighter / darker / warmer / cooler\n"
+            "\u2022 more contrast / vivid / muted / cinematic / vintage / black and white\n"
+            "\u2022 denoise / sharpen / deflicker (add 'light' or 'heavy')\n"
+            "\u2022 balance (auto color balance) / reset filters\n\n"
+            "AUDIO:\n"
+            "\u2022 normalize / volume up / volume down / mute / unmute\n"
+            "\u2022 volume to -6db / sync audio\n\n"
+            "TIMELINE:\n"
+            "\u2022 add a 2 second dissolve / fade all / move clip 2 to 45 seconds\n"
+            "\u2022 add text \"hello\" at 5 seconds for 3 seconds\n"
+            "\u2022 select clip 2 / remove clip / clear timeline\n"
+            "\u2022 mark in / mark out / record voiceover / export\n\n"
+            "TARGETING: \"clip 2\", \"the interview clip\", \"last clip\", or \"all clips\".\n"
+            "No clip named? It uses the selected clip, else the first one.\n\n"
+            "Example: 'on clip 2, cut from 1:00 to 1:30, make it warmer, normalize and export'")
 
+    # ---------- plan builder ----------
     def _ai_build_plan(self, prompt):
         import re as _re
         text = (prompt or "").strip()
-        low = text.lower()
-        if not low:
+        if not text:
             return []
-        # Split multi-intent prompts: "trim, fade all and normalize" -> 3 chunks
-        chunks = _re.split(r'\s+then\s+|\s+and\s+|[,;+&]+|\n+', low)
-        chunks = [c.strip() for c in chunks if c.strip()]
-        if not chunks:
-            chunks = [low]
-        plan = []
-        seen = set()
-        def _add(key, label):
-            if key not in seen:
-                seen.add(key)
-                plan.append({"key": key, "label": label})
-        # Extract quoted text for Text action: "add text \"hello\"" or text: hello
+        # 1) pull out quoted text first (quotes may contain time-like words)
         quoted = ""
         try:
             m = _re.search(r'"([^"]+)"', text)
@@ -9815,59 +12781,441 @@ class FastEncodeProApp(QMainWindow):
                     m3 = _re.search(r'text\s*[:\-]\s*(.+)', text, flags=_re.IGNORECASE)
                     if m3:
                         quoted = m3.group(1).strip()[:120]
+            if quoted:
+                text = text.replace('"%s"' % quoted, '__QUOTE__', 1)
+                text = text.replace("'%s'" % quoted, '__QUOTE__', 1)
         except Exception:
             quoted = ""
+        low = text.lower()
+        # 2) global clip target ("clip 2", "the interview clip", "all clips")
+        target = self._ai_target_spec(low)
+        # 3) protect ranges so chunk-splitting can't break "A to B" / "A and B"
+        ranges = {}
+        low = self._ai_protect_ranges(low, ranges)
+        # 4) protect "black and white" from the "and"-splitter
+        low = low.replace("black and white", "black_and_white").replace("black & white", "black_and_white")
+        chunks = _re.split(r'\s+then\s+|\s+and\s+|[,;+&]+|\n+', low)
+        chunks = [c.strip(' .') for c in chunks if c.strip(' .')]
+        if not chunks:
+            chunks = [low]
+        plan = []
+        seen = set()
+        ctx = {'last_cut': None}  # verb inheritance for orphan timecode chunks
+
+        def _add(key, label, clip=None, params=None, all_clips=False):
+            sig = (key, str(params))
+            if sig in seen:
+                return
+            seen.add(sig)
+            plan.append({"key": key, "label": label, "clip": clip,
+                         "params": params or {}, "all": all_clips})
+
+        def _target_for(chunk):
+            spec = self._ai_target_spec(chunk) or target
+            return self._ai_resolve_target(spec)
+
         for ch in chunks:
-            # Order matters: check specific/clear first so "remove bw" doesn't eat "remove clip"
-            if any(k in ch for k in ("clear timeline", "clear all", "remove all clips", "empty timeline")):
-                _add("clear", "Clear timeline (asks to confirm)")
-            elif any(k in ch for k in ("add to timeline", "add media", "add clip", "add video", "put on timeline", "put it on the timeline")):
-                _add("add", "Add selected library media to timeline")
-            elif any(k in ch for k in ("remove clip", "delete clip", "remove selected")):
-                _add("remove", "Remove selected timeline clip")
-            if any(k in ch for k in ("trim", "cut edges", "remove ends", "auto-trim", "autotrim")):
-                _add("trim", "Auto-trim 1s off selected clip edges")
-            if "fade" in ch or "crossfade" in ch or "dissolve" in ch:
-                _add("fade", "Fade all clips (1s)")
-            # B&W with on/off detection
-            if any(k in ch for k in ("black and white", "black & white", "b&w", "grayscale", "greyscale")) or ch.strip() == "bw":
-                if any(k in ch for k in ("remove", "off", "disable", "restore color", "back to color")):
-                    _add("bw_off", "Remove Black & White (restore color)")
-                else:
-                    _add("bw_on", "Apply Black & White")
-            if any(k in ch for k in ("normalize", "normalise", "loudnorm", "level audio", "loudness", "boost audio")):
-                _add("norm", "Normalize audio (all clips)")
-            if any(k in ch for k in ("balance", "white balance", "color correct", "auto color")):
-                _add("balance", "Auto color balance")
-            if "sync" in ch or "align audio" in ch or "lip sync" in ch:
-                _add("sync", "Auto-sync audio tracks")
-            if any(k in ch for k in ("lower third", "caption", "title", "overlay text")) or ("text" in ch):
-                lbl = f'Add text "{quoted}"' if quoted else "Add text overlay (asks for words)"
-                _add("text", lbl)
-            if any(k in ch for k in ("voiceover", "voice over", "narration", "narrate")) or ("record" in ch and "audio" in ch) or ch.strip() in ("vo", "record"):
-                _add("vo", "Record voiceover at playhead")
-            if any(k in ch for k in ("reset", "clear filters", "remove filters")):
-                _add("reset", "Reset all color/FX filters")
-            if "zoom out" in ch:
-                _add("zoomout", "Zoom timeline out")
-            elif "zoom in" in ch:
-                _add("zoomin", "Zoom timeline in")
-            if "mark out" in ch or "out point" in ch or ch.strip() == "out":
-                _add("out", "Mark media Out-point at preview pos")
-            elif "mark in" in ch or "in point" in ch or ch.strip() in ("in", "mark in-point"):
-                _add("in", "Mark media In-point at preview pos")
-            if any(k in ch for k in ("export", "render", "encode video", "save video")):
-                _add("export", "Export timeline")
-            elif ch.strip() == "stop":
-                _add("stop", "Stop export")
-        if quoted and not any(p["key"] == "text" for p in plan) and "text" in low:
-            _add("text", f'Add text "{quoted}"')
-        # stash quoted text for apply step
+            ch = ch.replace('__quote__', '"%s"' % quoted if quoted else '')
+            if _re.match(r"^(don't|do not|no|without|never)\b", ch):
+                continue
+            self._ai_plan_chunk(ch, plan, _add, quoted, ranges, target, _target_for, ctx)
         try:
             self._ai_quoted_text = quoted
         except Exception:
             pass
         return plan
+
+    def _ai_plan_chunk(self, ch, plan, _add, quoted, ranges, target, _target_for, ctx):
+        import re as _re
+        clip, clabel, is_all = _target_for(ch)
+        tcs = self._ai_find_timecodes(ch)
+        range_keys = _re.findall(r'__range\d+__', ch)
+        has_range = bool(range_keys)
+
+        def _need_clip(op_label):
+            if clip is None and not is_all:
+                _add("noop", "%s: skipped (%s)" % (op_label, clabel))
+                return None
+            return clip
+
+        # --- undo ---
+        if ch.strip() in ("undo", "undo that", "undo ai", "undo last") or "undo last ai" in ch:
+            _add("undo", "Undo the last AI apply")
+            return
+        # --- clear / add / remove / zoom (from v1) ---
+        if any(k in ch for k in ("clear timeline", "clear all", "remove all clips", "empty timeline")):
+            _add("clear", "Clear timeline (asks to confirm)")
+            return
+        if any(k in ch for k in ("add to timeline", "add media", "add clip", "add video",
+                                 "put on timeline", "put it on the timeline")):
+            _add("add", "Add selected library media to timeline")
+            return
+        if any(k in ch for k in ("remove clip", "delete clip", "remove selected")) and not has_range:
+            if _need_clip("Remove clip") is not None or is_all:
+                _add("remove", "Remove %s" % clabel, clip)
+            return
+        if ch.strip().startswith("select ") or "select clip" in ch:
+            c = _need_clip("Select")
+            if c is not None:
+                _add("select", "Select %s" % clabel, c)
+            return
+        if "zoom out" in ch:
+            _add("zoomout", "Zoom timeline out")
+            return
+        if "zoom in" in ch:
+            _add("zoomin", "Zoom timeline in")
+            return
+        # --- range ops: cut / keep / split ---
+        if has_range:
+            rk = range_keys[0]
+            t0, t1 = ranges[rk]
+            rng = "%s\u2013%s" % (self._ai_fmt_tc(t0), self._ai_fmt_tc(t1))
+            if any(k in ch for k in ("timelapse", "time lapse", "time-lapse", "timelaps",
+                                     "speed up", "speedup")):
+                sp = 8.0
+                m = _re.search(r'(\d+(?:\.\d+)?)\s*x\b', ch)
+                if m:
+                    try:
+                        sp = float(m.group(1))
+                    except Exception:
+                        pass
+                sp = min(64.0, max(1.25, sp))
+                _add("timelapse", "Time-lapse %s at %sx" % (rng, ("%g" % sp)), None,
+                     {"t0": t0, "t1": t1, "speed": sp})
+                return
+            if any(k in ch for k in ("keep only", "keep just", "extract")):
+                c = _need_clip("Keep")
+                if c is not None:
+                    _add("keep_range", "Keep only %s of %s" % (rng, clabel), c, {"t0": t0, "t1": t1})
+                return
+            if "split" in ch:
+                c = _need_clip("Split")
+                if c is not None:
+                    _add("split", "Split %s at %s" % (clabel, self._ai_fmt_tc(t0)), c, {"t": t0})
+                    _add("split", "Split %s at %s" % (clabel, self._ai_fmt_tc(t1)), c, {"t": t1})
+                    ctx['last_cut'] = 'split'
+                return
+            if any(k in ch for k in ("cut", "remove", "delete", "drop", "clear out")):
+                c = _need_clip("Cut")
+                if c is not None:
+                    _add("cut_range", "Cut %s from %s and close the gap" % (rng, clabel), c,
+                         {"t0": t0, "t1": t1})
+                    ctx['last_cut'] = 'cut_range'
+                return
+            # bare range with a cutting verb seen earlier
+            if ctx.get('last_cut') in ('split',):
+                c = _need_clip("Split")
+                if c is not None:
+                    _add("split", "Split %s at %s" % (clabel, self._ai_fmt_tc(t0)), c, {"t": t0})
+                    _add("split", "Split %s at %s" % (clabel, self._ai_fmt_tc(t1)), c, {"t": t1})
+                return
+        # --- split at timecode(s) ---
+        if "split" in ch and tcs:
+            c = _need_clip("Split")
+            if c is not None:
+                for _, _, s in tcs:
+                    _add("split", "Split %s at %s" % (clabel, self._ai_fmt_tc(s)), c, {"t": s})
+                ctx['last_cut'] = 'split'
+            return
+        if "split" in ch and not tcs:
+            _add("noop", "Split: skipped (no timecode given - say 'split at 1:23')")
+            return
+        # orphan timecode chunk inherits the last cutting verb ("split at 1:00 and 2:00")
+        if tcs and ctx.get('last_cut') == 'split' and not any(
+                k in ch for k in ("fade", "dissolve", "transition", "volume", "normalize",
+                                  "text", "move", "trim", "cut", "keep", "grade", "color")):
+            c = _need_clip("Split")
+            if c is not None:
+                for _, _, s in tcs:
+                    _add("split", "Split %s at %s" % (clabel, self._ai_fmt_tc(s)), c, {"t": s})
+            return
+        # --- timelapse a clip / all (no range given) ---
+        if any(k in ch for k in ("timelapse", "time lapse", "time-lapse",
+                                 "speed up", "speedup")) and not has_range:
+            sp = 8.0
+            m = _re.search(r'(\d+(?:\.\d+)?)\s*x\b', ch)
+            if m:
+                try:
+                    sp = float(m.group(1))
+                except Exception:
+                    pass
+            sp = min(64.0, max(1.25, sp))
+            c = _need_clip("Time-lapse")
+            if c is not None or is_all:
+                _add("timelapse", "Time-lapse %s at %sx" % (clabel if not is_all else "all clips", ("%g" % sp)),
+                     None if is_all else c, {"speed": sp, "all": bool(is_all)})
+            return
+        # --- trim variants ---
+        m = _re.search(r'(?:first|opening)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|second)', ch)
+        if m and any(k in ch for k in ("cut", "trim", "remove", "drop", "delete")):
+            c = _need_clip("Trim")
+            if c is not None:
+                n = float(m.group(1))
+                _add("trim_first_n", "Cut first %ss of %s" % (m.group(1), clabel), c, {"n": n})
+            return
+        m = _re.search(r'(?:last|final|closing)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|second)', ch)
+        if m and any(k in ch for k in ("cut", "trim", "remove", "drop", "delete")):
+            c = _need_clip("Trim")
+            if c is not None:
+                n = float(m.group(1))
+                _add("trim_last_n", "Cut last %ss of %s" % (m.group(1), clabel), c, {"n": n})
+            return
+        if tcs and any(k in ch for k in ("trim start", "start at", "begin at", "set start")):
+            c = _need_clip("Trim")
+            if c is not None:
+                _add("trim_in_to", "Trim start of %s to %s" % (clabel, self._ai_fmt_tc(tcs[0][2])),
+                     c, {"t": tcs[0][2]})
+            return
+        if tcs and any(k in ch for k in ("trim end", "end at", "set end", "finish at")):
+            c = _need_clip("Trim")
+            if c is not None:
+                _add("trim_out_to", "Trim end of %s to %s" % (clabel, self._ai_fmt_tc(tcs[0][2])),
+                     c, {"t": tcs[0][2]})
+            return
+        if any(k in ch for k in ("trim", "cut edges", "remove ends", "auto-trim", "autotrim")):
+            _add("trim", "Auto-trim 1s off selected clip edges")
+            return
+        # --- fades & transitions ---
+        _trans_alias = {
+            "fadeblack": "fadeblack", "fade black": "fadeblack", "fade to black": "fadeblack",
+            "fadewhite": "fadewhite", "fade white": "fadewhite", "fade to white": "fadewhite",
+            "dissolve": "dissolve", "wipe left": "wipeleft", "wipe right": "wiperight",
+            "wipe up": "wipeup", "wipe down": "wipedown", "wipe": "wipeleft",
+            "slide left": "slideleft", "slide right": "slideright", "slide up": "slideup",
+            "slide down": "slidedown", "slide": "slideleft", "circle": "circlecrop",
+            "circlecrop": "circlecrop", "pixelize": "pixelize", "pixelate": "pixelize",
+        }
+        found_trans = None
+        for alias, real in _trans_alias.items():
+            if alias in ch:
+                found_trans = real
+                break
+        if found_trans and ("transition" in ch or tcs or "add" in ch or "apply" in ch or ch.strip() == found_trans):
+            c = _need_clip("Transition")
+            if c is not None:
+                dur = tcs[0][2] if tcs else 1.0
+                dur = max(0.1, min(5.0, dur))
+                _add("transition", "Apply %s transition (%ss) to %s" % (found_trans, dur, clabel),
+                     c, {"name": found_trans, "dur": dur})
+            return
+        if "fade" in ch or "crossfade" in ch:
+            dur = tcs[0][2] if tcs else 1.0
+            dur = max(0.1, min(5.0, dur))
+            _add("fade", "Fade all clips (%ss)" % dur, params={"dur": dur})
+            return
+        # --- black & white ---
+        if any(k in ch for k in ("black_and_white", "black and white", "b&w", "grayscale",
+                                 "greyscale")) or ch.strip() == "bw":
+            if any(k in ch for k in ("remove", "off", "disable", "restore color", "back to color")):
+                _add("bw_off", "Remove Black & White (restore color)")
+            else:
+                _add("bw_on", "Apply Black & White")
+            return
+        # --- color grading presets (absolute slider sets, combined freely) ---
+        _grades = [
+            (("brighter", "brighten", "too dark"), {"brightness": 35}, "Brighter"),
+            (("darker", "darken", "too bright"), {"brightness": -35}, "Darker"),
+            (("more contrast", "punchy", "increase contrast"), {"contrast": 30}, "More contrast"),
+            (("less contrast", "reduce contrast"), {"contrast": -25}, "Flatter"),
+            (("vivid", "more saturat", "saturate"), {"saturation": 45}, "Vivid"),
+            (("muted", "less saturat", "desaturat"), {"saturation": -40}, "Muted"),
+            (("warmer", "warm it", "warm up"), {"gamma": 80, "saturation": 20}, "Warmer"),
+            (("cooler", "cool it", "cool down"), {"gamma": -80, "saturation": 15}, "Cooler"),
+            (("cinematic",), {"contrast": 25, "saturation": -20, "gamma": 40}, "Cinematic look"),
+            (("vintage", "retro", "faded look"), {"contrast": -30, "saturation": -35, "brightness": 12}, "Vintage"),
+        ]
+        grade_hit = False
+        for triggers, preset, gname in _grades:
+            if any(k in ch for k in triggers):
+                _add("grade", "Color grade: %s" % gname, params={"preset": preset, "name": gname},
+                     all_clips=is_all)
+                grade_hit = True
+        if grade_hit:
+            return
+        # --- FX filters ---
+        _fx_hit = False
+        def _fx_level(default="Medium"):
+            if any(k in ch for k in ("light", "slight", "a little", "subtle")):
+                return "Light"
+            if any(k in ch for k in ("heavy", "strong", "very", "max")):
+                return "Very Heavy" if default == "denoise" else "Heavy"
+            if any(k in ch for k in ("off", "disable", "remove")):
+                return "Off"
+            return default
+        if "denoise" in ch:
+            _add("fx", "Denoise: %s" % _fx_level("denoise"),
+                 params={"combo": "denoise_combo", "value": _fx_level("denoise")})
+            _fx_hit = True
+        if "sharpen" in ch or "sharpness" in ch:
+            _add("fx", "Sharpness: %s" % _fx_level(),
+                 params={"combo": "sharpness_combo", "value": _fx_level()})
+            _fx_hit = True
+        if "deflicker" in ch:
+            _add("fx", "Deflicker: %s" % _fx_level(),
+                 params={"combo": "deflicker_combo", "value": _fx_level()})
+            _fx_hit = True
+        if "temporal" in ch:
+            _add("fx", "Temporal: %s" % _fx_level(),
+                 params={"combo": "temporal_combo", "value": _fx_level()})
+            _fx_hit = True
+        if "exposure" in ch:
+            val = "+0.1" if any(k in ch for k in ("up", "brighter", "increase", "+")) else \
+                  "-0.1" if any(k in ch for k in ("down", "darker", "decrease", "-")) else "+0.1"
+            if "off" in ch:
+                val = "Off"
+            _add("fx", "Exposure: %s" % val, params={"combo": "exposure_combo", "value": val})
+            _fx_hit = True
+        if _fx_hit:
+            return
+        # --- audio: normalize / volume ---
+        if any(k in ch for k in ("normalize", "normalise", "loudnorm", "level audio",
+                                 "loudness", "boost audio")):
+            _add("norm", "Normalize audio (all clips)")
+            return
+        m = _re.search(r'volume\s+(?:to\s+)?(-?\d+(?:\.\d+)?)\s*(?:db)?\b', ch)
+        if m and any(k in ch for k in ("volume", "db", "gain")):
+            c = _need_clip("Volume")
+            if c is not None or is_all:
+                db = max(-60.0, min(30.0, float(m.group(1))))
+                _add("volume", "Set volume to %sdB (%s)" % (m.group(1), clabel if not is_all else "all clips"),
+                     c, {"mode": "abs", "value": db}, all_clips=is_all)
+            return
+        if "unmute" in ch or "full volume" in ch:
+            c = _need_clip("Volume")
+            if c is not None or is_all:
+                _add("volume", "Unmute (%s)" % (clabel if not is_all else "all clips"),
+                     c, {"mode": "abs", "value": 0.0}, all_clips=is_all)
+            return
+        if "mute" in ch:
+            c = _need_clip("Volume")
+            if c is not None or is_all:
+                _add("volume", "Mute (%s)" % (clabel if not is_all else "all clips"),
+                     c, {"mode": "abs", "value": -60.0}, all_clips=is_all)
+            return
+        if any(k in ch for k in ("volume up", "turn it up", "turn up", "louder", "increase volume")):
+            c = _need_clip("Volume")
+            if c is not None or is_all:
+                _add("volume", "Volume up 6dB (%s)" % (clabel if not is_all else "all clips"),
+                     c, {"mode": "delta", "value": 6.0}, all_clips=is_all)
+            return
+        if any(k in ch for k in ("volume down", "turn it down", "turn down", "quieter", "decrease volume")):
+            c = _need_clip("Volume")
+            if c is not None or is_all:
+                _add("volume", "Volume down 6dB (%s)" % (clabel if not is_all else "all clips"),
+                     c, {"mode": "delta", "value": -6.0}, all_clips=is_all)
+            return
+        # --- balance / sync ---
+        if any(k in ch for k in ("balance", "white balance", "color correct", "auto color")):
+            _add("balance", "Auto color balance")
+            return
+        if "sync" in ch or "align audio" in ch or "lip sync" in ch:
+            _add("sync", "Auto-sync audio tracks")
+            return
+        # --- text overlay ---
+        if any(k in ch for k in ("lower third", "caption", "title", "overlay text")) or "text" in ch:
+            at = tcs[0][2] if tcs and any(k in ch for k in (" at ", " at")) else None
+            dur = 5.0
+            md = _re.search(r'for\s+(\d+(?:\.\d+)?)\s*(?:s|sec)', ch)
+            if md:
+                dur = float(md.group(1))
+            if quoted:
+                lbl = 'Add text "%s"' % quoted
+                if at is not None:
+                    lbl += " at %s for %ss" % (self._ai_fmt_tc(at), dur)
+                _add("text", lbl, params={"at": at, "dur": dur})
+            else:
+                _add("text", "Add text overlay (asks for words)")
+            return
+        # --- voiceover / reset ---
+        if any(k in ch for k in ("voiceover", "voice over", "narration", "narrate")) or \
+           ("record" in ch and "audio" in ch) or ch.strip() in ("vo", "record"):
+            _add("vo", "Record voiceover at playhead")
+            return
+        if any(k in ch for k in ("reset", "clear filters", "remove filters")):
+            _add("reset", "Reset all color/FX filters")
+            return
+        # --- move clip ---
+        if "move" in ch:
+            c = _need_clip("Move")
+            if c is not None:
+                if any(k in ch for k in ("beginning", "start", "front")) and not tcs:
+                    _add("move", "Move %s to the beginning" % clabel, c, {"t": 0.0})
+                elif "end" in ch and not tcs:
+                    try:
+                        _add("move", "Move %s to the end" % clabel, c,
+                             {"t": float(self.timeline.get_timeline_duration())})
+                    except Exception:
+                        _add("noop", "Move: skipped (could not read timeline length)")
+                elif tcs:
+                    _add("move", "Move %s to %s" % (clabel, self._ai_fmt_tc(tcs[0][2])), c,
+                         {"t": tcs[0][2]})
+                else:
+                    _add("noop", "Move: skipped (say where - e.g. 'move clip 2 to 45 seconds')")
+            return
+        # --- media in/out points (source trim, from v1) ---
+        if "mark out" in ch or "out point" in ch or ch.strip() == "out":
+            _add("out", "Mark media Out-point at preview pos")
+            return
+        if "mark in" in ch or "in point" in ch or ch.strip() in ("in", "mark in-point"):
+            _add("in", "Mark media In-point at preview pos")
+            return
+        # --- export / stop ---
+        if any(k in ch for k in ("export", "render", "encode video", "save video")):
+            _add("export", "Export timeline")
+            return
+        if ch.strip() == "stop":
+            _add("stop", "Stop export")
+            return
+        # --- fallback: orphan timecode after a cut verb was already handled above;
+        # anything else unrecognized is reported, never guessed. ---
+        if quoted and "text" in ch and not any(p["key"] == "text" for p in plan):
+            _add("text", 'Add text "%s"' % quoted, params={"at": None, "dur": 5.0})
+
+    def _ai_confirm_plan(self, prompt, plan):
+        """Big-button review dialog. Returns True only on explicit Apply."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QListWidget,
+                                     QLabel, QPushButton)
+        from PyQt6.QtCore import Qt
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI Plan - review before anything runs")
+        dlg.setMinimumWidth(560)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(12)
+        lay.setContentsMargins(20, 20, 20, 20)
+        q = QLabel('You asked: "%s"' % (prompt or "")[:220])
+        q.setWordWrap(True)
+        q.setStyleSheet("font-size: 13px; color: #7df9ff;")
+        lay.addWidget(q)
+        info = QLabel("I will do ONLY these real actions, in order. Nothing is invented.")
+        info.setWordWrap(True)
+        info.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.7);")
+        lay.addWidget(info)
+        lst = QListWidget()
+        lst.setStyleSheet("font-size: 14px;")
+        for i, p in enumerate(plan, 1):
+            lst.addItem("%d. %s" % (i, p["label"]))
+        lay.addWidget(lst)
+        note = QLabel("Tip: the \u21a9 Undo button next to Apply restores everything if you don't like the result.")
+        note.setWordWrap(True)
+        note.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.45);")
+        lay.addWidget(note)
+        row = QHBoxLayout()
+        row.setSpacing(16)
+        no = QPushButton("\u2715 Cancel")
+        no.setMinimumSize(200, 64)
+        no.setStyleSheet("font-size: 16px; font-weight: 700;")
+        no.setCursor(Qt.CursorShape.PointingHandCursor)
+        no.clicked.connect(dlg.reject)
+        yes = QPushButton("\u2713 Apply")
+        yes.setMinimumSize(220, 64)
+        yes.setStyleSheet("font-size: 16px; font-weight: 700; background: #00ff88; color: black; border-radius: 10px;")
+        yes.setCursor(Qt.CursorShape.PointingHandCursor)
+        yes.clicked.connect(dlg.accept)
+        row.addWidget(no)
+        row.addStretch()
+        row.addWidget(yes)
+        lay.addLayout(row)
+        return dlg.exec() == QDialog.DialogCode.Accepted
 
     def run_ai_assist(self):
         prompt = ""
@@ -9880,38 +13228,207 @@ class FastEncodeProApp(QMainWindow):
             self.show_ai_capabilities()
             self.status_label.setText("AI: didn't understand - showing what I can do.")
             return
-        preview = "\n".join(f"• {p['label']}" for p in plan)
-        reply = QMessageBox.question(self, "AI Plan - Apply?",
-            f"You asked:\n\"{(prompt or '')[:200]}\"\n\nI will do only these real actions:\n{preview}\n\nApply in order?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
+        if not self._ai_confirm_plan(prompt, plan):
             self.status_label.setText("AI: cancelled, nothing changed.")
             return
         self._ai_apply_plan(plan)
 
+    def _ai_apply_grade(self, preset):
+        mapping = {'brightness': 'color_brightness_slider', 'contrast': 'color_contrast_slider',
+                   'saturation': 'color_saturation_slider', 'gamma': 'color_gamma_slider'}
+        for k, v in (preset or {}).items():
+            w = getattr(self, mapping.get(k, ''), None)
+            if w is not None:
+                try:
+                    w.setValue(max(w.minimum(), min(w.maximum(), int(v))))
+                except Exception:
+                    pass
+        try:
+            self.update_live_preview_filters()
+        except Exception:
+            pass
+
+    def _ai_apply_volume(self, clip, mode, value, all_clips=False):
+        targets = list(getattr(self.timeline, 'clips', []) or []) if all_clips else [clip]
+        for c in targets:
+            if c is None:
+                continue
+            try:
+                n = max(1, len(getattr(c, 'volumes', None) or [0.0]))
+                cur = list(getattr(c, 'volumes', [0.0]) or [0.0])
+                cur = (cur + [0.0] * n)[:n]
+                if mode == 'delta':
+                    new = [min(30.0, max(-60.0, v + value)) for v in cur]
+                else:
+                    new = [min(30.0, max(-60.0, float(value)))] * n
+                c.volumes = new
+                while len(getattr(c, 'normalization', [])) < len(c.volumes):
+                    c.normalization.append(False)
+            except Exception:
+                pass
+        # reflect on the mixer when the selected clip was touched
+        try:
+            sel = getattr(self.timeline, 'selected_clip', None)
+            if sel is not None and sel in targets and getattr(sel, 'volumes', None):
+                if hasattr(self, 'track1_slider'):
+                    self.track1_slider.setValue(int(sel.volumes[0]))
+                if len(sel.volumes) > 1 and hasattr(self, 'track2_slider'):
+                    self.track2_slider.setValue(int(sel.volumes[1]))
+        except Exception:
+            pass
+        try:
+            self.timeline.update()
+            self.update_timeline_duration()
+        except Exception:
+            pass
+
     def _ai_apply_plan(self, plan):
         quoted = getattr(self, '_ai_quoted_text', '') or ""
+        # Snapshot FIRST so Undo always restores the pre-apply state.
+        try:
+            self._ai_snapshot()
+        except Exception:
+            pass
         results = []
         for p in plan:
             key = p["key"]
+            clip = p.get("clip")
+            params = p.get("params") or {}
+            all_clips = p.get("all", False)
             try:
-                if key == "trim":
+                if clip is not None and clip not in getattr(self.timeline, 'clips', []):
+                    # clip vanished mid-plan (e.g. removed earlier in the plan)
+                    clip, _, _ = self._ai_resolve_target(None)
+                if key == "noop":
+                    results.append(p["label"])
+                elif key == "undo":
+                    if self._ai_restore_snapshot():
+                        results.append("undo: restored")
+                    else:
+                        results.append("undo: nothing to undo")
+                elif key in ("trim_first_n", "trim_last_n", "trim_in_to", "trim_out_to") and clip is None:
+                    results.append("%s: skipped (no clip)" % key)
+                elif key == "split":
+                    if clip is None:
+                        results.append("split: skipped (no clip)")
+                    else:
+                        _, msg = self._ai_split_clip_at(clip, float(params.get("t", 0)))
+                        results.append("split @%s: %s" % (self._ai_fmt_tc(params.get("t", 0)), msg))
+                elif key == "timelapse":
+                    sp = float(params.get("speed", 8) or 8)
+                    if params.get("all"):
+                        _ok = self._timelapse_clips(list(getattr(self.timeline, 'clips', []) or []), sp, snapshot=False)
+                        results.append("time-lapse all at %sx: %s" % (("%g" % sp), "done" if _ok else "failed"))
+                    elif params.get("t0") is not None and params.get("t1") is not None:
+                        results.append(self._ai_timelapse_range(float(params["t0"]), float(params["t1"]), sp))
+                    elif clip is None:
+                        results.append("timelapse: skipped (no clip)")
+                    else:
+                        _ok = self._timelapse_clips([clip], sp, snapshot=False)
+                        results.append("time-lapse at %sx: %s" % (("%g" % sp), "done" if _ok else "failed"))
+                elif key == "cut_range":
+                    if clip is None:
+                        results.append("cut: skipped (no clip)")
+                    else:
+                        results.append(self._ai_cut_range(clip, float(params["t0"]), float(params["t1"])))
+                elif key == "keep_range":
+                    if clip is None:
+                        results.append("keep: skipped (no clip)")
+                    else:
+                        results.append(self._ai_keep_range(clip, float(params["t0"]), float(params["t1"])))
+                elif key == "trim_first_n":
+                    n = float(params.get("n", 0))
+                    clip.in_point = min(clip.in_point + n, clip.out_point - 0.1)
+                    self.timeline.update()
+                    self.update_timeline_duration()
+                    results.append("trimmed first %ss" % params.get("n"))
+                elif key == "trim_last_n":
+                    n = float(params.get("n", 0))
+                    clip.out_point = max(clip.out_point - n, clip.in_point + 0.1)
+                    self.timeline.update()
+                    self.update_timeline_duration()
+                    results.append("trimmed last %ss" % params.get("n"))
+                elif key == "trim_in_to":
+                    ct = clip.timeline_time_to_clip_time(float(params["t"]))
+                    if ct is not None and clip.in_point < ct < clip.out_point:
+                        clip.in_point = ct
+                        results.append("start trimmed to %s" % self._ai_fmt_tc(params["t"]))
+                    else:
+                        results.append("trim start: time outside clip")
+                    self.timeline.update()
+                    self.update_timeline_duration()
+                elif key == "trim_out_to":
+                    ct = clip.timeline_time_to_clip_time(float(params["t"]))
+                    if ct is not None and clip.in_point < ct < clip.out_point:
+                        clip.out_point = ct
+                        results.append("end trimmed to %s" % self._ai_fmt_tc(params["t"]))
+                    else:
+                        results.append("trim end: time outside clip")
+                    self.timeline.update()
+                    self.update_timeline_duration()
+                elif key == "trim":
                     if not getattr(self.timeline, 'selected_clip', None):
-                        # Help non-editors: operate on first clip if nothing selected
                         if self.timeline.clips:
                             self.timeline.selected_clip = self.timeline.clips[0]
                             self.timeline.update()
                     self.auto_trim_selected()
                     results.append("trim: done")
                 elif key == "fade":
-                    self.auto_fade_all()
-                    results.append("fade: done")
+                    dur = float(params.get("dur", 1.0) or 1.0)
+                    if len(self.timeline.clips) < 2:
+                        results.append("fade: need 2+ clips")
+                    else:
+                        for i in range(len(self.timeline.clips) - 1):
+                            c = self.timeline.clips[i]
+                            c.transition_type = 'fade'
+                            c.transition_duration = dur
+                        self.timeline.update()
+                        self.update_timeline_duration()
+                        results.append("fade: %ss on all clips" % dur)
+                elif key == "transition":
+                    if clip is None:
+                        results.append("transition: skipped (no clip)")
+                    else:
+                        self.timeline.selected_clip = clip
+                        try:
+                            idx = self.transitions_combo.findText(params["name"])
+                            if idx >= 0:
+                                self.transitions_combo.setCurrentIndex(idx)
+                        except Exception:
+                            pass
+                        try:
+                            self.trans_duration_spin.setValue(float(params.get("dur", 1.0)))
+                        except Exception:
+                            pass
+                        self.apply_transition_to_selected()
+                        results.append("transition %s: done" % params["name"])
                 elif key == "bw_on":
                     self.auto_black_and_white(force_on=True)
                     results.append("b&w: on")
                 elif key == "bw_off":
                     self.auto_black_and_white(force_on=False)
                     results.append("b&w: off")
+                elif key == "grade":
+                    self._ai_apply_grade(params.get("preset"))
+                    results.append("grade: %s" % params.get("name", "applied"))
+                elif key == "fx":
+                    w = getattr(self, params.get("combo", ""), None)
+                    if w is not None:
+                        try:
+                            w.setCurrentText(params["value"])
+                        except Exception:
+                            pass
+                        try:
+                            self.update_live_preview_filters()
+                        except Exception:
+                            pass
+                        results.append("%s: %s" % (params.get("combo", "fx").replace("_combo", ""), params["value"]))
+                    else:
+                        results.append("fx: control not found")
+                elif key == "volume":
+                    self._ai_apply_volume(clip, params.get("mode", "abs"),
+                                          float(params.get("value", 0.0)), all_clips)
+                    results.append("volume: done")
                 elif key == "norm":
                     self.auto_normalize_audio()
                     results.append("normalize: done")
@@ -9924,13 +13441,18 @@ class FastEncodeProApp(QMainWindow):
                 elif key == "text":
                     if quoted:
                         try:
-                            start = float(getattr(self.timeline, 'playhead_position', 0.0) or 0.0)
+                            start = float(params.get("at") if params.get("at") is not None
+                                          else (getattr(self.timeline, 'playhead_position', 0.0) or 0.0))
                         except Exception:
                             start = 0.0
-                        tc = TextClip(quoted, start, 5.0)
+                        try:
+                            dur = float(params.get("dur") or 5.0)
+                        except Exception:
+                            dur = 5.0
+                        tc = TextClip(quoted, start, dur)
                         self.timeline.text_clips.append(tc)
                         self.timeline.update()
-                        self.status_label.setText(f"Added text overlay: '{quoted[:20]}...'")
+                        self.status_label.setText("Added text overlay: '%s...'" % quoted[:20])
                         results.append("text: added")
                     else:
                         self.add_text_overlay()
@@ -9941,6 +13463,21 @@ class FastEncodeProApp(QMainWindow):
                 elif key == "reset":
                     self.reset_all_filters()
                     results.append("reset: done")
+                elif key == "move":
+                    if clip is None:
+                        results.append("move: skipped (no clip)")
+                    else:
+                        clip.start_time = max(0.0, float(params.get("t", 0.0)))
+                        self.timeline.update()
+                        self.update_timeline_duration()
+                        results.append("moved to %s" % self._ai_fmt_tc(params.get("t", 0.0)))
+                elif key == "select":
+                    if clip is not None:
+                        self.timeline.selected_clip = clip
+                        self.timeline.update()
+                        results.append("selected %s" % clip.name)
+                    else:
+                        results.append("select: no clip")
                 elif key == "add":
                     self.add_to_timeline()
                     results.append("add: done")
@@ -9969,19 +13506,22 @@ class FastEncodeProApp(QMainWindow):
                     self.stop_timeline_export()
                     results.append("stop: done")
                 else:
-                    results.append(f"{key}: skipped (unknown)")
+                    results.append("%s: skipped (unknown)" % key)
             except Exception as e:
-                results.append(f"{key}: failed ({e})")
+                results.append("%s: failed (%s)" % (key, str(e)[:100]))
         try:
             self.append_log("🤖 AI applied: " + "; ".join(results))
         except Exception:
             pass
         self.status_label.setText("AI done: " + "; ".join(results)[:160])
         try:
+            self.ai_undo_btn.setEnabled(True)
+        except Exception:
+            pass
+        try:
             self.ai_prompt_input.clear()
         except Exception:
             pass
-
     def add_text_overlay(self):
         from PyQt6.QtWidgets import QInputDialog
         text, ok = QInputDialog.getText(self, "Add Text Overlay", "Enter text for the overlay:")
@@ -10107,10 +13647,10 @@ class FastEncodeProApp(QMainWindow):
             settings = self.get_settings()
         from PyQt6.QtWidgets import QFileDialog
         try:
-            ext = get_export_extension_for_codec(settings.get('video_codec', 'hevc_nvenc'))
+            ext = get_export_extension_for_settings(settings)
         except:
             ext = ".mp4"
-        output_file, _ = QFileDialog.getSaveFileName(self, "Choose Location & Start Export", f"timeline_export{ext}", f"Video Files (*{ext})")
+        output_file, _ = QFileDialog.getSaveFileName(self, "Choose Location & Start Export", f"timeline_export{ext}", f"Media Files (*{ext})")
         if not output_file:
             return
         try:
@@ -10128,7 +13668,7 @@ class FastEncodeProApp(QMainWindow):
             self.timeline_export_thread.finished.connect(self.timeline_export_done)
             self.timeline_export_thread.playhead_update.connect(self.timeline.set_playhead_position)
             self.progress_bar.setValue(0)
-            self.status_label.setText(f"Exporting: {settings.get('video_codec','').upper()}")
+            self.status_label.setText(f"Exporting: {'AUDIO-ONLY' if settings.get('audio_only') else settings.get('video_codec','').upper()}")
             self.render_dialog.show()
             try:
                 if hasattr(self, 'vram_timer'):
@@ -10948,13 +14488,48 @@ class FastEncodeProApp(QMainWindow):
             deleted = self.proxy_manager.clear_all_proxies()
             self.status_label.setText(f"Cleared {deleted} proxy files â€” freed {size_mb:.1f} MB")
 
-    def update_live_preview_filters(self):
+    def update_live_preview_filters(self, clip=None):
         if not hasattr(self, 'video_widget') or not self.video_widget:
             return
         settings = self.get_settings()
-        filters = build_video_filters_from_settings(settings)
+        filters = []
+        gclip = clip if clip is not None else self._geometry_clip_for_preview()
+        if gclip is not None:
+            try:
+                filters.extend(build_geometry_filters(getattr(gclip, 'crop', None),
+                                                      getattr(gclip, 'rotation', 0)))
+            except Exception:
+                pass
+        filters.extend(build_video_filters_from_settings(settings))
         filter_str = "lavfi=[" + ",".join(filters) + "]" if filters else ""
         self.video_widget.set_video_filter(filter_str)
+
+    def _geometry_clip_for_preview(self):
+        """Which clip's crop/rotation applies to the current preview."""
+        try:
+            if getattr(self, '_play_uses_timeline_edl', False):
+                t = 0.0
+                try:
+                    t = float(getattr(self.video_widget, '_position_ms', 0) or 0) / 1000.0
+                except Exception:
+                    pass
+                return self._timeline_clip_at(t)
+            return getattr(self.timeline, 'selected_clip', None)
+        except Exception:
+            return None
+
+    def _timeline_clip_at(self, t):
+        try:
+            for c in sorted(getattr(self.timeline, 'clips', []) or [],
+                            key=lambda c: c.start_time):
+                try:
+                    if c.start_time <= t < c.get_end_time():
+                        return c
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
 
     def apply_auto_balance(self):
         self.status_label.setText("Analyzing timeline clips for auto balance...")
